@@ -1,132 +1,14 @@
 import argparse
-import hashlib
-import json
 import re
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List
-
+from typing import List
 import numpy as np
 import torch
 
-
-@dataclass
-class Document:
-    page_content: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-# 读取文件 ###############################################
-def read_jsonl(path: str) -> List[Dict[str, Any]]:
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                print(f"Line {line_no} JSON parse error: {exc}")
-    return records
-###########################################################
-
-
-# 将数据初步处理为Document形式 ##############################
-def keep_year(value: str) -> str:
-    if not value:
-        return ""
-    match = re.search(r"(19|20)\d{2}", str(value).strip())
-    return match.group(0) if match else ""
-
-
-def process_data(data: List[Dict[str, Any]]) -> List[Document]:
-    result = []
-    for sample in data:
-        result.append(
-            Document(
-                page_content=sample.get("content") or "",
-                metadata={
-                    "published_date": keep_year(sample.get("published_date")),
-                    "title": sample.get("title") or "",
-                    "medical_topic": sample.get("medical_topics") or "",
-                    "url": sample.get("url") or "",
-                    "source": sample.get("source") or ""
-                },
-            )
-        )
-    return result
-###########################################################
-
-
-# 数据清洗 #################################################
-class DocumentCleaner:
-    MOJIBAKE_REPLACEMENTS = {
-        "\u920d?": ">=",
-        "\u920d\ufffd": ">=",
-        "\u920d\u6a9a": "'s",
-        "\u920d\u6a9b": "'t",
-        "\u920d\u6a99": "'r",
-        "\u920d\u6a9d": "'v",
-        "\u920d\u6a91": "'l",
-        "\u920d\uff1f": "'",
-        "\u76f2": "a",
-        "\ufffd": "",
-    }
-
-    def clean_text(self, text: str) -> str:
-        text = str(text or "")
-        text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("/n", "\n")
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-        for bad, good in self.MOJIBAKE_REPLACEMENTS.items():
-            text = text.replace(bad, good)
-
-        text = re.sub(r"(?im)^\s*#+\s*", "", text)
-        text = re.sub(r"(?im)^\s*[-*•]\s+", "", text)
-        text = re.sub(r"(?im)^\s*(Path|Citation|Footnotes?|References?)\s*$", "", text)
-        text = re.sub(r"(?im)^\s*(\[\d+\]|\(\w\)|[a-z]|\d+)\s*$", "", text)
-        text = re.sub(r"(?i)\bCitation\s+", "", text)
-        text = re.sub(r"\s+\[\d+\]\s+", " ", text)
-        text = re.sub(r"\s+\([a-z]\)\s+", " ", text)
-        text = re.sub(r"([A-Za-z])-\n([A-Za-z])", r"\1\2", text)
-        text = re.sub(r"\n+", " ", text)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\s+([,.;:])", r"\1", text)
-        text = re.sub(r"([(\[])\s+", r"\1", text)
-        text = re.sub(r"\s+([)\]])", r"\1", text)
-        return text.strip()
-
-    def clean(self, documents: List[Document]) -> List[Document]:
-        cleaned_docs = []
-        for doc in documents:
-            cleaned_text = self.clean_text(doc.page_content)
-            if len(cleaned_text) < 20:
-                continue
-            doc.page_content = cleaned_text
-            cleaned_docs.append(doc)
-        return cleaned_docs
-###########################################################
-
-
-# 指南去重 #################################################
-def hash_text(text: str) -> str:
-    normalized = " ".join(text.split())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
-def deduplicator(data: List[Document]) -> List[Document]:
-    seen = set()
-    unique = []
-    for document in data:
-        content_hash = hash_text(document.page_content)
-        if content_hash in seen:
-            continue
-        seen.add(content_hash)
-        unique.append(document)
-    return unique
-###########################################################
+from src.utils.document import Document,process_data
+from src.utils.process_jsonl import read_jsonl,save_jsonl
+from src.process_data.cleaner import DocumentCleaner
+from src.process_data.deduplicator import deduplicator
 
 
 def load_model():
@@ -452,19 +334,6 @@ def splitting(data: List[Document],tokenizer,model,device,threshold_pct: int = 2
                 accepted_idx += 1
 
     return all_chunks
-
-
-def save_jsonl(result, output_path):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with output_path.open("w", encoding="utf-8") as f:
-        for doc in result:
-            item = {
-                "page_content": doc.page_content,
-                "metadata": doc.metadata,
-            }
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def main():
