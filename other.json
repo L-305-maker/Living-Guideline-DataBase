@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "medical-guideline-rag": {
-      "transport": "streamable-http",
-      "url": "http://172.20.252.15:8000/mcp"
-    }
-  }
-}
