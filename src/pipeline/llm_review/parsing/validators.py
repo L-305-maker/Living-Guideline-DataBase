@@ -1,3 +1,8 @@
+﻿"""LLM 复核文件：构建复核队列、prompt、响应解析和自动质检，让候选结果进入人工/模型辅助复核流程。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -175,3 +180,4 @@ def validate_llm_result_for_item(task_type: str, result: JsonDict, queue_item: J
                 errors.append("recommendation_candidate_id_does_not_match_queue_item")
         return errors
     return [f"unsupported_task_type:{task_type}"]
+

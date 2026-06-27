@@ -1,3 +1,8 @@
+﻿"""GRADE 抽取文件：识别证据确定性、推荐强度和 GRADE 相关候选信息，并关联推荐候选。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -28,19 +33,28 @@ GRADE_SYSTEM_PATTERNS = [
     ("NUMERIC_LETTER_GRADE", re.compile(r"\bgrade\s+[1-2][A-D]\b|\b[1-2][A-D]\b", re.I)),
     ("LETTER_GRADE", re.compile(r"\bgrade\s+[A-D]\b|I statement", re.I)),
     ("VERB_BASED", re.compile(r"\b(?:offer|consider|recommend|suggest|should|should not)\b", re.I)),
+    ("CHINESE_GRADE", re.compile(r"(证据等级|证据级别|推荐等级|推荐强度|专家共识|A级|B级|C级|D级|Ⅰ级|Ⅱ级|Ⅲ级|强推荐|弱推荐)")),
+    ("CHINESE_VERB_BASED", re.compile(r"(推荐|建议|应当|应|应该|宜|可考虑|不推荐|不建议|避免|禁用)")),
 ]
 CERTAINTY_PATTERNS = [
     ("very_low", re.compile(r"\b(very[-\s]+low\s+(?:certainty|quality|evidence)|(?:certainty|quality)(?:\s+of\s+evidence)?\s+(?:was|is|were|are)\s+very[-\s]+low)\b", re.I)),
     ("low", re.compile(r"\b(low\s+(?:certainty|quality|evidence)|(?:certainty|quality)(?:\s+of\s+evidence)?\s+(?:was|is|were|are)\s+low)\b", re.I)),
     ("moderate", re.compile(r"\b(moderate\s+(?:certainty|quality|evidence)|(?:certainty|quality)(?:\s+of\s+evidence)?\s+(?:was|is|were|are)\s+moderate)\b", re.I)),
     ("high", re.compile(r"\b(high\s+(?:certainty|quality|evidence)|(?:certainty|quality)(?:\s+of\s+evidence)?\s+(?:was|is|were|are)\s+high)\b", re.I)),
+    ("very_low", re.compile(r"(极低质量证据|证据质量极低|极低证据质量|极低级别证据)")),
+    ("low", re.compile(r"(低质量证据|证据质量低|低级别证据)")),
+    ("moderate", re.compile(r"(中等质量证据|中等证据质量|中级别证据|中等强度证据)")),
+    ("high", re.compile(r"(高质量证据|证据质量高|高级别证据|高强度证据)")),
 ]
 STRENGTH_PATTERNS = [
     ("strong", re.compile(r"\bstrong recommendation\b|\bwe recommend\b|\bstandard\b|\bclass\s+i\b|\bcor\s+i\b", re.I)),
     ("conditional", re.compile(r"\bconditional recommendation\b|\bwe suggest\b|\bsuggest\b|\bclass\s+iia\b|\bcor\s+iia\b", re.I)),
     ("weak", re.compile(r"\bweak recommendation\b|\boption\b|\bclass\s+iib\b|\bcor\s+iib\b", re.I)),
+    ("strong", re.compile(r"(强推荐|A级推荐|Ⅰ级推荐|应当|必须|首选|优先推荐)")),
+    ("conditional", re.compile(r"(条件推荐|中等推荐|B级推荐|Ⅱ级推荐|建议|可考虑|可以考虑)")),
+    ("weak", re.compile(r"(弱推荐|C级推荐|D级推荐|Ⅲ级推荐|可选择)")),
 ]
-DOWNGRADE_RE = re.compile(r"\b(risk of bias|inconsistency|indirectness|imprecision|publication bias)\b", re.I)
+DOWNGRADE_RE = re.compile(r"\b(risk of bias|inconsistency|indirectness|imprecision|publication bias)\b|(偏倚风险|不一致|间接性|不精确|发表偏倚)", re.I)
 
 
 @dataclass(frozen=True)
@@ -140,8 +154,16 @@ def downgrade_reasons(text: str) -> List[str]:
     """提取理由文本中提到的 GRADE 降级领域。"""
 
     seen: List[str] = []
+    zh_map = {
+        "偏倚风险": "risk_of_bias",
+        "不一致": "inconsistency",
+        "间接性": "indirectness",
+        "不精确": "imprecision",
+        "发表偏倚": "publication_bias",
+    }
     for match in DOWNGRADE_RE.finditer(text):
-        reason = match.group(1).lower().replace(" ", "_")
+        matched = match.group(1) or match.group(2) or ""
+        reason = zh_map.get(matched, matched.lower().replace(" ", "_"))
         if reason not in seen:
             seen.append(reason)
     return seen
@@ -470,3 +492,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

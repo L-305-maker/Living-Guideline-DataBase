@@ -1,3 +1,8 @@
+﻿"""抽取公共工具文件：提供抽取阶段共享枚举、映射、校验器和通用辅助逻辑。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -79,3 +84,4 @@ def _safe_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+

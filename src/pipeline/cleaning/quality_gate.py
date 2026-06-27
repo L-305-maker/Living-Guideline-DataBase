@@ -374,6 +374,9 @@ def check_record_type(metrics: CleanRecordMetrics) -> tuple[list[JsonDict], floa
 def evaluate_cleaned_record(record: JsonDict) -> GateResult:
     """运行全部质量检查，并返回可路由的增强记录。"""
 
+    # 质量门的核心思路：
+    # 先把 record 转成一组可观测指标，再让每个 check 返回“问题标记 + 扣分”。
+    # 最终 status 由硬性问题、严重程度和总分共同决定。
     metrics = collect_record_metrics(record)
     flags, score = score_content_presence(metrics)
     for check in (
@@ -409,8 +412,10 @@ def status_for(score: float, flags: list[JsonDict]) -> str:
     codes = {str(flag.get("code") or "") for flag in flags}
     severities = {str(flag.get("severity") or "") for flag in flags}
 
+    # 内容为空或太短属于“无法安全解析”，直接进入 parse_failed。
     if "empty_raw_content" in codes or "empty_clean_content" in codes or "short_clean_content" in codes:
         return PARSE_FAILED
+    # 版式坏但内容可能还在的记录进入 layout repair 队列，后续有机会修复后再跑。
     if "single_section_huge_document" in codes or "suspected_multi_column_glue" in codes:
         return NEEDS_LAYOUT_REPAIR
     if score < 0.35:
@@ -426,6 +431,8 @@ def enrich_record(
 ) -> JsonDict:
     """在不丢失原始 cleaned payload 的前提下附加质量元数据。"""
 
+    # enrich_record 不改变原始业务字段的含义，只附加 cleaning_status、score、flags 等审计信息。
+    # 下游 parser 仍读取 content/clean_content，但报告和排障可以读取这些质量字段。
     enriched = dict(record)
     existing_warnings = list(enriched.get("cleaning_warnings") or [])
     gate_warnings = [
@@ -501,6 +508,7 @@ def route_records(input_path: str | Path, handles: dict[str, TextIO]) -> GateRou
 
     stats = GateRouteStats()
     for row in iter_jsonl(input_path):
+        # 单条记录在这里被分诊：ready 继续主流程，repair/failed/skipped 写入各自队列。
         result = evaluate_cleaned_record(row)
         update_route_stats(stats, result)
         write_jsonl_obj(handles[result.status], result.record)

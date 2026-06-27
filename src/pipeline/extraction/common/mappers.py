@@ -1,3 +1,8 @@
+﻿"""抽取公共工具文件：提供抽取阶段共享枚举、映射、校验器和通用辅助逻辑。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -60,3 +65,4 @@ def map_payload_to_business_tables(payload: JsonDict) -> JsonDict:
         "grade_assessments": _valid(entities.get("grade_assessments", [])),
         "update_logs": list(entities.get("update_logs", [])),
     }
+

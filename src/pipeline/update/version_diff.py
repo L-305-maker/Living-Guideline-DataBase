@@ -1,3 +1,8 @@
+﻿"""版本更新文件：比较新旧推荐版本并生成 update log，记录推荐知识的变化。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -139,3 +144,4 @@ def build_update_logs_file(
     write_jsonl(update_logs_output, logs)
     write_jsonl(report_output, [report])
     return report
+

@@ -1,3 +1,8 @@
+﻿"""清洗阶段文件：把来源记录整理成可追溯的 cleaned record，并在进入解析前处理 PDF 噪声和质量信号。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -40,26 +45,39 @@ AFFILIATION_HEADING_RE = re.compile(
 INLINE_AFFILIATION_HEADING_RE = re.compile(
     r"(?ims)(^|\n|\.\s+)(authors?\s+and\s+affiliations|author\s+information|affiliations|extended\s+author\s+information)(?=\s*(?:$|\n|department|division|university|school|hospital|medical))"
 )
-TABLE_START_RE = re.compile(r"(?im)^\s*(table\s+(\d+[A-Za-z]?)[^\n]*)$")
-TABLE_CAPTION_RE = re.compile(r"(?im)^\s*((?:table|figure)\s+\d+[A-Za-z]?(?:[.:)\-]\s*)?[^\n]{0,180})$")
+TABLE_LABEL = r"(?:appendix\s+table|supplementary\s+table|supplemental\s+table|etable|table|figure)\s+(?:[S]?\d+(?:\.\d+)*[A-Za-z]?|[IVXLC]+)"
+TABLE_START_RE = re.compile(rf"(?im)^\s*({TABLE_LABEL}[^\n]*)$")
+TABLE_CAPTION_RE = re.compile(
+    rf"(?im)^\s*((?:{TABLE_LABEL}|(?:grade|evidence)\s+profile)(?:[.:)\-]\s*)?[^\n]{{0,180}})$"
+)
 INLINE_TABLE_CAPTION_RE = re.compile(
-    r"(?P<prefix>^|[.;:]\s+)(?P<caption>(?:Table|Figure)\s+\d+[A-Za-z]?(?:[.:)\-]\s*)?)(?P<tail>\s+(?=[A-Z0-9]))",
+    rf"(?P<prefix>^|[.;:]\s+)(?P<caption>(?:{TABLE_LABEL}|(?:GRADE|Evidence)\s+profile)(?:[.:)\-]\s*)?)(?P<tail>\s+(?=[A-Z0-9]))",
     re.I,
 )
+SECTION_LABEL = (
+    r"abstract|introduction|methods?|methodology|recommendations?|discussion|limitations?|conclusions?|"
+    r"background|evidence|rationale|remarks?|executive\s+summary|summary|key\s+points|"
+    r"key\s+recommendations?|summary\s+of\s+recommendations?|guideline\s+statements?|"
+    r"practice\s+recommendations?|clinical\s+recommendations?|good\s+practice\s+statements?|"
+    r"implementation|monitoring|diagnosis|treatment|management|"
+    r"推荐意见|推荐|建议|指南|共识|摘要|背景|方法|证据|讨论|结论|诊断|治疗|防治|管理|"
+    r"适应证|禁忌证|不良反应|随访|监测|预防|筛查|参考文献"
+)
 SECTION_HEADING_RE = re.compile(
-    r"(?im)^\s*(abstract|introduction|methods?|methodology|recommendations?|discussion|limitations?|conclusions?|background|evidence|rationale|remarks?)\s*$"
+    rf"(?im)^\s*({SECTION_LABEL})\s*$"
 )
 INLINE_SECTION_HEADING_RE = re.compile(
     r"(?P<prefix>^|[.;:]\s+)"
-    r"(?P<heading>Abstract|Introduction|Methods?|Methodology|Recommendations?|Discussion|Limitations?|Conclusions?|"
-    r"Background|Evidence|Rationale|Remarks?)"
-    r"(?!\s*\d)"
-    r"(?P<tail>\s*(?:[:\-]\s*)?(?=[A-Z0-9]))"
+    rf"(?P<heading>{SECTION_LABEL})"
+    r"\b(?!\s*\d)"
+    r"(?P<tail>\s*(?:[:\-]\s*)?(?=[A-Z0-9]))",
+    re.I,
 )
 INLINE_RECOMMENDATION_LABEL_RE = re.compile(
     r"(?P<prefix>[.;:]\s+)"
-    r"(?P<label>(?:Recommendation|Statement|Clinical question|Question)\s*\d+[A-Za-z]?(?:\.\d+)*\s*[:.)-]?)"
-    r"(?P<tail>\s+(?=[A-Z]))",
+    r"(?P<label>(?:Recommendation|Statement|Clinical question|Question)\s*\d+[A-Za-z]?(?:\.\d+)*\s*[:.)-]?|"
+    r"(?:推荐意见|推荐|建议)\s*\d*(?:[：:、.)-])?)"
+    r"(?P<tail>\s*(?=[A-Z一二三四五六七八九十0-9\u4e00-\u9fff]))",
     re.I,
 )
 INLINE_NUMBERED_RECOMMENDATION_RE = re.compile(
@@ -68,16 +86,26 @@ INLINE_NUMBERED_RECOMMENDATION_RE = re.compile(
     r"(?P<tail>(?=(?:We|The guideline|Clinicians|Patients|Adults|Children|For|In)\b))",
     re.I,
 )
+INLINE_NUMBERED_ACTION_RE = re.compile(
+    r"(?P<prefix>[.;:]\s+|(?:Recommendations?|Key recommendations?|Summary of recommendations?)\s+)"
+    r"(?P<label>\d+(?:\.\d+)*[.)]\s+)"
+    r"(?P<tail>(?=[A-Z][^.]{0,180}\b(?:should|should not|is indicated|are indicated|"
+    r"is recommended|are recommended|may benefit|benefit from)\b))",
+    re.I,
+)
 TWO_COLUMN_GAP_RE = re.compile(r"[ \t]{4,}")
 RECOMMENDATION_BOX_HEADING_RE = re.compile(
     r"(?im)^\s*((?:box\s+\d+[A-Za-z]?|recommendation\s+box(?:\s+\d+[A-Za-z]?)?|"
-    r"key\s+recommendations?|summary\s+of\s+recommendations?)"
+    r"key\s+recommendations?|summary\s+of\s+recommendations?|recommendation\s+statements?|"
+    r"clinical\s+recommendations?|good\s+practice\s+statements?|practice\s+points?|"
+    r"推荐意见|推荐建议|诊疗建议|专家建议|共识意见)"
     r"(?:[.:)\-]\s*)?[^\n]{0,160})$"
 )
 INLINE_RECOMMENDATION_BOX_RE = re.compile(
     r"(?P<prefix>^|[.;:]\s+)"
-    r"(?P<label>(?:Box\s+\d+[A-Za-z]?|Key recommendations?|Recommendations?)\s*[:.\-]?)"
-    r"(?P<tail>\s+(?=(?:We|In|For|Adults|Children|Patients|Clinicians|The)\b))",
+    r"(?P<label>(?:Box\s+\d+[A-Za-z]?|Key recommendations?|Recommendations?|Recommendation statements?|"
+    r"Clinical recommendations?|Good practice statements?|Practice points?|推荐意见|推荐建议|诊疗建议|专家建议|共识意见)\s*[:：.\-]?)"
+    r"(?P<tail>\s+(?=(?:We|In|For|Adults|Children|Patients|Clinicians|The)\b)|\s*(?=[\u4e00-\u9fff]))",
     re.I,
 )
 METHOD_SECTION_NAME_RE = re.compile(r"(?i)^(methods?|methodology)$")
@@ -87,8 +115,14 @@ METHODOLOGY_BOILERPLATE_RE = re.compile(
     r"rand/ucla|methodology|search strategy|included studies|excluded studies)\b"
 )
 SOURCE_SPAN_BOUNDARY_RE = re.compile(
-    r"(?im)^\s*(?:abstract|introduction|methods?|methodology|recommendations?|background|evidence|rationale|"
-    r"remarks?|table\s+\d+[A-Za-z]?|figure\s+\d+[A-Za-z]?|box\s+\d+[A-Za-z]?)\b"
+    rf"(?im)^\s*(?:{SECTION_LABEL}|{TABLE_LABEL}|(?:grade|evidence)\s+profile|box\s+\d+[A-Za-z]?|"
+    r"recommendation\s+\d+[A-Za-z]?(?:\.\d+)*)\b"
+)
+MOJIBAKE_REPAIRS: tuple[tuple[str, str], ...] = (
+    ("鈥檚", "'s"),
+    ("鈥檛", "n't"),
+    ("鈥?", "-"),
+    ("茅", "e"),
 )
 MAX_RECOMMENDATION_BOX_CHARS = 8000
 MAX_REFERENCE_REMOVED_RATIO = 0.35
@@ -152,6 +186,15 @@ def fix_hyphenation(text: str) -> str:
 
     text = re.sub(r"([A-Za-z]{3,})-\s*\n\s*([A-Za-z]{2,})", r"\1\2", str(text or ""))
     return re.sub(r"([A-Za-z]{3,})-\s+([a-z]{2,})", r"\1\2", text)
+
+
+def repair_common_mojibake(text: str) -> str:
+    """Repair a small set of high-frequency mojibake artifacts without guessing broadly."""
+
+    repaired = str(text or "")
+    for source, replacement in MOJIBAKE_REPAIRS:
+        repaired = repaired.replace(source, replacement)
+    return repaired
 
 
 def normalize_spaces(text: str) -> str:
@@ -235,7 +278,7 @@ def remove_headers_footers(text: str) -> str:
 def light_clean_pdf_text(text: str) -> str:
     """应用所有来源共享的最小 PDF 文本清理规则。"""
 
-    return normalize_spaces(remove_headers_footers(fix_hyphenation(text)))
+    return normalize_spaces(remove_headers_footers(fix_hyphenation(repair_common_mojibake(text))))
 
 
 def light_clean_pdf_text_with_layout_report(text: str) -> tuple[str, JsonDict]:
@@ -310,6 +353,7 @@ def restore_inline_section_breaks(text: str) -> tuple[str, int]:
     restored = INLINE_RECOMMENDATION_BOX_RE.sub(replace_recommendation, restored)
     restored = INLINE_RECOMMENDATION_LABEL_RE.sub(replace_recommendation, restored)
     restored = INLINE_NUMBERED_RECOMMENDATION_RE.sub(replace_recommendation, restored)
+    restored = INLINE_NUMBERED_ACTION_RE.sub(replace_recommendation, restored)
     return normalize_spaces(restored), inserted
 
 
@@ -693,23 +737,32 @@ def build_cleaning_warnings(record: JsonDict, fallback_tables: list[JsonDict]) -
 def clean_source_record(record: JsonDict, source: Optional[str] = None) -> JsonDict:
     """清洗单条来源记录，并保留 raw_content 到 clean_content 的可追溯关系。"""
 
+    # 1. 先保留最接近原始来源的正文。后面所有清洗都不能替代 raw_content 的审计价值。
     raw_content = raw_content_from(record)
     source_key = normalize_source(source or record.get("source"))
     cleaned = base_record({**record, "source": source_key})
 
+    # 2. 做通用 PDF/文本轻清洗：修复乱码、断词、页眉页脚、简单双栏阅读顺序。
     light_text, layout_report = light_clean_pdf_text_with_layout_report(raw_content)
     noise_cleaned = enhance_pdf_noise_cleaning({**cleaned, "content": light_text})
     light_text = str(noise_cleaned.get("content") or light_text)
     pdf_noise_report = dict(noise_cleaned.get("cleaning_report") or {}).get("enhanced_pdf_noise_cleaning")
     light_text, column_merge_repairs = repair_pdf_column_word_merges(light_text)
     light_text, inline_section_breaks_inserted = restore_inline_section_breaks(light_text)
+
+    # 3. 把不适合进入正文抽取的尾部材料拆出去，但仍保存在独立字段中，避免丢失来源证据。
     main_text, references_text = split_references(light_text)
     main_text, affiliations_text = split_affiliations(main_text)
+
+    # 4. 处理表格和方法学噪声：表格保留为结构化/半结构化 payload，正文里尽量只留 caption。
     fallback_tables = [] if record.get("tables") else extract_tables_from_text(main_text)
     tables = cleaned.get("tables") or fallback_tables
     table_dicts = [table for table in tables if isinstance(table, dict)]
     clean_content = remove_table_blocks_from_main_text(main_text, table_dicts)
     clean_content, methodology_blocks = split_methodology_blocks(clean_content)
+
+    # 5. 生成给后续 parser/extractor 使用的辅助线索。
+    # 这里的 recommendations/grade_assessments 是兼容字段，不是正式候选抽取结果。
     recommendation_boxes = extract_recommendation_boxes(clean_content)
     span_boundaries = source_span_boundaries(clean_content)
     sections = split_sections(clean_content)
@@ -718,6 +771,7 @@ def clean_source_record(record: JsonDict, source: Optional[str] = None) -> JsonD
 
     cleaned.update(
         {
+            # record_id 若上游没有提供，就用来源、标题、URL 生成稳定 ID，保证多次运行可对齐。
             "record_id": cleaned.get("record_id") or stable_id("record", source_key, cleaned.get("title"), cleaned.get("url")),
             "metadata": metadata_from(record, cleaned),
             "raw_content": raw_content,
@@ -784,3 +838,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

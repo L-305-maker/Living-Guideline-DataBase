@@ -1,3 +1,8 @@
+﻿"""PICO 抽取文件：从文本块中抽取人群、干预、对照和结局等临床问题结构。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -24,7 +29,8 @@ JsonDict = Dict[str, Any]
 RULE_VERSION = "pico_rules_v1"
 
 QUESTION_RE = re.compile(
-    r"(?P<question>(?:clinical\s+question|key\s+question|pico(?:t)?\s+question)\s*[:\-]\s*[^.?!]+[.?!]?)",
+    r"(?P<question>(?:clinical\s+question|key\s+question|pico(?:t)?\s+question)\s*[:\-]\s*[^.?!]+[.?!]?|"
+    r"(?:临床问题|关键问题|PICO问题)\s*[:：]\s*[^。！？；]+[。！？]?)",
     re.I,
 )
 POPULATION_RE = re.compile(
@@ -66,7 +72,9 @@ RANDOMIZED_TO_RE = re.compile(r"\brandomi[sz]ed\s+to\s+(?P<intervention>[^.;:]{3
 INTERVENTION_RE = re.compile(
     r"\b(?:should\s+receive|should\s+be\s+offered|should\s+be\s+performed|is\s+indicated|are\s+indicated|"
     r"recommend(?:ed)?|suggest(?:ed)?|offer|consider|use|treated\s+with|treatment\s+with)\s+"
-    r"(?P<intervention>[^.;:]{3,220})",
+    r"(?P<intervention>[^.;:]{3,220})|"
+    r"(?:推荐|建议|应当|应|应该|宜|可考虑|可以考虑|可予|可用|使用|采用|给予|接受|进行|首选|避免|不推荐|不建议)"
+    r"(?P<zh_intervention>[^。；，,]{2,120})",
     re.I,
 )
 TREATED_WITH_RE = re.compile(r"\btreated\s+with\s+(?P<intervention>[^.;:]{3,160})", re.I)
@@ -82,10 +90,19 @@ POPULATION_CLAUSE_BOUNDARY_RE = re.compile(
 COMPARATOR_RE = re.compile(r"\b(?:compared\s+with|versus|vs\.?|rather\s+than)\s+(?P<comparator>[^.;:]{3,160})", re.I)
 OUTCOME_RE = re.compile(
     r"\b(?:outcomes?|to\s+assess|to\s+determine|to\s+reduce|to\s+improve|to\s+prevent|for\s+the\s+prevention\s+of)\s+"
-    r"(?P<outcome>[^.;:]{3,180})",
+    r"(?P<outcome>[^.;:]{3,180})|"
+    r"(?:降低|减少|改善|提高|预防|防治|控制|缓解)(?P<zh_outcome>[^。；，,]{2,120})",
     re.I,
 )
 NUMBERED_SPLIT_RE = re.compile(r"(?=\b\d+(?:\.\d+)*[.)]\s+[A-Z])")
+ZH_POPULATION_RE = re.compile(
+    r"(?P<population>(?:成人|儿童|青少年|老年|孕妇|患者|病人|病例|血液病患者|血液肿瘤患者|"
+    r"淋巴瘤患者|白血病患者|血友病患者|多发性骨髓瘤患者|ITP患者|感染患者|移植患者)"
+    r"[^。；，,]{0,80})"
+)
+ZH_POPULATION_WITH_CONDITION_RE = re.compile(
+    r"(?:对于|对|在|针对)?(?P<population>[^。；，,]{0,80}?(?:患者|病人|儿童|成人|青少年|孕妇|老年人))"
+)
 
 
 def split_pico_units(text: str) -> List[str]:
@@ -98,8 +115,12 @@ def split_pico_units(text: str) -> List[str]:
     if explicit_questions:
         return explicit_questions
     parts = [compact(part, 700) for part in NUMBERED_SPLIT_RE.split(clean) if compact(part)]
-    useful = [part for part in parts if POPULATION_RE.search(part) or INTERVENTION_RE.search(part) or OUTCOME_RE.search(part)]
-    return useful or ([clean] if POPULATION_RE.search(clean) else [])
+    useful = [
+        part
+        for part in parts
+        if POPULATION_RE.search(part) or ZH_POPULATION_RE.search(part) or INTERVENTION_RE.search(part) or OUTCOME_RE.search(part)
+    ]
+    return useful or ([clean] if POPULATION_RE.search(clean) or ZH_POPULATION_RE.search(clean) else [])
 
 
 def infer_population(text: str) -> str:
@@ -120,6 +141,9 @@ def infer_population(text: str) -> str:
     match = POPULATION_RE.search(text)
     if match:
         return clean_population(match.group("population"))
+    zh_match = ZH_POPULATION_RE.search(text) or ZH_POPULATION_WITH_CONDITION_RE.search(text)
+    if zh_match:
+        return clean_population(zh_match.group("population"))
     return "unclear"
 
 
@@ -145,7 +169,7 @@ def infer_intervention(text: str) -> str:
         return compact(treated_match.group("intervention"))
     match = INTERVENTION_RE.search(text)
     if match:
-        return compact(match.group("intervention"))
+        return compact(match.group("intervention") or match.group("zh_intervention"))
     return "unclear"
 
 
@@ -161,7 +185,7 @@ def infer_outcomes(text: str) -> List[JsonDict]:
 
     outcomes: List[JsonDict] = []
     for match in OUTCOME_RE.finditer(text):
-        value = compact(match.group("outcome"))
+        value = compact(match.group("outcome") or match.group("zh_outcome"))
         if value and value.lower() not in {str(item.get("name", "")).lower() for item in outcomes}:
             outcomes.append({"name": value, "source": "rule"})
     return outcomes[:8]
@@ -388,3 +412,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

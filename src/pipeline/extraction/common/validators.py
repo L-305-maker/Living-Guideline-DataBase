@@ -1,3 +1,8 @@
+﻿"""抽取公共工具文件：提供抽取阶段共享枚举、映射、校验器和通用辅助逻辑。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -184,3 +189,4 @@ def validate_grade_assessment(row: JsonDict) -> ValidationResult:
     if any(value == "no_concern" for value in domain_values) and not str(row.get("source_span") or "").lower().count("no serious"):
         warnings.append("unjustified_no_concern")
     return ValidationResult(score >= 4 and "unjustified_no_concern" not in warnings, score, warnings)
+

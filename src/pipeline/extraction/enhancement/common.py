@@ -1,3 +1,8 @@
+﻿"""候选增强文件：对规则抽取得到的候选进行补充、归一化或后处理增强。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -135,3 +140,4 @@ def summarize_enhancements(rows: list[JsonDict]) -> tuple[dict[str, int], dict[s
             enhancement_counts[str(enhancement.get("auto_qc_decision") or enhancement.get("enhancement_status") or "unknown")] += 1
             policy_counts[str(enhancement.get("qc_policy_key") or "generic")] += 1
     return dict(status_counts), dict(enhancement_counts), dict(policy_counts)
+

@@ -1,3 +1,8 @@
+﻿"""清洗阶段文件：把来源记录整理成可追溯的 cleaned record，并在进入解析前处理 PDF 噪声和质量信号。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -124,3 +129,4 @@ def span_offset_fields(raw_text: str, clean_text: str, clean_start: int, clean_e
             "method": result.mapping_method,
         },
     }
+

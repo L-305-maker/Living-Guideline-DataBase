@@ -1,3 +1,8 @@
+﻿"""结构解析阶段文件：把 cleaned record 解析成带章节、顺序和 offset 的 SourceBlock。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -385,3 +390,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

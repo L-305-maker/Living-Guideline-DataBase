@@ -1,3 +1,8 @@
+﻿"""候选增强文件：对规则抽取得到的候选进行补充、归一化或后处理增强。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -207,3 +212,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

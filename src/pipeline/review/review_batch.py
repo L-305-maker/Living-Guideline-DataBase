@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
 from src.common.process_jsonl import iter_jsonl, write_jsonl
+from src.pipeline.review.association_review import AssociationReviewOptions, build_association_review_package
 from src.pipeline.review.manual_review_gate import ReviewQueueOptions, build_queue
+from src.pipeline.review.rule_assisted_backfill import BackfillInputs
 
 
 JsonDict = Dict[str, Any]
@@ -156,6 +158,10 @@ def build_review_batch(
     max_first_pass_per_entity: int | None = 500,
     max_llm_priority: int | None = 1000,
     input_overrides: Dict[str, str | Path] | None = None,
+    include_association_review: bool = True,
+    association_batch_size: int = 100,
+    max_association_recommendations: int | None = None,
+    max_evidence_pico_reviews: int | None = None,
 ) -> JsonDict:
     """从一次 pipeline run 目录生成完整人工审核包，并返回汇总信息。"""
 
@@ -197,6 +203,24 @@ def build_review_batch(
     first_pass_items = sorted_queue(first_pass_items)
     write_jsonl(batch_dir / "first_pass_review_queue.jsonl", first_pass_items)
 
+    association_summary: JsonDict | None = None
+    if include_association_review:
+        association_inputs = BackfillInputs(
+            recommendations=list(optional_jsonl(Path(overrides.get("recommendation_candidate") or run_path / "recommendation_candidates.jsonl"))),
+            grades=list(optional_jsonl(Path(overrides.get("grade_candidate") or run_path / "grade_candidates.jsonl"))),
+            picos=list(optional_jsonl(Path(overrides.get("pico_question") or run_path / "pico_questions.jsonl"))),
+            evidence=list(optional_jsonl(Path(overrides.get("evidence_item") or run_path / "evidence_items.jsonl"))),
+        )
+        association_summary = build_association_review_package(
+            association_inputs,
+            batch_dir,
+            AssociationReviewOptions(
+                batch_size=association_batch_size,
+                max_recommendation_records=max_association_recommendations,
+                max_evidence_pico_records=max_evidence_pico_reviews,
+            ),
+        )
+
     summary = {
         "run_dir": str(run_path),
         "output_dir": str(batch_dir),
@@ -204,11 +228,16 @@ def build_review_batch(
         "llm_priorities": list(llm_priorities),
         "max_first_pass_per_entity": max_first_pass_per_entity,
         "max_llm_priority": max_llm_priority,
+        "include_association_review": include_association_review,
+        "association_batch_size": association_batch_size,
+        "max_association_recommendations": max_association_recommendations,
+        "max_evidence_pico_reviews": max_evidence_pico_reviews,
         "input_overrides": {key: str(value) for key, value in overrides.items()},
         "entity_queues": entity_summaries,
         "first_pass_review_records": len(first_pass_items),
         "llm_priority_total_records": llm_priority_total,
         "llm_priority_records": len(llm_priority_queue),
+        "association_review": association_summary,
     }
     write_jsonl(batch_dir / "review_batch_summary.jsonl", [summary])
     return summary
@@ -236,6 +265,10 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="进入 llm_priority_queue 的最大条数；小于等于 0 表示不限制。",
     )
+    parser.add_argument("--skip-association-review", action="store_true", help="不生成关联复核队列。")
+    parser.add_argument("--association-batch-size", type=int, default=100, help="关联复核队列的批次大小。")
+    parser.add_argument("--max-association-recommendations", type=int, default=None, help="限制 Recommendation 关联复核条数。")
+    parser.add_argument("--max-evidence-pico-reviews", type=int, default=None, help="限制 Evidence-PICO 复核条数。")
     parser.add_argument(
         "--llm-priority",
         action="append",
@@ -267,6 +300,10 @@ def main() -> None:
         max_first_pass_per_entity=args.max_first_pass_per_entity,
         max_llm_priority=args.max_llm_priority,
         input_overrides=input_overrides,
+        include_association_review=not args.skip_association_review,
+        association_batch_size=args.association_batch_size,
+        max_association_recommendations=args.max_association_recommendations,
+        max_evidence_pico_reviews=args.max_evidence_pico_reviews,
     )
     print(f"Wrote review batch to {summary['output_dir']}")
 

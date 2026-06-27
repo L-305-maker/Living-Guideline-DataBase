@@ -1,3 +1,8 @@
+﻿"""抽取路由文件：根据 SourceBlock 的候选提示和质量信息，把文本块分发到推荐、GRADE、PICO 或证据抽取支线。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -391,3 +396,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

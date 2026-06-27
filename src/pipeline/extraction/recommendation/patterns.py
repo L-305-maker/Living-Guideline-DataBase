@@ -1,3 +1,8 @@
+﻿"""推荐抽取文件：从路由后的 SourceBlock 中识别推荐语句候选，并保留可追溯抽取 trace。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import re
@@ -27,6 +32,13 @@ ACTION_PATTERN_SPECS: List[ActionPattern] = [
     ("suggests_against", r"\bsuggests?\s+against\b"),
     ("should_not", r"\bshould\s+not\b"),
     ("not_recommended", r"\bis\s+not\s+recommended\b"),
+    ("zh_recommend", r"推荐"),
+    ("zh_suggest", r"建议"),
+    ("zh_should", r"(?:应当|应该|应予|应|需|需要|必须)"),
+    ("zh_may_consider", r"(?:可考虑|可以考虑|可予|可用于|可选择|可采用)"),
+    ("zh_preferred", r"(?:首选|优先推荐|优先选择)"),
+    ("zh_against", r"(?:不推荐|不建议|不宜|避免|禁用|不应)"),
+    ("zh_indicated", r"(?:适用于|适合|适应证|可作为)"),
 ]
 
 ACTION_RECOMMENDATION_RE = re.compile("|".join(f"(?:{pattern})" for _, pattern in ACTION_PATTERN_SPECS), re.I)
@@ -46,3 +58,4 @@ def has_action_pattern(text: str) -> bool:
 def matched_action_texts(text: str) -> List[str]:
     clean = normalize_text(text)
     return sorted(set(match.group(0).lower() for match in ACTION_RECOMMENDATION_RE.finditer(clean)))
+

@@ -1,3 +1,8 @@
+﻿"""证据抽取文件：识别研究、系统综述、效应量和证据条目，并为推荐版本提供 grounding 线索。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -34,19 +39,27 @@ STUDY_PATTERNS = [
     ("cross_sectional", re.compile(r"\bcross[-\s]sectional\b", re.I)),
     ("case_series", re.compile(r"\bcase\s+series\b", re.I)),
     ("guideline", re.compile(r"\bguidelines?\b|\bpractice\s+parameters?\b", re.I)),
+    ("systematic_review", re.compile(r"系统评价")),
+    ("meta_analysis", re.compile(r"(Meta分析|荟萃分析)")),
+    ("RCT", re.compile(r"(随机对照|随机研究|随机试验|临床试验)")),
+    ("cohort", re.compile(r"队列研究")),
+    ("case_control", re.compile(r"病例对照")),
+    ("case_series", re.compile(r"病例系列")),
+    ("guideline", re.compile(r"(指南|共识|指导原则)")),
 ]
-SAMPLE_SIZE_RE = re.compile(r"\b(?:n\s*=\s*|sample\s+size\s+(?:of\s+)?)(?P<n>[0-9][0-9,]*)\b", re.I)
-CI_RE = re.compile(r"\b(?:95%\s*)?CI\s*(?:=|:)?\s*(?P<ci>[0-9.]+\s*(?:-|to|,)\s*[0-9.]+)\b", re.I)
+SAMPLE_SIZE_RE = re.compile(r"\b(?:n\s*=\s*|sample\s+size\s+(?:of\s+)?)(?P<n>[0-9][0-9,]*)\b|(?P<zh_n>[0-9][0-9,]*)\s*例", re.I)
+CI_RE = re.compile(r"\b(?:95%\s*)?CI\s*(?:=|:)?\s*(?P<ci>[0-9.]+\s*(?:-|to|,)\s*[0-9.]+)\b|95%\s*置信区间\s*(?P<zh_ci>[0-9.]+\s*(?:-|至|,|~)\s*[0-9.]+)", re.I)
 EFFECT_RE = re.compile(
     r"\b(?P<measure>RR|OR|HR|MD|SMD|risk\s+ratio|odds\s+ratio|hazard\s+ratio)\s*(?:=|of|:)?\s*(?P<value>[0-9.]+)",
     re.I,
 )
-BENEFIT_RE = re.compile(r"\b(reduc(?:ed|es|tion)|improv(?:ed|es|ement)|benefit|effective|lower risk|decrease)\b", re.I)
-HARM_RE = re.compile(r"\b(increas(?:ed|es|e)|harm|adverse|higher risk|worse|mortality)\b", re.I)
-NO_EFFECT_RE = re.compile(r"\b(no significant difference|no effect|not significant|similar)\b", re.I)
+BENEFIT_RE = re.compile(r"\b(reduc(?:ed|es|tion)|improv(?:ed|es|ement)|benefit|effective|lower risk|decrease)\b|(降低|减少|改善|提高|有效|获益|缓解|延长|预防)", re.I)
+HARM_RE = re.compile(r"\b(increas(?:ed|es|e)|harm|adverse|higher risk|worse|mortality)\b|(增加|升高|不良反应|毒性|死亡|风险较高|恶化)", re.I)
+NO_EFFECT_RE = re.compile(r"\b(no significant difference|no effect|not significant|similar)\b|(无显著差异|差异无统计学意义|无明显差异|相似)", re.I)
 OUTCOME_RE = re.compile(
     r"\b(?:outcomes?|endpoint|risk\s+of|rate\s+of|incidence\s+of|mortality|symptoms?|quality\s+of\s+life)\s+"
-    r"(?P<outcome>[^.;:]{0,160})",
+    r"(?P<outcome>[^.;:]{0,160})|"
+    r"(?P<zh_outcome>(?:总生存|无进展生存|缓解率|有效率|复发率|死亡率|感染率|出血率|血栓|不良反应|安全性|疗效)[^。；，,]{0,80})",
     re.I,
 )
 
@@ -134,7 +147,7 @@ def infer_sample_size(text: str) -> Optional[int]:
     if not match:
         return None
     try:
-        return int(match.group("n").replace(",", ""))
+        return int((match.group("n") or match.group("zh_n")).replace(",", ""))
     except ValueError:
         return None
 
@@ -152,7 +165,7 @@ def infer_confidence_interval(text: str) -> Optional[str]:
     """从证据文本中提取置信区间字符串。"""
 
     match = CI_RE.search(text)
-    return compact(match.group("ci"), 80) if match else None
+    return compact(match.group("ci") or match.group("zh_ci"), 80) if match else None
 
 
 def infer_effect_direction(text: str) -> str:
@@ -176,7 +189,7 @@ def infer_outcomes(text: str) -> List[JsonDict]:
 
     outcomes: List[JsonDict] = []
     for match in OUTCOME_RE.finditer(text):
-        value = compact(match.group("outcome"))
+        value = compact(match.group("outcome") or match.group("zh_outcome"))
         if value and value.lower() not in {str(item.get("name", "")).lower() for item in outcomes}:
             outcomes.append({"name": value, "source": "rule"})
     return outcomes[:8]
@@ -430,3 +443,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

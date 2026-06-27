@@ -456,6 +456,8 @@ def default_pico_match() -> JsonDict:
 def evaluate_publish_gate(context: VersionBuildContext) -> PublishGateResult:
     """把版本分类为可发布、需复核或阻断。"""
 
+    # publish_gate 是候选版本进入正式发布前的第一层质量判断。
+    # blocking 代表硬性问题，warnings 代表还需要复核或补全的软问题。
     blocking: List[str] = []
     warnings: List[str] = []
     rec = context.rec
@@ -510,6 +512,8 @@ def build_version_payloads(context: VersionBuildContext) -> tuple[JsonDict, Json
 
     rec = context.rec
     gate = evaluate_publish_gate(context)
+    # normalized_payload 是下游发布、审计和 RAG 更常读取的结构化摘要；
+    # raw_payload 则保留更接近抽取现场的来源信息。
     normalized = {
         "builder_version": BUILDER_VERSION,
         "publish_gate": {
@@ -733,6 +737,7 @@ def previous_version_for(rec: JsonDict, previous_by_recommendation: Dict[str, Js
 def build_version_rows(rows: VersionBuildRows) -> VersionBuildOutputs:
     """只为 accepted 推荐候选构建版本行。"""
 
+    # 版本构建阶段只处理 accepted 推荐候选；needs_review 的推荐候选不会被提升为 RecommendationVersion。
     previous_by_recommendation = latest_versions_by_recommendation(rows.existing_versions)
     grades_by_rec = index_grades_by_recommendation(rows.grades)
     pico_index = PicoIndex(rows.picos)
@@ -743,6 +748,7 @@ def build_version_rows(rows: VersionBuildRows) -> VersionBuildOutputs:
     for rec in rows.recommendations:
         if rec.get("status") != "accepted":
             continue
+        # 对每条推荐候选，查找最匹配的 PICO、GRADE 和 Evidence，再组装为不可变版本。
         linked_pico, pico_match = pico_index.find(rec)
         linked_evidence, evidence_reason = evidence_index.find(rec, str(linked_pico.get("pico_id") or "") if linked_pico else None)
         version_input = VersionBuildInput(

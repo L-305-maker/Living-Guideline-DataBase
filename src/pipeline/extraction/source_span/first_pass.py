@@ -1,3 +1,8 @@
+﻿"""source span 优先抽取文件：围绕原文 span 进行实验性抽取，强化结果与来源文本的对应关系。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import re
@@ -490,3 +495,4 @@ def run_source_span_first_pipeline(record: JsonDict) -> JsonDict:
             "processor": "src.pipeline.extraction.source_span.first_pass",
         },
     }
+

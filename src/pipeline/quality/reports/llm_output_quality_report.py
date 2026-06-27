@@ -1,3 +1,8 @@
+﻿"""质量报告文件：读取流水线产物并生成摘要、计数和样本，帮助定位抽取或路由质量问题。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -256,3 +261,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -55,7 +55,9 @@ HEADING_KEYWORDS_RE = re.compile(
     r"recommendations?|summary|background|evidence|rationale|management|diagnosis|"
     r"treatment|therapy|prevention|screening|monitoring|methods?|scope|"
     r"clinical questions?|key priorities|guideline statements?|implementation"
-    r")\b",
+    r")\b|"
+    r"(推荐意见|推荐|建议|指南|共识|诊断|治疗|防治|管理|证据|背景|方法|适应证|禁忌证|"
+    r"临床问题|关键问题|随访|监测|预防|筛查|总结|要点)",
     re.I,
 )
 RECOMMENDATION_HINT_RE = re.compile(
@@ -63,7 +65,9 @@ RECOMMENDATION_HINT_RE = re.compile(
     r"we\s+recommend|we\s+suggest|recommend(?:ed|s|ing)?|suggest(?:ed|s|ing)?|"
     r"should|should\s+not|must|must\s+not|do\s+not|offer|consider|avoid|"
     r"not\s+recommended|contraindicat|may\s+be\s+considered"
-    r")\b",
+    r")\b|"
+    r"(推荐|建议|应当|应|应该|宜|可考虑|可以考虑|不推荐|不建议|避免|禁用|首选|优先|"
+    r"适用于|适合|可用于|不宜|需|需要|必须)",
     re.I,
 )
 GRADE_HINT_RE = re.compile(
@@ -73,12 +77,15 @@ GRADE_HINT_RE = re.compile(
     r"strong\s+recommendation|conditional\s+recommendation|weak\s+recommendation|"
     r"risk\s+of\s+bias|inconsistency|indirectness|imprecision|publication\s+bias|"
     r"level\s+of\s+evidence|class\s+(?:i|ii|iii|iia|iib)|loe"
-    r")\b",
+    r")\b|"
+    r"(证据等级|证据级别|推荐等级|推荐强度|证据质量|证据级别|强推荐|弱推荐|专家共识|"
+    r"高质量证据|中等质量证据|低质量证据|极低质量证据|A级|B级|C级|D级|Ⅰ级|Ⅱ级|Ⅲ级)",
     re.I,
 )
 PICO_HINT_RE = re.compile(
     r"\b(?:clinical\s+question|pico|picot|population|intervention|comparator|comparison|outcomes?)\b|"
-    r"\b(?:in|for|among)\s+(?:adults?|children|patients?)\s+with\b",
+    r"\b(?:in|for|among)\s+(?:adults?|children|patients?)\s+with\b|"
+    r"(临床问题|研究对象|目标人群|患者|成人|儿童|干预|治疗|对照|结局|疗效|安全性)",
     re.I,
 )
 EVIDENCE_HINT_RE = re.compile(
@@ -86,14 +93,16 @@ EVIDENCE_HINT_RE = re.compile(
     r"systematic\s+review|meta-analysis|randomi[sz]ed|trial|cohort|case-control|"
     r"risk\s+ratio|odds\s+ratio|hazard\s+ratio|confidence\s+interval|"
     r"evidence\s+review|study|studies"
-    r")\b",
+    r")\b|"
+    r"(系统评价|荟萃分析|Meta分析|随机对照|随机研究|临床试验|队列研究|病例对照|"
+    r"研究显示|研究表明|证据显示|证据表明|纳入研究|样本量|风险比|比值比|置信区间|疗效|安全性)",
     re.I,
 )
 TABLE_HINT_RE = re.compile(r"^\s*\|.+\|\s*$|^\s*table\s+\d+[\s:.-]", re.I)
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+(?:\.\d+)*[.)]\s+|[A-Za-z][.)]\s+)")
 NUMBERED_HEADING_RE = re.compile(r"^\s*(\d+(?:\.\d+){0,5})\.?\s+\S+")
 MARKDOWN_HEADING_RE = re.compile(r"^\s*(#{1,6})\s+(.+)")
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|(?<=:)\s+(?=[A-Z])")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;。！？；])\s+|(?<=[:：])\s*(?=[A-Z0-9一二三四五六七八九十（(])")
 INLINE_HEADING_RE = re.compile(
     r"\b("
     r"Recommendations?|Background|Evidence|Rationale|Methods?|Summary|Treatment|"
@@ -411,13 +420,19 @@ def build_block(spec: BlockBuildInput) -> JsonDict:
     record = spec.record
     text = spec.text
     record_id = str(record.get("record_id") or "")
+    # block_id 由 record、顺序、字符范围和文本前缀共同生成，保证同一输入多次运行时 ID 稳定。
     block_id = stable_id("block", record_id, spec.order, spec.char_start, spec.char_end, text[:80])
+
+    # 低价值章节或疑似参考文献块不进入候选抽取，但仍保留为 SourceBlock 以便审计。
     reference_like = is_reference_like_block(text)
     skip_reason = ""
     if spec.is_low_value:
         skip_reason = "low_value_section"
     elif reference_like:
         skip_reason = "reference_like_block"
+
+    # candidate_hints 是给下一步 router 的粗标签，不是最终抽取结果。
+    # 标题块 forced_heading=True 时通常不打 hint，避免把章节名当成推荐句。
     hints = [] if spec.forced_heading else candidate_hints(text, skip_candidate_extraction=bool(skip_reason))
     record_context = _record_context(record)
     quality = block_quality(text, hints, spec.is_low_value or reference_like, skip_reason)
@@ -455,6 +470,7 @@ def _append_heading_block(record: JsonDict, state: ParseState, title: str, line:
 
     level = heading_level(line)
     state.current_heading = line.strip(" :")
+    # section_stack 是“当前位置的章节路径”。遇到新标题时按层级弹出旧标题，再压入新标题。
     state.section_stack = update_section_path(state.section_stack, state.current_heading, level)
     state.blocks.append(
         build_block(
@@ -517,11 +533,13 @@ def _append_text_blocks(
 def parse_source_record(record: JsonDict, max_block_chars: int = 1600) -> List[JsonDict]:
     """把一条清洗后的记录切成有序、可追溯的 SourceBlock。"""
 
+    # 上游 source_cleaner 已经把 clean_content 同步到 content，因此这里优先读取 content。
     content = str(record.get("content") or record.get("content_markdown") or record.get("abstract") or "")
     title = str(record.get("title") or "Document")
     state = ParseState(section_stack=[(0, title)], current_heading=title, blocks=[])
 
     for line, start, end, forced_heading in iter_lines_with_offsets(content):
+        # 标题块会更新 section_path；普通正文块会继承当前 section_path。
         if forced_heading or is_heading(line):
             _append_heading_block(record, state, title, line, start, end)
             continue

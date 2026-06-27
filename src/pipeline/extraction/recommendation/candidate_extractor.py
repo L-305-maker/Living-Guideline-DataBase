@@ -57,7 +57,8 @@ EVIDENCE_PSEUDO_RECOMMENDATION_RE = re.compile(
 FIGURE_TABLE_RE = re.compile(r"\b(?:figure|fig\.|table)\s*[0-9A-Z]?\b|representative images", re.I)
 LAYOUT_GLUE_RE = re.compile(r"(?:\.\.){2,}|[A-Za-z]{18,}|[a-z][A-Z][a-z]")
 ADMINISTRATIVE_RE = re.compile(
-    r"\b(?:fda|supplementary|contact|registry|copyright|conflicts?\s+of\s+interest|disclaimer|references)\b",
+    r"\b(?:fda|supplementary|contact|registry|copyright|conflicts?\s+of\s+interest|disclaimer|references)\b|"
+    r"(参考文献|利益冲突|基金项目|通信作者|作者单位|版权|免责声明)",
     re.I,
 )
 INCOMPLETE_ACTION_RE = re.compile(
@@ -65,28 +66,43 @@ INCOMPLETE_ACTION_RE = re.compile(
     r"\b(?:clinicians?\s+should|patients?\s+should|we\s+(?:recommend|suggest)\s+that\s+clinicians?)\s+(?:use|offer|receive|administer|provide|consider)\s*$",
     re.I,
 )
-RISK_SECTION_RE = re.compile(r"\b(?:references|author|disclosure|copyright|methods?|methodology|evidence|rationale|discussion)\b", re.I)
-RECOMMENDATION_SECTION_RE = re.compile(r"\b(?:recommendations?|summary|key recommendations?)\b", re.I)
-NEGATIVE_DIRECTION_RE = re.compile(
-    r"\b(should\s+not|must\s+not|do\s+not|avoid|not\s+recommended|contraindicat|not\s+indicated|suggests?\s+against|recommend\s+against)\b",
+RISK_SECTION_RE = re.compile(
+    r"\b(?:references|author|disclosure|copyright|methods?|methodology|evidence|rationale|discussion)\b|"
+    r"(参考文献|作者|利益冲突|方法|证据|讨论|背景)",
     re.I,
 )
-STRONG_RE = re.compile(r"\b(strong recommendation|we recommend|must|should|standard|class\s+i|cor\s+i)\b", re.I)
-CONDITIONAL_RE = re.compile(r"\b(conditional recommendation|we suggest|suggest|may be considered|class\s+iia|cor\s+iia)\b", re.I)
-WEAK_RE = re.compile(r"\b(weak recommendation|option|class\s+iib|cor\s+iib)\b", re.I)
+RECOMMENDATION_SECTION_RE = re.compile(r"\b(?:recommendations?|summary|key recommendations?)\b|(推荐|建议|指南|共识|治疗|诊断)", re.I)
+NEGATIVE_DIRECTION_RE = re.compile(
+    r"\b(should\s+not|must\s+not|do\s+not|avoid|not\s+recommended|contraindicat|not\s+indicated|suggests?\s+against|recommend\s+against)\b|"
+    r"(不推荐|不建议|不宜|避免|禁用|不应|禁忌)",
+    re.I,
+)
+STRONG_RE = re.compile(r"\b(strong recommendation|we recommend|must|should|standard|class\s+i|cor\s+i)\b|(强推荐|A级推荐|Ⅰ级推荐|应当|必须|首选)", re.I)
+CONDITIONAL_RE = re.compile(r"\b(conditional recommendation|we suggest|suggest|may be considered|class\s+iia|cor\s+iia)\b|(建议|可考虑|可以考虑|B级推荐|Ⅱ级推荐)", re.I)
+WEAK_RE = re.compile(r"\b(weak recommendation|option|class\s+iib|cor\s+iib)\b|(弱推荐|可选择|C级推荐|D级推荐|Ⅲ级推荐)", re.I)
 CERTAINTY_PATTERNS = [
     ("very_low", re.compile(r"\b(very[-\s]+low\s+(?:certainty|quality)|(?:certainty|quality)(?:\s+of\s+evidence)?\s+(?:was|is|were|are)\s+very[-\s]+low)\b", re.I)),
     ("low", re.compile(r"\b(low\s+(?:certainty|quality)|(?:certainty|quality)(?:\s+of\s+evidence)?\s+(?:was|is|were|are)\s+low)\b", re.I)),
     ("moderate", re.compile(r"\b(moderate\s+(?:certainty|quality)|(?:certainty|quality)(?:\s+of\s+evidence)?\s+(?:was|is|were|are)\s+moderate)\b", re.I)),
     ("high", re.compile(r"\b(high\s+(?:certainty|quality)|(?:certainty|quality)(?:\s+of\s+evidence)?\s+(?:was|is|were|are)\s+high)\b", re.I)),
+    ("very_low", re.compile(r"(极低质量证据|证据质量极低|极低证据质量|极低级别证据)")),
+    ("low", re.compile(r"(低质量证据|证据质量低|低级别证据)")),
+    ("moderate", re.compile(r"(中等质量证据|中等证据质量|中级别证据|中等强度证据)")),
+    ("high", re.compile(r"(高质量证据|证据质量高|高级别证据|高强度证据)")),
 ]
 REC_CODE_RE = re.compile(r"\b(?:recommendation|statement)\s*([0-9A-Za-z.-]+)|^\s*([0-9]+(?:\.[0-9]+)*)[.)]\s+", re.I)
 SPLIT_RE = re.compile(
     r"(?=\b(?:Recommendation|Statement|Clinical question|Question)\s*\d+[A-Za-z]?(?:\.\d+)*\s*[:.)-]?\s+)|"
     r"(?=\b[0-9]+(?:\.[0-9]+)*[.)]\s+[A-Z])|"
-    r"(?<=[.!?;])\s+(?=(?:We|The panel|Clinicians|Patients|Children|Adults|In|For)\b)"
+    r"(?<=[.!?;。！？；])\s+(?=(?:We|The panel|Clinicians|Patients|Children|Adults|In|For)\b)|"
+    r"(?=推荐意见\s*\d*[:：]?)|(?=推荐\s*\d+[:：.、]?)|(?=建议\s*\d+[:：.、]?)|"
+    r"(?<=[。！？；])\s*(?=(?:推荐|建议|对于|对|成人|儿童|患者|应|宜|可|不推荐|不建议))"
 )
-SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
+SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s*(?=[A-Z0-9一二三四五六七八九十（(推荐建议对于对成人儿童患者应宜可不])")
+
+
+def has_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", str(text or "")))
 
 
 def _section_text(block: JsonDict | None) -> str:
@@ -107,7 +123,8 @@ def statement_noise_reasons(statement: str, block: JsonDict | None = None) -> Li
     reasons: List[str] = []
     if not clean:
         return ["empty_statement"]
-    if len(clean) < 35:
+    min_len = 12 if has_cjk(clean) else 35
+    if len(clean) < min_len:
         reasons.append("too_short_fragment")
     if re.match(r"^[,.;:)\]}]", clean):
         reasons.append("starts_with_punctuation")
@@ -129,7 +146,7 @@ def statement_noise_reasons(statement: str, block: JsonDict | None = None) -> Li
         reasons.append("layout_glued_statement")
     if len(re.findall(r"\[\d+\]|\(\d+\)|\b\d{3,}\b", clean)) >= 4:
         reasons.append("citation_heavy")
-    if ACTION_RECOMMENDATION_RE.search(clean) and not re.search(r"\b(?:for|in|with|to|against|receive|use|offer|administer|treat|avoid|refer)\b", clean, re.I):
+    if ACTION_RECOMMENDATION_RE.search(clean) and not has_cjk(clean) and not re.search(r"\b(?:for|in|with|to|against|receive|use|offer|administer|treat|avoid|refer)\b", clean, re.I):
         reasons.append("missing_clinical_object")
     return reasons
 
@@ -284,7 +301,7 @@ def quality_notes(text: str, block: JsonDict | None = None) -> List[str]:
     clean = normalize_text(text)
     if len(clean) > 1000:
         notes.append("long_statement")
-    if len(clean) < 35:
+    if len(clean) < (12 if has_cjk(clean) else 35):
         notes.append("short_statement")
     if re.match(r"^[,.;:)\]}]", clean):
         notes.append("starts_with_fragment")

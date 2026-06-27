@@ -1,3 +1,8 @@
+﻿"""质量评估文件：提供 goldset、审计指标和质量报告能力，用于评估候选结果是否可靠。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -122,3 +127,4 @@ def evaluate_goldset_file(gold_input: str | Path, predictions_input: str | Path,
     report = evaluate_goldset(iter_jsonl(gold_input), iter_jsonl(predictions_input))
     write_jsonl(report_output, [report])
     return report
+

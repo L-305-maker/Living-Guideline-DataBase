@@ -1,3 +1,10 @@
+"""候选生成流水线的总调度器。
+
+这个文件只负责编排“从 origin JSONL 到候选产物”的流程：
+清洗 -> 质量门 -> 结构解析 -> 路由 -> 四类抽取 -> 版本构建 -> 审核队列 -> 质量报告。
+它不会把候选结果发布成正式 Recommendation，也不会直接写 PostgreSQL。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -97,6 +104,8 @@ class PipelinePaths:
 
     @classmethod
     def for_run(cls, run_dir: str | Path, *, route_prefix: str = "flow") -> "PipelinePaths":
+        # PipelinePaths 是本流水线的“文件路径合同”：
+        # 上一步写到哪里，下一步就从对应路径读取，避免路径散落在各阶段逻辑里。
         root = Path(run_dir)
         routes = root / "routes"
         return cls(
@@ -173,6 +182,8 @@ class PipelineRunResult:
 
 
 def artifact_counts(paths: PipelinePaths) -> JsonDict:
+    """统计每个关键产物的行数，用于 run_manifest 和命令行摘要。"""
+
     return {
         "cleaned": count_jsonl(paths.cleaned),
         "ready_cleaned": count_jsonl(paths.ready_cleaned),
@@ -263,6 +274,8 @@ def run_pipeline(
     run_dir.mkdir(parents=True, exist_ok=True)
     paths = PipelinePaths.for_run(run_dir, route_prefix=route_prefix)
 
+    # result 是这次运行的“审计账本”：记录输入、输出目录、阶段摘要和产物计数。
+    # 最终会写入 run_manifest.json，方便之后定位数据在哪个阶段丢失或被分流。
     result = PipelineRunResult(
         run_id=run_id,
         input_path=str(input_path),
@@ -271,7 +284,8 @@ def run_pipeline(
         artifacts=paths.as_dict(),
     )
 
-    # 每一步都把摘要收进 manifest，方便后续定位是哪一阶段损失了数据。
+    # 下面是主流水线调用链。每一步基本都是“读一个 JSONL，写一个 JSONL/报告”。
+    # 注意：这里产出的是候选数据，不是正式发布数据。
     result.stage_summaries["cleaning"] = {"cleaned_records": clean_file(input_path, paths.cleaned)}
     result.stage_summaries["cleaning_gate"] = route_cleaned_file(
         QualityGatePaths(

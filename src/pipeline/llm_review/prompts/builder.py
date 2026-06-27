@@ -1,3 +1,8 @@
+﻿"""LLM 复核文件：构建复核队列、prompt、响应解析和自动质检，让候选结果进入人工/模型辅助复核流程。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import json
@@ -350,3 +355,4 @@ def build_prompt_record(item: JsonDict, prompt_version: str) -> JsonDict:
         "status": "pending_model_call",
         "created_at": utc_now(),
     }
+

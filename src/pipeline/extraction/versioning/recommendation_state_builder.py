@@ -1,3 +1,8 @@
+﻿"""推荐版本构建文件：把推荐、GRADE、PICO 和证据候选组装成不可变 RecommendationVersion。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -114,3 +119,4 @@ def build_recommendation_state(
         normalized_payload=normalized_payload,
     )
     return recommendation.to_dict()
+

@@ -1,3 +1,8 @@
+﻿"""抽取公共工具文件：提供抽取阶段共享枚举、映射、校验器和通用辅助逻辑。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -95,3 +100,4 @@ def normalize_evidence_type(value: Any) -> str:
     if text in {"guideline", "guideline_summary"}:
         return "guideline_summary"
     return text if text in EVIDENCE_TYPES else "unclear"
+
