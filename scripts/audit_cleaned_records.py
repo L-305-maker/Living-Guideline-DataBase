@@ -1,3 +1,8 @@
+﻿"""本地脚本入口：把 src 中的项目能力包装成命令行工具，方便运行、审计或质量检查。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -208,3 +213,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
