@@ -1,3 +1,8 @@
+﻿"""存储层文件：定义 PostgreSQL schema、行映射、入库流程和完整性检查。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -69,3 +74,4 @@ def create_vector_schema_with_cursor(cur: Any, *, dimensions: int = DEFAULT_VECT
         ON {EMBEDDING_TABLE}(entity_type, entity_id, text_hash, embedding_model, embedding_version)
         """
     )
+

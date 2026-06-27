@@ -1,3 +1,8 @@
+﻿"""数据库 repository 文件：封装特定表或业务对象的 PostgreSQL 读写逻辑。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -103,3 +108,4 @@ def mark_review_item_published(
     published["publication_summary"] = summary
     published["published_at"] = published_at or utc_now()
     return published
+

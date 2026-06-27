@@ -1,3 +1,8 @@
+﻿"""存储层文件：定义 PostgreSQL schema、行映射、入库流程和完整性检查。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import json
@@ -65,3 +70,4 @@ def execute_many(conn: Any, sql: str, rows: Sequence[Mapping[str, Any]]) -> int:
     with conn.cursor() as cur:
         cur.executemany(sql, list(rows))
     return len(rows)
+

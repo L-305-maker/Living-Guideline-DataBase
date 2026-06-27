@@ -1,3 +1,8 @@
+﻿"""数据库 repository 文件：封装特定表或业务对象的 PostgreSQL 读写逻辑。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -129,3 +134,4 @@ def ingest_cleaned_records(jsonl_path: str | Path, batch_size: int = DEFAULT_BAT
             total += len(record_rows)
             print(f"Ingested {total} cleaned records")
     return total
+

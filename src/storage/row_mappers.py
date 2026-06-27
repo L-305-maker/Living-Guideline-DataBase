@@ -1,3 +1,8 @@
+﻿"""存储层文件：定义 PostgreSQL schema、行映射、入库流程和完整性检查。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict
@@ -69,3 +74,4 @@ def cleaned_record_row(item: JsonDict) -> JsonDict:
         "direct_extraction": json_obj(direct),
         "raw_record": json_obj(item),
     }
+

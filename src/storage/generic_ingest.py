@@ -131,6 +131,16 @@ GENERIC_TABLE_CONFIG: Dict[str, Dict[str, Any]] = {
             "raw_payload": {},
         },
     },
+    "recommendation_version_evidence_links": {
+        "pk": "link_id",
+        "json_fields": {"normalized_payload"},
+        "list_fields": set(),
+        "defaults": {
+            "link_reason": "release_linked_evidence",
+            "link_status": "publish_ready",
+            "normalized_payload": {},
+        },
+    },
     "update_logs": {
         "pk": "update_log_id",
         "json_fields": {"triggering_evidence_ids"},
@@ -278,6 +288,8 @@ def prepare_generic_row(
 
 
 def ingest_table(table: str, jsonl_path: str | Path, batch_size: int = DEFAULT_BATCH_SIZE) -> int:
+    """按表配置把一个 JSONL 文件写入 PostgreSQL。"""
+
     table = sql_identifier(table)
     if table not in GENERIC_TABLE_CONFIG:
         raise ValueError(f"Unsupported generic ingest table: {table}")
@@ -301,6 +313,8 @@ def ingest_table(table: str, jsonl_path: str | Path, batch_size: int = DEFAULT_B
         for batch in batches(iter_jsonl(jsonl_path), batch_size):
             review_rows: List[JsonDict] = []
             if table == "recommendation_versions":
+                # recommendation_versions 是正式知识表，入库前必须按 publish_gate 分流。
+                # 不可发布的版本转入 recommendation_version_review_queue，而不是写进正式版本表。
                 review_rows = recommendation_version_review_rows(batch)
                 batch, gate_report = partition_recommendation_versions_for_ingest(batch)
                 if gate_report["skipped_rows"]:
@@ -378,6 +392,7 @@ def ingest_tables_atomically(
     active_conn = conn or get_connection()
     pending_review_rows = list(table_rows.get("recommendation_version_review_queue") or ())
     counts: Dict[str, int] = {}
+    # 固定顺序体现外键依赖，也体现发布语义：先写依赖实体，再写版本、当前态、证据链接和更新日志。
     order = [
         "model_traces",
         "pico_questions",
@@ -387,12 +402,14 @@ def ingest_tables_atomically(
         "recommendations",
         "recommendation_version_review_queue",
         "evidence_items",
+        "recommendation_version_evidence_links",
         "update_logs",
     ]
     try:
         for table in order:
             rows = table_rows.get(table) or ()
             if table == "recommendation_versions":
+                # 原子 bundle 入库同样要执行 publish gate 分流，保证正式表只包含 publishable 版本。
                 pending_review_rows.extend(recommendation_version_review_rows(rows))
                 rows, gate_report = partition_recommendation_versions_for_ingest(rows)
                 if gate_report["skipped_rows"]:
@@ -423,6 +440,8 @@ def table_counts() -> JsonDict:
 
 
 def integrity_report() -> JsonDict:
+    """生成数据库完整性报告，用于发布后确认没有孤儿外键或低质量正式版本。"""
+
     create_schema(recreate=False)
     report: JsonDict = {"table_counts": {}, "orphan_counts": {}, "version_quality": {}, "version_review_queue": {}}
     with get_connection() as conn:
@@ -450,6 +469,19 @@ def integrity_report() -> JsonDict:
                     FROM evidence_items ei
                     LEFT JOIN pico_questions pq ON pq.pico_id = ei.pico_id
                     WHERE ei.pico_id IS NOT NULL AND ei.pico_id <> '' AND pq.pico_id IS NULL
+                """,
+                "recommendation_version_evidence_links_without_version": """
+                    SELECT COUNT(*)
+                    FROM recommendation_version_evidence_links link
+                    LEFT JOIN recommendation_versions rv
+                      ON rv.recommendation_version_id = link.recommendation_version_id
+                    WHERE rv.recommendation_version_id IS NULL
+                """,
+                "recommendation_version_evidence_links_without_evidence": """
+                    SELECT COUNT(*)
+                    FROM recommendation_version_evidence_links link
+                    LEFT JOIN evidence_items ei ON ei.evidence_id = link.evidence_id
+                    WHERE ei.evidence_id IS NULL
                 """,
             }
             for name, query in orphan_queries.items():

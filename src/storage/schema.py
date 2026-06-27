@@ -1,3 +1,8 @@
+﻿"""存储层文件：定义 PostgreSQL schema、行映射、入库流程和完整性检查。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -20,6 +25,7 @@ SCHEMA_TABLES = (
     "recommendations",
     "recommendation_version_review_queue",
     "evidence_items",
+    "recommendation_version_evidence_links",
     "update_logs",
 )
 
@@ -61,7 +67,10 @@ def create_indexes(cur: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_recommendation_version_review_queue_status ON recommendation_version_review_queue(review_status)",
         "CREATE INDEX IF NOT EXISTS idx_recommendation_version_review_queue_guideline ON recommendation_version_review_queue(guideline_id)",
         "CREATE INDEX IF NOT EXISTS idx_evidence_items_pico ON evidence_items(pico_id)",
+        "CREATE INDEX IF NOT EXISTS idx_recommendation_version_evidence_links_version ON recommendation_version_evidence_links(recommendation_version_id)",
+        "CREATE INDEX IF NOT EXISTS idx_recommendation_version_evidence_links_evidence ON recommendation_version_evidence_links(evidence_id)",
         "CREATE INDEX IF NOT EXISTS idx_update_logs_guideline ON update_logs(guideline_id)",
     ]
     for sql in indexes:
         cur.execute(sql)
+
