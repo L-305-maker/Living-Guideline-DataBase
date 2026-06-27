@@ -1,3 +1,8 @@
+﻿"""向量化测试文件：验证 embedding queue 和后续 RAG 入队准备逻辑。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 from __future__ import annotations
 
 import tempfile
@@ -129,4 +134,5 @@ class EmbeddingQueueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -1,3 +1,8 @@
+﻿"""复核与发布测试文件：验证 review queue、backfill、release export 和正式发布闭包逻辑。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import unittest
 
 from src.storage.generic_ingest import is_publishable_recommendation_version
@@ -44,3 +49,4 @@ class RecommendationVersionReviewQueueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

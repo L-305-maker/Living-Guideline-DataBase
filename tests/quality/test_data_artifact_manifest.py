@@ -1,3 +1,8 @@
+﻿"""质量评估测试文件：验证 goldset、数据产物 manifest 和质量报告相关逻辑。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,3 +30,4 @@ class DataArtifactManifestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,3 +1,8 @@
+﻿"""复核与发布测试文件：验证 review queue、backfill、release export 和正式发布闭包逻辑。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,7 +62,10 @@ class ReviewBatchTests(unittest.TestCase):
             self.assertTrue((batch_dir / "pico_review_queue.jsonl").exists())
             self.assertTrue((batch_dir / "evidence_review_queue.jsonl").exists())
             self.assertTrue((batch_dir / "first_pass_review_queue.jsonl").exists())
+            self.assertTrue((batch_dir / "recommendation_association_review_queue.jsonl").exists())
+            self.assertTrue((batch_dir / "evidence_pico_review_queue.jsonl").exists())
             self.assertEqual(summary["llm_priority_records"], 1)
+            self.assertIsNotNone(summary["association_review"])
             self.assertGreaterEqual(summary["first_pass_review_records"], 4)
             first_pass = list(iter_jsonl(batch_dir / "first_pass_review_queue.jsonl"))
             self.assertTrue(all(item["priority"] in {"P0", "P1"} for item in first_pass))
@@ -119,3 +127,4 @@ class ReviewBatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

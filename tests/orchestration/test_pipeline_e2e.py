@@ -1,3 +1,8 @@
+﻿"""编排流程测试文件：验证端到端流水线入口、公开 API 和阶段衔接是否正常。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,3 +94,4 @@ class PipelineEndToEndTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

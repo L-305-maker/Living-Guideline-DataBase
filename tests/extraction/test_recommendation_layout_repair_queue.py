@@ -1,3 +1,8 @@
+﻿"""抽取阶段测试文件：验证推荐、GRADE、PICO、证据和 source span 等候选抽取行为。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import unittest
 
 from src.pipeline.extraction.routing.candidate_router import route_blocks, routed_block
@@ -76,3 +81,4 @@ class RecommendationLayoutRepairQueueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,3 +1,8 @@
+﻿"""存储层测试文件：验证 PostgreSQL schema、contract、原子入库和完整性检查。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import os
 import unittest
 
@@ -135,3 +140,4 @@ class PostgreSQLPublishSmokeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

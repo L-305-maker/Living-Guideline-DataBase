@@ -1,3 +1,8 @@
+﻿"""清洗阶段测试文件：验证 source_cleaner、quality_gate、offset 和记录类型路由等清洗链路行为。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import unittest
 
 from src.pipeline.parsing.structure_parser import parse_source_record
@@ -41,3 +46,4 @@ class RecordTypeRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,3 +1,8 @@
+﻿"""版本构建测试文件：验证 RecommendationVersion、当前态构建和 update log 差异逻辑。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import unittest
 
 from src.pipeline.extraction.versioning.recommendation_version_builder import VersionBuildInput, build_version
@@ -123,3 +128,4 @@ class RecommendationVersioningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

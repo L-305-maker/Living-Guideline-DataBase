@@ -1,3 +1,8 @@
+﻿"""清洗阶段测试文件：验证 source_cleaner、quality_gate、offset 和记录类型路由等清洗链路行为。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import unittest
 
 from src.pipeline.cleaning.source_cleaner import clean_source_record, clean_source_records, fix_hyphenation
@@ -313,6 +318,70 @@ class GuidelineCleaningTests(unittest.TestCase):
         self.assertIn("Table 1", labels)
         self.assertIn("Box 2", labels)
 
+    def test_guideline_specific_headings_are_restored_from_flattened_text(self) -> None:
+        output = clean_source_record(
+            {
+                "content": (
+                    "Executive summary This guideline describes the scope and intended users. "
+                    "Key recommendations We recommend antiviral treatment for adults with severe infection. "
+                    "Good practice statements Clinicians should monitor symptoms after treatment."
+                ),
+                "title": "Demo",
+                "source": "who",
+            }
+        )
+
+        section_names = {section["section_name"] for section in output["sections"]}
+        self.assertIn("Executive Summary", section_names)
+        self.assertIn("Key Recommendations", section_names)
+        self.assertIn("Good Practice Statements", section_names)
+        self.assertGreaterEqual(output["cleaning_log"]["source_span_boundaries_detected"], 2)
+
+    def test_decimal_table_caption_is_extracted(self) -> None:
+        output = clean_source_record(
+            {
+                "content": (
+                    "Recommendations\nWe recommend treatment for adults.\n"
+                    "Table 1.2 Evidence profile\nOutcome Benefit RR 0.80 95% CI 0.70 to 0.95\n"
+                    "Evidence\nThe certainty of evidence was moderate."
+                ),
+                "tables": [],
+                "title": "Demo",
+                "source": "who",
+            }
+        )
+
+        self.assertTrue(output["tables"])
+        self.assertIn("Table 1.2", output["tables"][0]["caption"])
+        self.assertNotIn("RR 0.80", output["clean_content"])
+
+    def test_flattened_numbered_action_recommendations_are_restored(self) -> None:
+        output = clean_source_record(
+            {
+                "content": (
+                    "Recommendations 1. Polysomnography in children should be performed when clinically indicated. "
+                    "2. Antiviral treatment is recommended for adults with severe infection. "
+                    "Evidence The certainty of evidence was moderate."
+                ),
+                "title": "Demo",
+                "source": "aasm",
+            }
+        )
+
+        self.assertIn("\n1. Polysomnography", output["clean_content"])
+        self.assertIn("\n2. Antiviral treatment", output["clean_content"])
+
+    def test_common_mojibake_is_repaired_conservatively(self) -> None:
+        output = clean_source_record(
+            {
+                "content": "Recommendations\nThe patient鈥檚 symptoms should be monitored.",
+                "title": "Demo",
+                "source": "aasm",
+            }
+        )
+
+        self.assertIn("patient's symptoms", output["clean_content"])
+
     def test_column_merge_artifact_in_recommendation_word_is_repaired(self) -> None:
         output = clean_source_record(
             {
@@ -406,3 +475,4 @@ class GuidelineCleaningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

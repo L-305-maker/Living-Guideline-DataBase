@@ -1,3 +1,8 @@
+﻿"""项目测试文件：通过小样本验证 Living-Guideline 数据处理链路的关键行为。
+
+阅读测试时，优先看测试名称、输入样例和断言，它们通常说明对应模块的业务边界。
+"""
+
 import os
 import unittest
 
@@ -77,3 +82,4 @@ class LLMClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
