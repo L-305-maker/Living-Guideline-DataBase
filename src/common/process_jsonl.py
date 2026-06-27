@@ -1,3 +1,8 @@
+﻿"""通用基础工具文件：提供 JSONL、文本、质量上下文或项目公共辅助能力，供多个流水线阶段复用。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import json
@@ -65,3 +70,4 @@ def save_jsonl(result: Iterable[Any], output_path: str | Path) -> None:
                     "metadata": doc.metadata,
                 },
             )
+
