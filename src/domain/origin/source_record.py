@@ -1,3 +1,8 @@
+﻿"""领域模型文件：定义 Living-Guideline 项目中的核心数据结构，只描述数据形状，不负责文件读写或数据库操作。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -26,3 +31,4 @@ class SourceRecord(SerializableMixin):
     direct_extraction: JsonDict = field(default_factory=dict)  # source_cleaner 直接提取字段汇总
     raw_record: JsonDict = field(default_factory=dict)  # 原始或清洗后完整 record 快照，避免溯源信息丢失
     created_at: str = ""  # 入库创建时间，建议由存储层统一填充
+

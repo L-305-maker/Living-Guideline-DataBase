@@ -1,3 +1,8 @@
+﻿"""领域模型文件：定义 Living-Guideline 项目中的核心数据结构，只描述数据形状，不负责文件读写或数据库操作。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -40,3 +45,4 @@ class RecommendationCandidate(SerializableMixin):
     raw_payload: JsonDict = field(default_factory=dict)  # 原始抽取结果快照，便于排错和回溯
     created_at: str = ""  # 候选记录创建时间
     updated_at: str = ""  # 候选记录最后更新时间
+

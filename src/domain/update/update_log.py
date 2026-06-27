@@ -1,3 +1,8 @@
+﻿"""领域模型文件：定义 Living-Guideline 项目中的核心数据结构，只描述数据形状，不负责文件读写或数据库操作。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -18,3 +23,4 @@ class UpdateLog(SerializableMixin):
     updated_by: Optional[str] = None  # 更新执行者，可以是模型名、流程名或人工审核者
     updated_at: str = ""  # 系统内记录更新时间，建议使用 ISO 8601 字符串
     published_at: Optional[str] = None  # 若更新已对外发布，记录发布时间
+
