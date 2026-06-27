@@ -1,3 +1,8 @@
+﻿"""爬虫公共工具文件：封装 HTTP、JSONL、PDF 和文本处理等 ingestion 阶段共享能力。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -92,3 +97,4 @@ def _metadata_title(metadata: dict[str, Any]) -> str:
 def _title_from_first_page(text: str) -> str:
     lines = [normalize_space(line) for line in text.splitlines() if normalize_space(line)]
     return lines[0] if lines else ""
+

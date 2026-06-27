@@ -1,3 +1,8 @@
+﻿"""爬虫来源适配文件：面向特定医学资料来源抓取或解析原始记录，并为 ingestion 阶段提供统一输入。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -181,3 +186,4 @@ def _pmc_oa_download_url(url: str) -> str:
     if path.startswith("/pub/pmc/") and not path.startswith("/pub/pmc/deprecated/"):
         path = path.replace("/pub/pmc/", "/pub/pmc/deprecated/", 1)
     return urlunparse(("https", parsed.netloc, path, parsed.params, parsed.query, parsed.fragment))
+

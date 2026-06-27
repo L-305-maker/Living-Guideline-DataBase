@@ -1,3 +1,8 @@
+﻿"""爬虫公共工具文件：封装 HTTP、JSONL、PDF 和文本处理等 ingestion 阶段共享能力。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import re
@@ -110,4 +115,5 @@ def extract_page_metadata(html: str) -> dict[str, str]:
         html[:5000],
     )
     return {"title": title, "published_year": year}
+
 

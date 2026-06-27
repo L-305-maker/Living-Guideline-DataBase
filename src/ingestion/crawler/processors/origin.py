@@ -1,3 +1,8 @@
+﻿"""爬虫后处理文件：把下载或抓取到的原始内容整理成 origin JSONL、PDF 清单或可追溯来源记录。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -170,3 +175,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

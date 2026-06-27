@@ -1,3 +1,8 @@
+﻿"""爬虫公共工具文件：封装 HTTP、JSONL、PDF 和文本处理等 ingestion 阶段共享能力。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import json
@@ -43,4 +48,5 @@ def write_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> int:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             count += 1
     return count
+
 
