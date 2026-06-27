@@ -1,3 +1,8 @@
+﻿"""向量化文件：为后续 embedding/RAG 流程准备可入队、可追踪的知识对象。
+
+阅读本文件时，先看模块入口函数和被谁调用，再看具体规则或数据结构。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -477,3 +482,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
