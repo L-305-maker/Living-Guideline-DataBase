@@ -1,5 +1,5 @@
-"""候选生成流水线编排入口。"""
+"""Evidence-library pipeline orchestration entry points."""
 
-from src.pipeline.orchestration.run_pipeline import PipelineRunResult, run_pipeline
+from src.pipeline.orchestration.run_pipeline import run_pipeline
 
-__all__ = ["PipelineRunResult", "run_pipeline"]
+__all__ = ["run_pipeline"]

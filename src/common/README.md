@@ -1,28 +1,17 @@
 # common 模块
 
-`common/` 放跨阶段复用的小工具。它不应该包含具体业务决策，比如“某条推荐是否可发布”，而是提供读写、格式化、质量上下文等基础能力。
-
-## 数据如何流动
-
-```text
-pipeline / storage / scripts
-  -> 调用 common 工具
-  -> 读写 JSONL、整理质量字段、处理通用结构
-  -> 返回给调用方继续业务处理
-```
+`src/common/` 现在只保留当前证据库任务需要的公共入口。
 
 ## 文件职责
 
 | 文件 | 作用 |
 | --- | --- |
-| `process_jsonl.py` | JSONL 读写基础函数，是流水线文件传递的底座 |
-| `extraction_common.py` | 抽取相关共享类型 |
-| `record_quality.py` | 把 cleaned record 的质量信息传递到 block 和候选中 |
-| `data_artifacts.py` | 数据产物清单、分类和治理辅助 |
-| `mcp_server.py` | 面向外部工具/服务的辅助入口 |
+| `mcp_server.py` | 对外提供 MCP 工具：`search`、`read`、`retrieve`。 |
 
-## 维护原则
+## MCP 工具边界
 
-- 这里的函数应该小而稳定。
-- 不要让 `common/` 反向依赖 `pipeline/` 或 `storage/` 的业务规则。
-- 如果一个工具只被某个阶段使用，优先放在那个阶段目录里。
+- `search`：混合检索入口，返回候选 chunk/block。
+- `read`：按文档、block 或 chunk 标识读取原文证据。
+- `retrieve`：面向 Agent 的完整召回接口，组合检索结果和可读证据内容。
+
+旧的 JSONL 工具、抽取公共类型、质量字段传播等模块已经迁移到 `legacy_recommendation_pipeline/src/common/`。

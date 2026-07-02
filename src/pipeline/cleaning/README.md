@@ -1,41 +1,35 @@
 # cleaning 阶段
 
-`pipeline/cleaning/` 是主流水线第一阶段。它把来源格式不稳定、PDF 噪声较多的原始记录整理成可追溯的 cleaned record。
+`src/pipeline/cleaning/` 现在只服务于“指南证据库”任务：把原始 PDF 转为 Markdown，清洗 Markdown，再按完整 block 和小 chunk 两层结构建库。
 
-## 数据如何流动
+本阶段不再抽取 `Recommendation`、`PICOQuestion`、`GradeCandidate` 等结构化推荐对象。block 被视为可追溯的原文证据单元，chunk 是面向检索和向量化的更小文本单元。
+
+## 数据流
 
 ```text
-origin JSONL
-  -> source_cleaner.py
-  -> cleaned.jsonl
-  -> quality_gate.py
-  -> cleaned.ready.jsonl
-  -> cleaned.needs_layout_repair.jsonl
-  -> cleaned.parse_failed.jsonl
-  -> cleaned.skipped.jsonl
+raw_pdfs/
+  -> pdf_to_markdown.py
+  -> markdown_raw/
+  -> markdown_cleaner.py
+  -> markdown_clean/
+  -> block_encoder.py
+  -> sections/
+  -> block_chunker.py
+  -> chunks.jsonl
 ```
 
 ## 核心文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `source_cleaner.py` | 清洗单条来源记录，生成 `raw_content`、`clean_content`、sections、tables、cleaning_log |
-| `quality_gate.py` | 根据长度、章节、版式、表格、来源类型等质量信号分流 cleaned records |
-| `pdf_noise.py` | 增强 PDF 噪声修复 |
-| `offset_mapping.py` | 维护 raw/clean/source span 的 offset 追踪 |
-| `source_normalizers.py` | 标准化不同来源的字段和 seed |
-| `base_cleaner.py` | 文本基础清理工具 |
-| `deduplicator.py` | 去重辅助 |
+| `pdf_to_markdown.py` | 调用 `project.pipeline.pdf_to_md`，把 PDF 批量转换为 Markdown。 |
+| `markdown_cleaner.py` | 调用 `project.pipeline.cleaner`，清理页眉页脚、目录、参考文献等噪声。 |
+| `block_encoder.py` | 调用 `project.pipeline.encoder`，把清洗后的 Markdown 编码为完整 block。 |
+| `block_chunker.py` | 调用 `project.pipeline.chunker`，把单个 block 切分成检索 chunk。 |
+| `evidence_pipeline.py` | 串联 PDF->Markdown->clean->block->chunk->SQLite/FTS/vector 的证据库构建流程。 |
 
-## 数据变化
+## 设计边界
 
-```text
-raw record
-  -> raw_content 保留原文
-  -> clean_content 作为后续工作文本
-  -> references_text / affiliations_text 从正文拆出
-  -> tables / recommendation_boxes / source_span_boundaries 成为辅助线索
-  -> cleaning_log 记录清洗动作
-```
-
-只有 `cleaned.ready.jsonl` 会进入 `pipeline/parsing/`。
+- cleaning 只生成证据检索需要的 Markdown、block、chunk 和索引。
+- 推荐语句、PICO、GRADE、人工审核、发布版本等旧链路已经迁移到 `legacy_recommendation_pipeline/`。
+- 默认向量化粒度是 chunk，不是整篇 document；document/block 主要承担溯源和展示。
