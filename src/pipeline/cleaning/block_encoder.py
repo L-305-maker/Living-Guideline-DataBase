@@ -1,4 +1,4 @@
-"""Block encoding for clean Markdown evidence documents.
+﻿"""Block encoding for clean Markdown evidence documents.
 
 In the evidence pipeline, a block is the complete Markdown section produced
 from heading-aware parsing. The on-disk directory remains named ``sections`` so
@@ -10,9 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from project.pipeline.encoder import encode_all as _encode_all
-from project.pipeline.encoder import encode_file
-from project.pipeline.encoder import encode_markdown
+from src.pipeline.cleaning.encoder import encode_all as _encode_all
+from src.pipeline.cleaning.encoder import encode_file
+from src.pipeline.cleaning.encoder import encode_markdown
 
 
 def encode_blocks(

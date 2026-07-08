@@ -1,4 +1,4 @@
-# orchestration 阶段
+﻿# orchestration 阶段
 
 `src/pipeline/orchestration/` 是当前证据库构建的一键入口，负责调用 cleaning 阶段并生成可供 MCP 检索使用的数据目录。
 
@@ -18,14 +18,14 @@ run_pipeline.py
 ## 入口
 
 ```powershell
-python -m src.pipeline.orchestration.run_pipeline --data-dir project/data --skip-vector
+python -m src.pipeline.orchestration.run_pipeline --data-dir data/evidence --skip-vector
 ```
 
 常用参数：
 
 | 参数 | 作用 |
 | --- | --- |
-| `--data-dir` | 数据根目录，默认 `project/data`。 |
+| `--data-dir` | 数据根目录，默认 `data/evidence`。 |
 | `--raw-pdf-dir` | 原始 PDF 目录；不传则使用 `data_dir/raw_pdfs`。 |
 | `--skip-pdf-to-markdown` | 已经有 Markdown 时跳过 PDF 转换。 |
 | `--skip-vector` | 跳过向量索引构建，只保留 SQLite/FTS。 |

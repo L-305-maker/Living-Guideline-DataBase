@@ -1,0 +1,95 @@
+"""Parent section chunk construction."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+
+from src.guideline_chunking.models import DocumentMeta, ParsedBlock, SectionChunk
+
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|[\u4e00-\u9fff]")
+MAX_SECTION_TOKENS = 3000
+
+
+def build_section_chunks(blocks: list[ParsedBlock], meta: DocumentMeta) -> list[SectionChunk]:
+    sections: list[SectionChunk] = []
+    current_key: tuple[str, ...] | None = None
+    current_blocks: list[ParsedBlock] = []
+
+    def flush() -> None:
+        nonlocal current_blocks
+        if not current_blocks:
+            return
+        sections.extend(_section_parts(current_blocks, meta))
+        current_blocks = []
+
+    for block in sorted(blocks, key=lambda item: item.order_index):
+        key = tuple(block.heading_path or [_untitled(meta)])
+        if current_key is not None and key != current_key:
+            flush()
+        current_key = key
+        current_blocks.append(block)
+    flush()
+    return sections
+
+
+def section_for_block(section_chunks: list[SectionChunk], block_id: str) -> str | None:
+    for section in section_chunks:
+        if block_id in section.child_block_ids:
+            return section.section_id
+    return None
+
+
+def _section_parts(blocks: list[ParsedBlock], meta: DocumentMeta) -> list[SectionChunk]:
+    parts: list[list[ParsedBlock]] = []
+    current: list[ParsedBlock] = []
+    current_tokens = 0
+    for block in blocks:
+        block_tokens = estimate_tokens(block.text)
+        if current and current_tokens + block_tokens > MAX_SECTION_TOKENS:
+            parts.append(current)
+            current = []
+            current_tokens = 0
+        current.append(block)
+        current_tokens += block_tokens
+    if current:
+        parts.append(current)
+
+    section_chunks: list[SectionChunk] = []
+    for part_index, part in enumerate(parts):
+        path = part[0].heading_path or [_untitled(meta)]
+        title = path[-1]
+        section_id = _section_id(meta.doc_id, path, part[0].order_index, part_index)
+        pages = [page for block in part for page in (block.page_start, block.page_end) if page is not None]
+        section_chunks.append(
+            SectionChunk(
+                section_id=section_id,
+                doc_id=meta.doc_id,
+                heading_path=list(path),
+                heading_level=part[0].heading_level or len(path) or 1,
+                title=title,
+                text="\n\n".join(block.text for block in part if not block.metadata.get("is_heading")),
+                child_block_ids=[block.block_id for block in part],
+                child_chunk_ids=[],
+                page_start=min(pages) if pages else None,
+                page_end=max(pages) if pages else None,
+                order_start=part[0].order_index,
+                order_end=part[-1].order_index,
+                metadata={"title": meta.title, "publisher": meta.publisher, "part_index": part_index},
+            )
+        )
+    return section_chunks
+
+
+def estimate_tokens(text: str) -> int:
+    return len(TOKEN_RE.findall(text or ""))
+
+
+def _section_id(doc_id: str, path: list[str], order_index: int, part_index: int) -> str:
+    digest = hashlib.sha1((" > ".join(path) + f":{order_index}:{part_index}").encode("utf-8")).hexdigest()[:10]
+    return f"{doc_id}_sec_{digest}"
+
+
+def _untitled(meta: DocumentMeta) -> str:
+    return meta.title or "Untitled"

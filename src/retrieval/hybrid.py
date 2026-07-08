@@ -1,0 +1,595 @@
+﻿"""Hybrid SQLite BM25 plus FAISS retrieval with RRF fusion."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from src.pipeline.cleaning.semantic_chunker import estimate_tokens, retrieval_text
+from src.retrieval.document_repr.section_classifier import classify_chunk
+from src.retrieval.reranker import ChunkReranker, default_chunk_reranker, quality_score_multiplier
+from src.retrieval.rrf import rrf_fusion
+from src.retrieval.sqlite_store import DEFAULT_DB_PATH, TOKEN_RE, connect, retrieve_chunks_sqlite
+from src.retrieval.vector_store import vector_search
+from src.utils.io import DATA_DIR
+
+
+GUIDE_RE = re.compile(r"(指南|共识|guideline|guidelines|consensus|practice parameters?|recommendations?)", re.I)
+JOURNAL_HEADER_RE = re.compile(
+    r"(中华.{0,16}杂志.{0,90}第\s*\d+\s*卷.{0,50}第\s*\d+\s*期|"
+    r"Chin\s+J\s+.{0,90}\bVol\.?\s*\d+.{0,50}\bNo\.?\s*\d+|"
+    r"\bVol\.?\s*\d+.{0,50}\bNo\.?\s*\d+)",
+    re.I,
+)
+DOCUMENT_QUALITY_COLUMNS = (
+    "cleaning_quality, cleaning_flags, source_pdf_text_quality, source_pdf_needs_ocr, source_pdf_is_scanned, "
+    "pdf_text_quality, pdf_needs_ocr, pdf_is_scanned, ocr_engine, ocr_applied, ocr_status, ocr_error"
+)
+
+
+def _time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
+    if not time_range:
+        return None, None
+    if isinstance(time_range, dict):
+        return time_range.get("start") or time_range.get("start_date"), time_range.get("end") or time_range.get("end_date")
+    match = re.match(r"^\s*(\d{4})(?:-\d{2}-\d{2})?\s*[-~:]\s*(\d{4})(?:-\d{2}-\d{2})?\s*$", str(time_range))
+    if match:
+        return f"{match.group(1)}-01-01", f"{match.group(2)}-12-31"
+    return str(time_range), None
+
+
+def _metadata_sql(
+    source_institution: str | None,
+    clinical_department: str | None,
+    time_range: str | dict[str, str] | None,
+    publication_date: str | None,
+    exclude_reference_sections: bool = False,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if source_institution:
+        clauses.append("source_institution LIKE ?")
+        params.append(f"%{source_institution}%")
+    if clinical_department:
+        clauses.append("clinical_department LIKE ?")
+        params.append(f"%{clinical_department}%")
+    start, end = _time_range(time_range)
+    if start:
+        clauses.append("publication_date >= ?")
+        params.append(start)
+    if end:
+        clauses.append("publication_date <= ?")
+        params.append(end)
+    if publication_date:
+        clauses.append("publication_date = ?")
+        params.append(publication_date)
+    if exclude_reference_sections:
+        clauses.append("is_reference_section = 0")
+    return (" AND ".join(clauses), params)
+
+
+def _select_by_ids(
+    db_path: str | Path,
+    table: str,
+    id_field: str,
+    ids: list[str],
+    columns: str,
+    source_institution: str | None,
+    clinical_department: str | None,
+    time_range: str | dict[str, str] | None,
+    publication_date: str | None,
+    exclude_reference_sections: bool = False,
+) -> dict[str, sqlite3.Row]:
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    where = [f"{id_field} IN ({placeholders})"]
+    params: list[Any] = list(ids)
+    metadata_where, metadata_params = _metadata_sql(
+        source_institution, clinical_department, time_range, publication_date, exclude_reference_sections
+    )
+    if metadata_where:
+        where.append(metadata_where)
+        params.extend(metadata_params)
+    sql = f"SELECT {columns} FROM {table} WHERE " + " AND ".join(where)
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return {row[id_field]: row for row in rows}
+
+
+def _doc_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
+
+    def value(name: str, default: Any = "") -> Any:
+        return row[name] if name in keys else default
+
+    def flag(name: str) -> bool:
+        raw = value(name, False)
+        return raw is True or str(raw).strip().lower() in {"1", "true", "yes", "y"}
+
+    return {
+        "doc_id": row["doc_id"],
+        "title": row["title"],
+        "abstract": row["abstract"],
+        "publication_date": row["publication_date"],
+        "source_institution": row["source_institution"],
+        "clinical_department": row["clinical_department"],
+        "cleaning_quality": value("cleaning_quality"),
+        "cleaning_flags": value("cleaning_flags"),
+        "source_pdf_text_quality": value("source_pdf_text_quality"),
+        "source_pdf_needs_ocr": flag("source_pdf_needs_ocr"),
+        "source_pdf_is_scanned": flag("source_pdf_is_scanned"),
+        "pdf_text_quality": value("pdf_text_quality"),
+        "pdf_needs_ocr": flag("pdf_needs_ocr"),
+        "pdf_is_scanned": flag("pdf_is_scanned"),
+        "ocr_engine": value("ocr_engine"),
+        "ocr_applied": flag("ocr_applied"),
+        "ocr_status": value("ocr_status"),
+        "ocr_error": value("ocr_error"),
+    }
+
+
+def _chunk_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        section_path = json.loads(row["section_path"] or "[]")
+    except json.JSONDecodeError:
+        section_path = []
+    item = {
+        "chunk_id": row["chunk_id"],
+        "doc_id": row["doc_id"],
+        "content": row["content"],
+        "title": row["title"],
+        "publication_date": row["publication_date"],
+        "source_institution": row["source_institution"],
+        "clinical_department": row["clinical_department"],
+        "section_path": section_path,
+        "retrieval_text": row["retrieval_text"] if "retrieval_text" in row.keys() else "",
+        "chunk_type": row["chunk_type"] if "chunk_type" in row.keys() else "",
+        "token_count": row["token_count"] if "token_count" in row.keys() else 0,
+        "retrieval_key": row["retrieval_key"],
+        "source_file": row["source_file"],
+        "markdown_clean_path": row["markdown_clean_path"],
+        "chunk_index": row["chunk_index"],
+        "is_background": bool(row["is_background"]) if "is_background" in row.keys() else False,
+        "is_reference_section": bool(row["is_reference_section"]) if "is_reference_section" in row.keys() else False,
+    }
+    return _enrich_chunk_metadata(item)
+
+
+def _enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    chunk_type = str(item.get("chunk_type") or "") or classify_chunk(item)
+    item["chunk_type"] = chunk_type
+    item["token_count"] = int(item.get("token_count") or estimate_tokens(item.get("content", "")))
+    item["retrieval_text"] = item.get("retrieval_text") or retrieval_text(
+        item.get("title", ""),
+        item.get("section_path") or [],
+        chunk_type,
+        item.get("content", ""),
+    )
+    item["is_background"] = bool(item.get("is_background") or chunk_type == "background")
+    return item
+
+
+def _fuse(
+    id_field: str,
+    bm25_results: list[dict[str, Any]],
+    vector_results: list[dict[str, Any]],
+    topk: int,
+) -> list[dict[str, Any]]:
+    bm25_ids = [item[id_field] for item in bm25_results]
+    vector_ids = [item[id_field] for item in vector_results]
+    fused = rrf_fusion([bm25_ids, vector_ids])
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in bm25_results + vector_results:
+        by_id.setdefault(item[id_field], item)
+    bm25_rank = {item_id: rank for rank, item_id in enumerate(bm25_ids, start=1)}
+    vector_rank = {item_id: rank for rank, item_id in enumerate(vector_ids, start=1)}
+
+    output: list[dict[str, Any]] = []
+    for item_id, score in fused:
+        item = dict(by_id[item_id])
+        item["score"] = score
+        item["retrieval_scores"] = {
+            "bm25_rank": bm25_rank.get(item_id),
+            "vector_rank": vector_rank.get(item_id),
+            "rrf_score": score,
+        }
+        output.append(item)
+        if len(output) >= topk:
+            break
+    return output
+
+
+def _query_terms(query: str) -> list[str]:
+    seen: set[str] = set()
+    terms: list[str] = []
+    for token in TOKEN_RE.findall(query or ""):
+        token = token.strip().lower()
+        if token and token not in seen:
+            seen.add(token)
+            terms.append(token)
+    return terms
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").lower()
+
+
+def _contains_exact_phrase(text: str, query: str) -> bool:
+    query = (query or "").strip().lower()
+    if not query:
+        return False
+    lowered = (text or "").lower()
+    if query in lowered:
+        return True
+    compact_query = _compact(query)
+    return bool(compact_query and compact_query in _compact(text))
+
+
+def _field_term_hit(text: str, terms: list[str]) -> bool:
+    lowered = (text or "").lower()
+    compacted = _compact(text)
+    for term in terms:
+        if term in lowered or _compact(term) in compacted:
+            return True
+    return False
+
+
+def _is_journal_header_title(title: str) -> bool:
+    normalized = re.sub(r"\s+", " ", title or "").strip()
+    if not normalized:
+        return True
+    if JOURNAL_HEADER_RE.search(normalized) and not GUIDE_RE.search(normalized):
+        return True
+    visible = [char for char in normalized if not char.isspace()]
+    if len(visible) > 20:
+        symbol_count = sum(1 for char in visible if ord(char) < 128 and not char.isalnum())
+        if symbol_count / max(1, len(visible)) > 0.45:
+            return True
+    return False
+
+
+def _publication_year(publication_date: str | None) -> int | None:
+    match = re.search(r"(20\d{2}|19\d{2})", publication_date or "")
+    return int(match.group(1)) if match else None
+
+
+def _recency_boost(publication_date: str | None, enabled: bool) -> float:
+    if not enabled:
+        return 0.0
+    year = _publication_year(publication_date)
+    if year is None:
+        return 0.0
+    return max(0.0, min(0.15, (year - 2012) / max(1, 2026 - 2012) * 0.15))
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _rerank_documents(
+    items: list[dict[str, Any]],
+    query: str,
+    source_institution: str | None,
+    recency_boost: bool,
+    topk: int,
+) -> list[dict[str, Any]]:
+    terms = _query_terms(query)
+    ranked: list[dict[str, Any]] = []
+    for item in items:
+        title = item.get("title", "")
+        abstract = item.get("abstract", "")
+        if _is_journal_header_title(title):
+            continue
+        retrieval_scores = item.get("retrieval_scores", {})
+        boosts: dict[str, float] = {}
+        matched_fields: list[str] = []
+        exact_phrase_fields: list[str] = []
+
+        if _field_term_hit(title, terms):
+            matched_fields.append("title")
+            boosts["title"] = 0.35
+        if _field_term_hit(abstract, terms):
+            matched_fields.append("abstract")
+            boosts["abstract"] = 0.12
+        if _contains_exact_phrase(title, query):
+            exact_phrase_fields.append("title")
+            boosts["exact_phrase_title"] = 0.45
+        elif _contains_exact_phrase(abstract, query):
+            exact_phrase_fields.append("abstract")
+            boosts["exact_phrase_abstract"] = 0.2
+        if retrieval_scores.get("bm25_rank") is not None:
+            matched_fields.append("keyword")
+        if retrieval_scores.get("vector_rank") is not None:
+            matched_fields.append("vector")
+        if source_institution and source_institution.lower() in (item.get("source_institution") or "").lower():
+            matched_fields.append("source_institution")
+            boosts["source_institution"] = 0.2
+        if GUIDE_RE.search(title):
+            matched_fields.append("document_type")
+            boosts["guideline_or_consensus"] = 0.18
+        recency = _recency_boost(item.get("publication_date"), recency_boost)
+        if recency:
+            boosts["publication_date_recency"] = recency
+        if retrieval_scores.get("bm25_rank") is not None and retrieval_scores.get("vector_rank") is not None:
+            boosts["bm25_vector_agreement"] = 0.1
+
+        base_score = float(item.get("score", 0.0))
+        boost_total = sum(boosts.values())
+        quality_multiplier, quality_penalties = quality_score_multiplier(item)
+        item = dict(item)
+        item["score"] = base_score * (1.0 + boost_total) * quality_multiplier
+        item["read_key"] = item["doc_id"]
+        item["match_reason"] = {
+            "matched_fields": sorted(set(matched_fields)),
+            "exact_phrase_fields": exact_phrase_fields,
+            "boosts": boosts,
+            "quality_penalties": quality_penalties,
+            "quality_multiplier": quality_multiplier,
+            "bm25_rank": retrieval_scores.get("bm25_rank"),
+            "vector_rank": retrieval_scores.get("vector_rank"),
+            "base_rrf_score": retrieval_scores.get("rrf_score", base_score),
+        }
+        ranked.append(item)
+    ranked.sort(
+        key=lambda item: (
+            -float(item.get("score", 0.0)),
+            item.get("match_reason", {}).get("bm25_rank") is None,
+            item.get("match_reason", {}).get("vector_rank") is None,
+            -(_publication_year(item.get("publication_date")) or 0),
+            item.get("doc_id", ""),
+        )
+    )
+    standardized = []
+    for item in ranked[:topk]:
+        standardized.append(
+            {
+                "doc_id": item.get("doc_id", ""),
+                "title": item.get("title", ""),
+                "abstract": item.get("abstract", ""),
+                "publication_date": item.get("publication_date", "unknown"),
+                "source_institution": item.get("source_institution", "Unknown"),
+                "clinical_department": item.get("clinical_department", "未分类"),
+                "cleaning_quality": item.get("cleaning_quality", ""),
+                "cleaning_flags": item.get("cleaning_flags", ""),
+                "source_pdf_text_quality": item.get("source_pdf_text_quality", ""),
+                "source_pdf_needs_ocr": item.get("source_pdf_needs_ocr", False),
+                "source_pdf_is_scanned": item.get("source_pdf_is_scanned", False),
+                "pdf_text_quality": item.get("pdf_text_quality", ""),
+                "pdf_needs_ocr": item.get("pdf_needs_ocr", False),
+                "pdf_is_scanned": item.get("pdf_is_scanned", False),
+                "ocr_engine": item.get("ocr_engine", ""),
+                "ocr_applied": item.get("ocr_applied", False),
+                "ocr_status": item.get("ocr_status", ""),
+                "ocr_error": item.get("ocr_error", ""),
+                "score": item.get("score", 0.0),
+                "match_reason": item.get("match_reason", {}),
+                "read_key": item.get("read_key", item.get("doc_id", "")),
+                "retrieval_scores": item.get("retrieval_scores", {}),
+            }
+        )
+    return standardized
+
+
+def _clip_text(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _find_chunk_span(markdown_path: str, content: str) -> tuple[int | None, int | None]:
+    path = Path(markdown_path or "")
+    if not path.exists() or not content:
+        return None, None
+    try:
+        markdown = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    needle = content.strip()
+    if not needle:
+        return None, None
+    position = markdown.find(needle)
+    if position < 0:
+        snippet = needle[:300]
+        position = markdown.find(snippet)
+        if position < 0:
+            compact_markdown_chars: list[str] = []
+            compact_markdown_offsets: list[int] = []
+            for index, char in enumerate(markdown):
+                if not char.isspace():
+                    compact_markdown_chars.append(char.lower())
+                    compact_markdown_offsets.append(index)
+            compact_needle = "".join(char.lower() for char in needle if not char.isspace())
+            if len(compact_needle) < 20:
+                return None, None
+            compact_position = "".join(compact_markdown_chars).find(compact_needle[:300])
+            if compact_position < 0:
+                return None, None
+            start = compact_markdown_offsets[compact_position]
+            end_index = min(compact_position + len(compact_needle) - 1, len(compact_markdown_offsets) - 1)
+            end = compact_markdown_offsets[end_index] + 1
+            return start, end
+    return position, position + len(needle)
+
+
+def _source_quote_context(prev_content: str, content: str, next_content: str) -> str:
+    parts = []
+    if prev_content:
+        parts.append("[previous] " + _clip_text(prev_content[-500:], 500))
+    parts.append("[current] " + _clip_text(content, 1400))
+    if next_content:
+        parts.append("[next] " + _clip_text(next_content[:500], 500))
+    return "\n".join(parts)
+
+
+def _enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    with connect(db_path) as conn:
+        enriched: list[dict[str, Any]] = []
+        for item in items:
+            chunk_index = item.get("chunk_index")
+            prev_chunk_id = None
+            next_chunk_id = None
+            prev_content = ""
+            next_content = ""
+            if chunk_index is not None:
+                rows = conn.execute(
+                    """
+                    SELECT chunk_id, chunk_index, content
+                    FROM chunks
+                    WHERE doc_id=? AND chunk_index IN (?, ?)
+                    """,
+                    (item["doc_id"], int(chunk_index) - 1, int(chunk_index) + 1),
+                ).fetchall()
+                for row in rows:
+                    if row["chunk_index"] == int(chunk_index) - 1:
+                        prev_chunk_id = row["chunk_id"]
+                        prev_content = row["content"] or ""
+                    elif row["chunk_index"] == int(chunk_index) + 1:
+                        next_chunk_id = row["chunk_id"]
+                        next_content = row["content"] or ""
+
+            section_path_json = json.dumps(item.get("section_path") or [], ensure_ascii=False, separators=(",", ":"))
+            section = conn.execute(
+                """
+                SELECT heading, char_start, char_end
+                FROM sections
+                WHERE doc_id=? AND section_path=?
+                ORDER BY section_index
+                LIMIT 1
+                """,
+                (item["doc_id"], section_path_json),
+            ).fetchone()
+            heading = section["heading"] if section else None
+            section_char_start = section["char_start"] if section else None
+            section_char_end = section["char_end"] if section else None
+            char_start, char_end = _find_chunk_span(item.get("markdown_clean_path", ""), item.get("content", ""))
+            if char_start is None:
+                char_start = section_char_start
+            if char_end is None:
+                char_end = section_char_end
+
+            updated = dict(item)
+            display_heading = heading or ((item.get("section_path") or [None])[-1])
+            if display_heading and _is_journal_header_title(str(display_heading)):
+                display_heading = item.get("title")
+            updated["heading"] = display_heading
+            updated["prev_chunk_id"] = prev_chunk_id
+            updated["next_chunk_id"] = next_chunk_id
+            updated["char_start"] = char_start
+            updated["char_end"] = char_end
+            updated["source_quote_context"] = _source_quote_context(prev_content, item.get("content", ""), next_content)
+            enriched.append(updated)
+    return enriched
+
+
+def search_documents_hybrid(
+    query: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    index_dir: str | Path = DATA_DIR / "index",
+    source_institution: str | None = None,
+    clinical_department: str | None = None,
+    time_range: str | dict[str, str] | None = None,
+    publication_date: str | None = None,
+    recency_boost: bool = False,
+    topk: int = 10,
+    bm25_top_n: int = 50,
+    vector_top_n: int = 50,
+) -> list[dict[str, Any]]:
+    from src.retrieval.document_multiview_search import has_document_representations_sqlite, search_documents_multiview
+
+    if not has_document_representations_sqlite(db_path):
+        raise RuntimeError("Document hybrid search requires document_cards/document_views; rebuild rag.sqlite.")
+    return search_documents_multiview(
+        query,
+        db_path,
+        index_dir=index_dir,
+        source_institution=source_institution,
+        clinical_department=clinical_department,
+        time_range=time_range,
+        publication_date=publication_date,
+        recency_boost=recency_boost,
+        topk=topk,
+        card_bm25_top_n=bm25_top_n,
+        view_bm25_top_n=bm25_top_n,
+        card_vector_top_n=vector_top_n,
+        view_vector_top_n=vector_top_n,
+    )
+
+
+def retrieve_chunks_hybrid(
+    query: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    index_dir: str | Path = DATA_DIR / "index",
+    source_institution: str | None = None,
+    clinical_department: str | None = None,
+    time_range: str | dict[str, str] | None = None,
+    publication_date: str | None = None,
+    topk: int = 5,
+    bm25_top_n: int = 50,
+    vector_top_n: int = 50,
+    exclude_reference_sections: bool = True,
+    reranker: ChunkReranker | None = None,
+    rerank_pool_n: int | None = None,
+) -> list[dict[str, Any]]:
+    bm25_pool = retrieve_chunks_sqlite(
+        query,
+        db_path,
+        source_institution=source_institution,
+        clinical_department=clinical_department,
+        time_range=time_range,
+        topk=max(bm25_top_n, topk),
+        exclude_reference_sections=exclude_reference_sections,
+    )
+    bm25_rows = _select_by_ids(
+        db_path,
+        "chunks",
+        "chunk_id",
+        [item["chunk_id"] for item in bm25_pool],
+        "chunk_id, doc_id, content, retrieval_text, chunk_type, token_count, title, publication_date, "
+        "source_institution, clinical_department, section_path, chunk_index, retrieval_key, source_file, "
+        "markdown_clean_path, is_background, is_reference_section",
+        source_institution,
+        clinical_department,
+        time_range,
+        publication_date,
+        exclude_reference_sections,
+    )
+    bm25_results = [dict(item) for item in bm25_pool if item["chunk_id"] in bm25_rows][:bm25_top_n]
+
+    index_path = Path(index_dir) / "faiss_chunks.index"
+    mapping_path = Path(index_dir) / "faiss_chunks_mapping.jsonl"
+    vector_ids = vector_search(query, index_path, mapping_path, "chunk_id", top_n=max(vector_top_n * 4, 200))
+    vector_rows = _select_by_ids(
+        db_path,
+        "chunks",
+        "chunk_id",
+        vector_ids,
+        "chunk_id, doc_id, content, retrieval_text, chunk_type, token_count, title, publication_date, "
+        "source_institution, clinical_department, section_path, chunk_index, retrieval_key, source_file, "
+        "markdown_clean_path, is_background, is_reference_section",
+        source_institution,
+        clinical_department,
+        time_range,
+        publication_date,
+        exclude_reference_sections,
+    )
+    vector_results = [_chunk_row_to_result(vector_rows[chunk_id]) for chunk_id in vector_ids if chunk_id in vector_rows][:vector_top_n]
+    max_pool = max(topk, _env_int("CHUNK_RERANK_POOL_MAX", 120))
+    pool_size = rerank_pool_n or min(max(topk * 8, 50), max_pool)
+    fused = _fuse("chunk_id", bm25_results, vector_results, max(topk, pool_size))
+    enriched = _enrich_chunk_context(db_path, fused)
+    reranker = reranker or default_chunk_reranker()
+    return reranker.rerank(query, enriched, topk)

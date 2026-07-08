@@ -1,12 +1,12 @@
-"""Markdown cleanup entry points for evidence documents."""
+﻿"""Markdown cleanup entry points for evidence documents."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from project.pipeline.cleaner import clean_all as _clean_all
-from project.pipeline.cleaner import clean_file, clean_markdown_text
+from src.pipeline.cleaning.cleaner import clean_all as _clean_all
+from src.pipeline.cleaning.cleaner import clean_file, clean_markdown_text
 
 
 def clean_markdown_dir(

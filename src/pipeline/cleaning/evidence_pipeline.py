@@ -1,4 +1,4 @@
-"""Evidence-library cleaning pipeline.
+﻿"""Evidence-library cleaning pipeline.
 
 The pipeline is intentionally retrieval-first:
 
@@ -17,14 +17,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from project.index.bm25_store import build_bm25_indexes
-from project.index.sqlite_store import build_sqlite_store
-from project.index.vector_store import build_vector_indexes
+from src.retrieval.bm25_store import build_bm25_indexes
+from src.retrieval.document_repr import build_document_representations
+from src.retrieval.sqlite_store import build_sqlite_store
+from src.retrieval.vector_store import build_vector_indexes
 
 from src.pipeline.cleaning.block_chunker import chunk_blocks
 from src.pipeline.cleaning.block_encoder import encode_blocks
 from src.pipeline.cleaning.markdown_cleaner import clean_markdown_dir
 from src.pipeline.cleaning.pdf_to_markdown import convert_pdfs
+from src.utils.io import DATA_DIR
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,8 @@ class EvidencePipelinePaths:
     index_dir: Path
     raw_manifest: Path
     document_manifest: Path
+    document_cards: Path
+    document_views: Path
     sqlite_db: Path
     run_manifest: Path
 
@@ -56,6 +60,8 @@ class EvidencePipelinePaths:
             index_dir=root / "index",
             raw_manifest=root / "documents_raw.jsonl",
             document_manifest=root / "documents.jsonl",
+            document_cards=root / "document_cards.jsonl",
+            document_views=root / "document_views.jsonl",
             sqlite_db=root / "index" / "rag.sqlite",
             run_manifest=root / "evidence_pipeline_manifest.json",
         )
@@ -72,12 +78,14 @@ def write_json(path: str | Path, payload: dict[str, Any]) -> None:
 
 def run_evidence_pipeline(
     *,
-    data_dir: str | Path = "project/data",
+    data_dir: str | Path = DATA_DIR,
     raw_pdf_dir: str | Path | None = None,
     skip_pdf_to_markdown: bool = False,
     skip_vector: bool = True,
     legacy_json_bm25: bool = False,
     embedding_model: str = "BAAI/bge-m3",
+    ocr_mode: str = "auto",
+    ocr_languages: str = "chi_sim+eng",
 ) -> dict[str, Any]:
     """Run the evidence-library build and return a machine-readable manifest."""
 
@@ -99,10 +107,18 @@ def run_evidence_pipeline(
             "markdown_raw_dir": str(paths.markdown_raw_dir),
         }
     else:
-        stages["pdf_to_markdown"] = convert_pdfs(paths.raw_pdf_dir, paths.markdown_raw_dir, paths.raw_manifest)
+        stages["pdf_to_markdown"] = convert_pdfs(
+            paths.raw_pdf_dir,
+            paths.markdown_raw_dir,
+            paths.raw_manifest,
+            ocr_mode=ocr_mode,
+            ocr_output_dir=paths.data_dir / "ocr_pdf",
+            ocr_languages=ocr_languages,
+        )
 
     stages["clean_markdown"] = clean_markdown_dir(paths.markdown_raw_dir, paths.markdown_clean_dir, paths.document_manifest)
     stages["encode_blocks"] = encode_blocks(paths.markdown_clean_dir, paths.blocks_dir)
+    stages["document_representations"] = build_document_representations(paths.markdown_clean_dir, paths.data_dir)
     stages["chunk_blocks"] = chunk_blocks(paths.markdown_clean_dir, paths.chunks_dir)
     stages["sqlite_fts"] = build_sqlite_store(paths.data_dir, paths.sqlite_db)
     gc.collect()
