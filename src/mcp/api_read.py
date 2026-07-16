@@ -11,12 +11,12 @@ from src.utils.front_matter import parse_front_matter
 from src.utils.io import DATA_DIR, iter_markdown_files
 
 
-def _validate(payload: dict[str, Any] | ReadInput) -> ReadInput:
+def helper_validate(payload: dict[str, Any] | ReadInput) -> ReadInput:
     return payload if isinstance(payload, ReadInput) else ReadInput(**payload)
 
 
 def read(payload: dict[str, Any] | ReadInput, data_dir: str | Path = DATA_DIR) -> dict[str, Any]:
-    request = _validate(payload)
+    request = helper_validate(payload)
     sqlite_path = Path(data_dir) / "index" / DEFAULT_DB_PATH.name
     if sqlite_path.exists():
         return read_document_sqlite(

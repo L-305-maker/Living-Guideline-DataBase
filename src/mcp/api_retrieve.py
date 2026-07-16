@@ -8,7 +8,7 @@ from typing import Any
 from src.pipeline.cleaning.semantic_chunker import estimate_tokens, retrieval_text
 from src.retrieval.bm25_store import load_store
 from src.retrieval.document_repr.section_classifier import classify_chunk
-from src.retrieval.hybrid import retrieve_chunks_hybrid
+from src.retrieval.hybrid import retrieve_chunks_with_consensus_fallback
 from src.retrieval.rrf import rrf_fusion
 from src.retrieval.sqlite_store import DEFAULT_DB_PATH
 from src.retrieval.vector_store import vector_search
@@ -16,11 +16,11 @@ from src.models.schemas import RetrieveInput
 from src.utils.io import DATA_DIR
 
 
-def _validate(payload: dict[str, Any] | RetrieveInput) -> RetrieveInput:
+def helper_validate(payload: dict[str, Any] | RetrieveInput) -> RetrieveInput:
     return payload if isinstance(payload, RetrieveInput) else RetrieveInput(**payload)
 
 
-def _matches(record: dict[str, Any], request: RetrieveInput) -> bool:
+def helper_matches(record: dict[str, Any], request: RetrieveInput) -> bool:
     if request.source_institution and request.source_institution.lower() not in (record.get("source_institution") or "").lower():
         return False
     if request.clinical_department and request.clinical_department.lower() not in (record.get("clinical_department") or "").lower():
@@ -29,11 +29,11 @@ def _matches(record: dict[str, Any], request: RetrieveInput) -> bool:
 
 
 def retrieve(payload: dict[str, Any] | RetrieveInput, data_dir: str | Path = DATA_DIR) -> list[dict[str, Any]]:
-    request = _validate(payload)
+    request = helper_validate(payload)
     index_dir = Path(data_dir) / "index"
     sqlite_path = index_dir / DEFAULT_DB_PATH.name
     if sqlite_path.exists():
-        return retrieve_chunks_hybrid(
+        return retrieve_chunks_with_consensus_fallback(
             request.query,
             sqlite_path,
             index_dir=index_dir,
@@ -62,7 +62,7 @@ def retrieve(payload: dict[str, Any] | RetrieveInput, data_dir: str | Path = DAT
         top_n=50,
     )
     records = {record["chunk_id"]: record for record in store.records}
-    vector_ids = [chunk_id for chunk_id in vector_ids_raw if chunk_id in records and _matches(records[chunk_id], request)]
+    vector_ids = [chunk_id for chunk_id in vector_ids_raw if chunk_id in records and helper_matches(records[chunk_id], request)]
     fused = rrf_fusion([bm25_ids, vector_ids])
     results: list[dict[str, Any]] = []
     for chunk_id, score in fused:
