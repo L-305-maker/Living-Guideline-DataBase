@@ -769,7 +769,9 @@ def classify_chunk_departments(
         title=" > ".join(section_path), abstract=chunk_type, content=content,
         allowed=parent, relative_threshold=0.5, minimum_score=1,
     )
-    labels = [item for item in result["clinical_departments"] if item in parent] or [UNKNOWN_DEPARTMENT]
+    labels = [item for item in result["clinical_departments"] if item in parent]
+    if not labels:
+        labels = [parent[0] if parent else UNKNOWN_DEPARTMENT]
     result["clinical_departments"] = labels
     result["clinical_department"] = labels[0]
     result["department_scope"] = "compositive" if len(labels) > 1 else "single"

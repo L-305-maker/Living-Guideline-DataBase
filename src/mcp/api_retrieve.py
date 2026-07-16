@@ -13,6 +13,7 @@ from src.retrieval.rrf import rrf_fusion
 from src.retrieval.sqlite_store import DEFAULT_DB_PATH
 from src.retrieval.vector_store import vector_search
 from src.models.schemas import RetrieveInput
+from src.mcp.response_projection import compact_chunk_result
 from src.utils.io import DATA_DIR
 
 
@@ -33,7 +34,7 @@ def retrieve(payload: dict[str, Any] | RetrieveInput, data_dir: str | Path = DAT
     index_dir = Path(data_dir) / "index"
     sqlite_path = index_dir / DEFAULT_DB_PATH.name
     if sqlite_path.exists():
-        return retrieve_chunks_with_consensus_fallback(
+        results = retrieve_chunks_with_consensus_fallback(
             request.query,
             sqlite_path,
             index_dir=index_dir,
@@ -44,6 +45,7 @@ def retrieve(payload: dict[str, Any] | RetrieveInput, data_dir: str | Path = DAT
             topk=request.topk,
             exclude_reference_sections=True,
         )
+        return results if request.debug else [compact_chunk_result(item) for item in results]
     store = load_store(index_dir / "bm25_chunks.json")
     bm25 = store.search(
         request.query,
@@ -93,4 +95,4 @@ def retrieve(payload: dict[str, Any] | RetrieveInput, data_dir: str | Path = DAT
         )
         if len(results) >= request.topk:
             break
-    return results
+    return results if request.debug else [compact_chunk_result(item) for item in results]

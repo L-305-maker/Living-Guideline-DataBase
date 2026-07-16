@@ -80,6 +80,49 @@ SPACED_OCR_RE = re.compile(r"(?:[A-Za-zＡ-Ｚａ-ｚ０-９]\s+){12,}")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;。！？；])\s+")
 
 
+CARD_OUTPUT_FIELDS = (
+    "doc_id",
+    "title",
+    "publication_date",
+    "source_institution",
+    "clinical_departments",
+    "document_kind",
+    "card_text",
+)
+VIEW_OUTPUT_FIELDS = (
+    "view_id",
+    "doc_id",
+    "view_type",
+    "priority",
+    "title",
+    "text",
+    "publication_date",
+    "source_institution",
+    "clinical_departments",
+    "document_kind",
+)
+
+
+def helper_departments(record: dict[str, Any]) -> list[str]:
+    labels = record.get("clinical_departments") or []
+    if isinstance(labels, str):
+        labels = labels.split("|")
+    if not labels:
+        labels = str(record.get("clinical_department") or "未分类").split("|")
+    return list(dict.fromkeys(str(label).strip() for label in labels if str(label).strip())) or ["未分类"]
+
+
+def compact_document_card(card: dict[str, Any]) -> dict[str, Any]:
+    values = dict(card)
+    values["clinical_departments"] = helper_departments(card)
+    return {field: values.get(field, "") for field in CARD_OUTPUT_FIELDS}
+
+
+def compact_document_view(view: dict[str, Any]) -> dict[str, Any]:
+    values = dict(view)
+    values["clinical_departments"] = helper_departments(view)
+    return {field: values.get(field, "") for field in VIEW_OUTPUT_FIELDS}
+
 def helper_normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -412,35 +455,20 @@ def helper_view_record(card: dict[str, Any], view_type: str, text: str) -> dict[
     if not text:
         return None
     doc_id = card["doc_id"]
-    return {
-        "view_id": f"{doc_id}__{view_type}",
-        "doc_id": doc_id,
-        "view_type": view_type,
-        "text": text,
-        "priority": VIEW_PRIORITIES.get(view_type, 1.0),
-        "title": card.get("title", ""),
-        "publication_date": card.get("publication_date", "unknown"),
-        "source_institution": card.get("source_institution", "Unknown"),
-        "clinical_department": card.get("clinical_department", "\u672a\u5206\u7c7b"),
-        "clinical_departments": card.get("clinical_departments") or [card.get("clinical_department", "未分类")],
-        "department_scope": card.get("department_scope") or "single",
-        "document_kind": card.get("document_kind") or "guideline",
-        "cleaning_quality": card.get("cleaning_quality", ""),
-        "cleaning_flags": card.get("cleaning_flags", ""),
-        "source_pdf_text_quality": card.get("source_pdf_text_quality", ""),
-        "source_pdf_needs_ocr": card.get("source_pdf_needs_ocr", ""),
-        "source_pdf_is_scanned": card.get("source_pdf_is_scanned", ""),
-        "pdf_text_quality": card.get("pdf_text_quality", ""),
-        "pdf_needs_ocr": card.get("pdf_needs_ocr", ""),
-        "pdf_is_scanned": card.get("pdf_is_scanned", ""),
-        "ocr_engine": card.get("ocr_engine", ""),
-        "ocr_applied": card.get("ocr_applied", ""),
-        "ocr_status": card.get("ocr_status", ""),
-        "ocr_error": card.get("ocr_error", ""),
-        "markdown_clean_path": card.get("markdown_clean_path", ""),
-    }
-
-
+    return compact_document_view(
+        {
+            "view_id": f"{doc_id}__{view_type}",
+            "doc_id": doc_id,
+            "view_type": view_type,
+            "text": text,
+            "priority": VIEW_PRIORITIES.get(view_type, 1.0),
+            "title": card.get("title", ""),
+            "publication_date": card.get("publication_date", "unknown"),
+            "source_institution": card.get("source_institution", "Unknown"),
+            "clinical_departments": helper_departments(card),
+            "document_kind": card.get("document_kind") or "guideline",
+        }
+    )
 def build_document_views(card: dict[str, Any]) -> list[dict[str, Any]]:
     """Create independently searchable document views from a card."""
 
@@ -469,7 +497,7 @@ def build_document_representations(
     for path in iter_markdown_files(clean_dir):
         markdown = path.read_text(encoding="utf-8", errors="replace")
         card = build_document_card(markdown, path)
-        cards.append(card)
+        cards.append(compact_document_card(card))
         # 每个 card 可派生多个检索意图 view，但仍共享同一个 doc_id。
         views.extend(build_document_views(card))
 

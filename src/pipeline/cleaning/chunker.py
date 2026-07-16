@@ -23,6 +23,38 @@ from src.utils.ids import make_chunk_id
 from src.utils.io import DATA_DIR, ensure_dir, iter_markdown_files, write_jsonl
 
 
+CHUNK_OUTPUT_FIELDS = (
+    "chunk_id",
+    "doc_id",
+    "title",
+    "publication_date",
+    "source_institution",
+    "clinical_departments",
+    "document_kind",
+    "section_path",
+    "chunk_index",
+    "content",
+    "retrieval_text",
+    "chunk_type",
+    "token_count",
+    "retrieval_key",
+    "is_background",
+    "is_reference_section",
+)
+
+
+def compact_chunk_record(record: dict[str, Any] | ChunkRecord) -> dict[str, Any]:
+    values = dump_model(record) if isinstance(record, ChunkRecord) else dict(record)
+    labels = values.get("clinical_departments") or []
+    if isinstance(labels, str):
+        labels = labels.split("|")
+    if not labels:
+        labels = str(values.get("clinical_department") or "未分类").split("|")
+    values["clinical_departments"] = list(
+        dict.fromkeys(str(label).strip() for label in labels if str(label).strip())
+    ) or ["未分类"]
+    return {field: values.get(field) for field in CHUNK_OUTPUT_FIELDS}
+
 def split_section_content(
     content: str,
     min_tokens: int = 120,
@@ -96,7 +128,7 @@ def chunk_file(clean_path: str | Path, output_dir: str | Path = DATA_DIR / "chun
     doc_id = metadata["id"]
     chunks = chunk_markdown(markdown, str(path))
     out = ensure_dir(output_dir) / f"{doc_id}.jsonl"
-    write_jsonl(out, [dump_model(chunk) for chunk in chunks])
+    write_jsonl(out, [compact_chunk_record(chunk) for chunk in chunks])
     return chunks
 
 
@@ -108,7 +140,7 @@ def chunk_all(input_dir: str | Path = DATA_DIR / "markdown_clean", output_dir: s
         chunks = chunk_file(path, output_dir)
         active_doc_ids.add(chunks[0].doc_id if chunks else path.stem)
         docs += 1
-        all_chunks.extend(dump_model(chunk) for chunk in chunks)
+        all_chunks.extend(compact_chunk_record(chunk) for chunk in chunks)
     chunks_dir = Path(output_dir)
     write_jsonl(chunks_dir / "all_chunks.jsonl", all_chunks)
     stale_files_removed = 0

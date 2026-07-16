@@ -10,7 +10,6 @@ __pycache__/
 .agents/
 .vs/
 .ruff_cache/
-deploy/
 .codex/
 tests/
 tmp/

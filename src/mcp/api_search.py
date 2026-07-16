@@ -8,6 +8,7 @@ from typing import Any
 from src.retrieval.document_multiview_search import has_document_representations_sqlite, search_documents_with_consensus_fallback
 from src.retrieval.sqlite_store import DEFAULT_DB_PATH
 from src.models.schemas import SearchInput
+from src.mcp.response_projection import compact_document_result
 from src.utils.io import DATA_DIR
 
 
@@ -21,7 +22,7 @@ def search(payload: dict[str, Any] | SearchInput, data_dir: str | Path = DATA_DI
     sqlite_path = index_dir / DEFAULT_DB_PATH.name
     if not sqlite_path.exists() or not has_document_representations_sqlite(sqlite_path):
         raise RuntimeError("Document search requires the new document_cards/document_views SQLite index; rebuild rag.sqlite.")
-    return search_documents_with_consensus_fallback(
+    results = search_documents_with_consensus_fallback(
         request.query,
         sqlite_path,
         index_dir=index_dir,
@@ -32,3 +33,4 @@ def search(payload: dict[str, Any] | SearchInput, data_dir: str | Path = DATA_DI
         recency_boost=request.recency_boost,
         topk=request.topk,
     )
+    return results if request.debug else [compact_document_result(item) for item in results]

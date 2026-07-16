@@ -96,6 +96,7 @@ class SearchInput(BaseModel):
     publication_date: str | None = None
     recency_boost: bool = False
     topk: int = 20
+    debug: bool = False
 
 
 class ReadInput(BaseModel):
@@ -111,6 +112,7 @@ class RetrieveInput(BaseModel):
     clinical_department: str | None = None
     time_range: str | dict[str, str] | None = None
     publication_date: str | None = None
+    debug: bool = False
 
 
 def dump_model(model: BaseModel) -> dict[str, Any]:

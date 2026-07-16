@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import json
 import os
 import re
@@ -48,27 +50,29 @@ def helper_metadata_sql(
     time_range: str | dict[str, str] | None,
     publication_date: str | None,
     exclude_reference_sections: bool = False,
+    alias: str | None = None,
 ) -> tuple[str, list[Any]]:
+    prefix = f"{alias}." if alias else ""
     clauses: list[str] = []
     params: list[Any] = []
     if source_institution:
-        clauses.append("source_institution LIKE ?")
+        clauses.append(f"{prefix}source_institution LIKE ?")
         params.append(f"%{source_institution}%")
     if clinical_department:
-        clauses.append("clinical_department LIKE ?")
+        clauses.append(f"{prefix}clinical_department LIKE ?")
         params.append(f"%{clinical_department}%")
     start, end = helper_time_range(time_range)
     if start:
-        clauses.append("publication_date >= ?")
+        clauses.append(f"{prefix}publication_date >= ?")
         params.append(start)
     if end:
-        clauses.append("publication_date <= ?")
+        clauses.append(f"{prefix}publication_date <= ?")
         params.append(end)
     if publication_date:
-        clauses.append("publication_date = ?")
+        clauses.append(f"{prefix}publication_date = ?")
         params.append(publication_date)
     if exclude_reference_sections:
-        clauses.append("is_reference_section = 0")
+        clauses.append(f"{prefix}is_reference_section = 0")
     return (" AND ".join(clauses), params)
 
 
@@ -84,26 +88,40 @@ def helper_select_by_ids(
     publication_date: str | None,
     exclude_reference_sections: bool = False,
     document_kind: str | None = None,
+    join_documents: bool = False,
 ) -> dict[str, sqlite3.Row]:
     if not ids:
         return {}
+    alias = "t" if join_documents else None
+    prefix = f"{alias}." if alias else ""
     placeholders = ",".join("?" for _ in ids)
-    where = [f"{id_field} IN ({placeholders})"]
+    where = [f"{prefix}{id_field} IN ({placeholders})"]
     params: list[Any] = list(ids)
     metadata_where, metadata_params = helper_metadata_sql(
-        source_institution, clinical_department, time_range, publication_date, exclude_reference_sections
+        source_institution,
+        clinical_department,
+        time_range,
+        publication_date,
+        exclude_reference_sections,
+        alias,
     )
     if metadata_where:
         where.append(metadata_where)
         params.extend(metadata_params)
-    if document_kind:
-        where.append(f"EXISTS (SELECT 1 FROM documents d_kind WHERE d_kind.doc_id={table}.doc_id AND d_kind.document_kind=?)")
-        params.append(document_kind)
-    sql = f"SELECT {columns} FROM {table} WHERE " + " AND ".join(where)
-    with connect(db_path) as conn:
+    if join_documents:
+        from_sql = f"{table} t JOIN documents d ON d.doc_id=t.doc_id"
+        if document_kind:
+            where.append("d.document_kind=?")
+            params.append(document_kind)
+    else:
+        from_sql = table
+        if document_kind:
+            where.append(f"EXISTS (SELECT 1 FROM documents d_kind WHERE d_kind.doc_id={table}.doc_id AND d_kind.document_kind=?)")
+            params.append(document_kind)
+    sql = f"SELECT {columns} FROM {from_sql} WHERE " + " AND ".join(where)
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(sql, params).fetchall()
     return {row[id_field]: row for row in rows}
-
 
 def helper_doc_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
     keys = set(row.keys())
@@ -454,7 +472,7 @@ def helper_source_quote_context(prev_content: str, content: str, next_content: s
 def helper_enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not items:
         return []
-    with connect(db_path) as conn:
+    with closing(connect(db_path)) as conn:
         enriched: list[dict[str, Any]] = []
         for item in items:
             chunk_index = item.get("chunk_index")
@@ -598,10 +616,14 @@ def recall_chunks_hybrid(
     )
     bm25_rows = helper_select_by_ids(
         db_path, "chunks", "chunk_id", [item["chunk_id"] for item in bm25_pool],
-        "chunk_id, doc_id, content, retrieval_text, chunk_type, token_count, title, publication_date, "
-        "source_institution, clinical_department, section_path, chunk_index, retrieval_key, source_file, "
-        "markdown_clean_path, is_background, is_reference_section",
+        "t.chunk_id AS chunk_id, t.doc_id AS doc_id, t.content AS content, t.retrieval_text AS retrieval_text, "
+        "t.chunk_type AS chunk_type, t.token_count AS token_count, t.title AS title, t.publication_date AS publication_date, "
+        "t.source_institution AS source_institution, t.clinical_department AS clinical_department, "
+        "t.section_path AS section_path, t.chunk_index AS chunk_index, t.retrieval_key AS retrieval_key, "
+        "d.source_file AS source_file, d.markdown_clean_path AS markdown_clean_path, "
+        "t.is_background AS is_background, t.is_reference_section AS is_reference_section",
         source_institution, clinical_department, time_range, publication_date, exclude_reference_sections, document_kind,
+        join_documents=True,
     )
     bm25_results = [dict(item) for item in bm25_pool if item["chunk_id"] in bm25_rows][:recall_n]
 
@@ -610,10 +632,14 @@ def recall_chunks_hybrid(
     vector_ids = vector_search(query, index_path, mapping_path, "chunk_id", top_n=max(recall_n * 4, 200))
     vector_rows = helper_select_by_ids(
         db_path, "chunks", "chunk_id", vector_ids,
-        "chunk_id, doc_id, content, retrieval_text, chunk_type, token_count, title, publication_date, "
-        "source_institution, clinical_department, section_path, chunk_index, retrieval_key, source_file, "
-        "markdown_clean_path, is_background, is_reference_section",
+        "t.chunk_id AS chunk_id, t.doc_id AS doc_id, t.content AS content, t.retrieval_text AS retrieval_text, "
+        "t.chunk_type AS chunk_type, t.token_count AS token_count, t.title AS title, t.publication_date AS publication_date, "
+        "t.source_institution AS source_institution, t.clinical_department AS clinical_department, "
+        "t.section_path AS section_path, t.chunk_index AS chunk_index, t.retrieval_key AS retrieval_key, "
+        "d.source_file AS source_file, d.markdown_clean_path AS markdown_clean_path, "
+        "t.is_background AS is_background, t.is_reference_section AS is_reference_section",
         source_institution, clinical_department, time_range, publication_date, exclude_reference_sections, document_kind,
+        join_documents=True,
     )
     vector_results = [
         helper_chunk_row_to_result(vector_rows[chunk_id]) for chunk_id in vector_ids if chunk_id in vector_rows

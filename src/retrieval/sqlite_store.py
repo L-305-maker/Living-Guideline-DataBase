@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import argparse
 import json
 import re
@@ -123,8 +125,6 @@ CREATE TABLE IF NOT EXISTS chunks (
     chunk_type TEXT NOT NULL DEFAULT 'other',
     token_count INTEGER NOT NULL DEFAULT 0,
     retrieval_key TEXT NOT NULL UNIQUE,
-    source_file TEXT NOT NULL DEFAULT '',
-    markdown_clean_path TEXT NOT NULL DEFAULT '',
     is_background INTEGER NOT NULL DEFAULT 0,
     is_reference_section INTEGER NOT NULL DEFAULT 0,
     title_zh_tokens TEXT NOT NULL DEFAULT '',
@@ -140,26 +140,11 @@ CREATE TABLE IF NOT EXISTS document_cards (
     publication_year INTEGER,
     source_institution TEXT NOT NULL DEFAULT 'Unknown',
     clinical_department TEXT NOT NULL DEFAULT '未分类',
-    markdown_clean_path TEXT NOT NULL DEFAULT '',
-    cleaning_quality TEXT NOT NULL DEFAULT '',
-    cleaning_flags TEXT NOT NULL DEFAULT '',
-    source_pdf_text_quality TEXT NOT NULL DEFAULT '',
-    source_pdf_needs_ocr INTEGER NOT NULL DEFAULT 0,
-    source_pdf_is_scanned INTEGER NOT NULL DEFAULT 0,
-    pdf_text_quality TEXT NOT NULL DEFAULT '',
-    pdf_needs_ocr INTEGER NOT NULL DEFAULT 0,
-    pdf_is_scanned INTEGER NOT NULL DEFAULT 0,
-    ocr_engine TEXT NOT NULL DEFAULT '',
-    ocr_applied INTEGER NOT NULL DEFAULT 0,
-    ocr_status TEXT NOT NULL DEFAULT '',
-    ocr_error TEXT NOT NULL DEFAULT '',
     card_text TEXT NOT NULL DEFAULT '',
-    fields_json TEXT NOT NULL DEFAULT '{}',
     title_zh_tokens TEXT NOT NULL DEFAULT '',
     card_zh_tokens TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
 );
-
 CREATE TABLE IF NOT EXISTS document_views (
     view_id TEXT PRIMARY KEY,
     doc_id TEXT NOT NULL,
@@ -170,25 +155,11 @@ CREATE TABLE IF NOT EXISTS document_views (
     publication_year INTEGER,
     source_institution TEXT NOT NULL DEFAULT 'Unknown',
     clinical_department TEXT NOT NULL DEFAULT '未分类',
-    markdown_clean_path TEXT NOT NULL DEFAULT '',
-    cleaning_quality TEXT NOT NULL DEFAULT '',
-    cleaning_flags TEXT NOT NULL DEFAULT '',
-    source_pdf_text_quality TEXT NOT NULL DEFAULT '',
-    source_pdf_needs_ocr INTEGER NOT NULL DEFAULT 0,
-    source_pdf_is_scanned INTEGER NOT NULL DEFAULT 0,
-    pdf_text_quality TEXT NOT NULL DEFAULT '',
-    pdf_needs_ocr INTEGER NOT NULL DEFAULT 0,
-    pdf_is_scanned INTEGER NOT NULL DEFAULT 0,
-    ocr_engine TEXT NOT NULL DEFAULT '',
-    ocr_applied INTEGER NOT NULL DEFAULT 0,
-    ocr_status TEXT NOT NULL DEFAULT '',
-    ocr_error TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL DEFAULT '',
     title_zh_tokens TEXT NOT NULL DEFAULT '',
     text_zh_tokens TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
 );
-
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     title,
     section_path_text,
@@ -584,8 +555,6 @@ def helper_insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: i
             chunk_type,
             int(rec.get("token_count") or 0),
             rec.get("retrieval_key") or "",
-            rec.get("source_file") or "",
-            rec.get("markdown_clean_path") or "",
             1 if rec.get("is_background") else 0,
             1 if rec.get("is_reference_section") else 0,
             helper_zh_token_text(rec.get("title") or ""),
@@ -599,10 +568,10 @@ def helper_insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: i
                 INSERT INTO chunks
                 (chunk_id, doc_id, title, publication_date, publication_year, source_institution, clinical_department,
                  section_path, section_path_text, chunk_index, content, retrieval_text, chunk_type, token_count,
-                 retrieval_key, source_file, markdown_clean_path, is_background, is_reference_section,
+                 retrieval_key, is_background, is_reference_section,
                  title_zh_tokens, section_path_zh_tokens,
                  content_zh_tokens)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 rows,
             )
@@ -614,10 +583,10 @@ def helper_insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: i
             INSERT INTO chunks
             (chunk_id, doc_id, title, publication_date, publication_year, source_institution, clinical_department,
              section_path, section_path_text, chunk_index, content, retrieval_text, chunk_type, token_count,
-             retrieval_key, source_file, markdown_clean_path, is_background, is_reference_section,
+             retrieval_key, is_background, is_reference_section,
              title_zh_tokens, section_path_zh_tokens,
              content_zh_tokens)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             rows,
         )
@@ -634,49 +603,31 @@ def helper_insert_document_cards(conn: sqlite3.Connection, data_dir: Path, allow
         doc_id = rec.get("doc_id")
         if doc_id not in allowed_doc_ids:
             continue
-        fields = rec.get("fields") or {}
         card_text = rec.get("card_text") or ""
-        row = (
-            doc_id,
-            rec.get("title") or "",
-            rec.get("publication_date") or "unknown",
-            helper_year(rec.get("publication_date")),
-            rec.get("source_institution") or "Unknown",
-            helper_department_text(rec),
-            rec.get("markdown_clean_path") or "",
-            rec.get("cleaning_quality") or "",
-            rec.get("cleaning_flags") or "",
-            rec.get("source_pdf_text_quality") or "",
-            1 if helper_truthy(rec.get("source_pdf_needs_ocr")) else 0,
-            1 if helper_truthy(rec.get("source_pdf_is_scanned")) else 0,
-            rec.get("pdf_text_quality") or "",
-            1 if helper_truthy(rec.get("pdf_needs_ocr")) else 0,
-            1 if helper_truthy(rec.get("pdf_is_scanned")) else 0,
-            rec.get("ocr_engine") or "",
-            1 if helper_truthy(rec.get("ocr_applied")) else 0,
-            rec.get("ocr_status") or "",
-            rec.get("ocr_error") or "",
-            card_text,
-            serialize_json(fields),
-            helper_zh_token_text(rec.get("title") or ""),
-            helper_zh_token_text(card_text, max_chars=12000),
+        rows.append(
+            (
+                doc_id,
+                rec.get("title") or "",
+                rec.get("publication_date") or "unknown",
+                helper_year(rec.get("publication_date")),
+                rec.get("source_institution") or "Unknown",
+                helper_department_text(rec),
+                card_text,
+                helper_zh_token_text(rec.get("title") or ""),
+                helper_zh_token_text(card_text, max_chars=12000),
+            )
         )
-        rows.append(row)
     if rows:
         conn.executemany(
             """
             INSERT INTO document_cards
             (doc_id, title, publication_date, publication_year, source_institution, clinical_department,
-             markdown_clean_path, cleaning_quality, cleaning_flags,
-             source_pdf_text_quality, source_pdf_needs_ocr, source_pdf_is_scanned,
-             pdf_text_quality, pdf_needs_ocr, pdf_is_scanned, ocr_engine, ocr_applied, ocr_status, ocr_error,
-             card_text, fields_json, title_zh_tokens, card_zh_tokens)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             card_text, title_zh_tokens, card_zh_tokens)
+            VALUES (?,?,?,?,?,?,?,?,?)
             """,
             rows,
         )
     return len(rows)
-
 
 def helper_insert_document_views(conn: sqlite3.Connection, data_dir: Path, allowed_doc_ids: set[str], batch_size: int) -> int:
     path = data_dir / "document_views.jsonl"
@@ -684,70 +635,41 @@ def helper_insert_document_views(conn: sqlite3.Connection, data_dir: Path, allow
         return 0
     count = 0
     rows = []
+    insert_sql = """
+        INSERT INTO document_views
+        (view_id, doc_id, view_type, priority, title, publication_date, publication_year,
+         source_institution, clinical_department, text, title_zh_tokens, text_zh_tokens)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """
     for rec in read_jsonl(path):
         doc_id = rec.get("doc_id")
         if doc_id not in allowed_doc_ids:
             continue
         text = rec.get("text") or ""
-        row = (
-            rec.get("view_id") or f"{doc_id}__{rec.get('view_type')}",
-            doc_id,
-            rec.get("view_type") or "",
-            float(rec.get("priority") or 1.0),
-            rec.get("title") or "",
-            rec.get("publication_date") or "unknown",
-            helper_year(rec.get("publication_date")),
-            rec.get("source_institution") or "Unknown",
-            helper_department_text(rec),
-            rec.get("markdown_clean_path") or "",
-            rec.get("cleaning_quality") or "",
-            rec.get("cleaning_flags") or "",
-            rec.get("source_pdf_text_quality") or "",
-            1 if helper_truthy(rec.get("source_pdf_needs_ocr")) else 0,
-            1 if helper_truthy(rec.get("source_pdf_is_scanned")) else 0,
-            rec.get("pdf_text_quality") or "",
-            1 if helper_truthy(rec.get("pdf_needs_ocr")) else 0,
-            1 if helper_truthy(rec.get("pdf_is_scanned")) else 0,
-            rec.get("ocr_engine") or "",
-            1 if helper_truthy(rec.get("ocr_applied")) else 0,
-            rec.get("ocr_status") or "",
-            rec.get("ocr_error") or "",
-            text,
-            helper_zh_token_text(rec.get("title") or ""),
-            helper_zh_token_text(text, max_chars=8000),
-        )
-        rows.append(row)
-        if len(rows) >= batch_size:
-            conn.executemany(
-                """
-                INSERT INTO document_views
-                (view_id, doc_id, view_type, priority, title, publication_date, publication_year,
-                 source_institution, clinical_department, markdown_clean_path, cleaning_quality, cleaning_flags,
-                 source_pdf_text_quality, source_pdf_needs_ocr,
-                 source_pdf_is_scanned, pdf_text_quality, pdf_needs_ocr, pdf_is_scanned, ocr_engine, ocr_applied,
-                 ocr_status, ocr_error, text, title_zh_tokens, text_zh_tokens)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                rows,
+        rows.append(
+            (
+                rec.get("view_id") or f"{doc_id}__{rec.get('view_type')}",
+                doc_id,
+                rec.get("view_type") or "",
+                float(rec.get("priority") or 1.0),
+                rec.get("title") or "",
+                rec.get("publication_date") or "unknown",
+                helper_year(rec.get("publication_date")),
+                rec.get("source_institution") or "Unknown",
+                helper_department_text(rec),
+                text,
+                helper_zh_token_text(rec.get("title") or ""),
+                helper_zh_token_text(text, max_chars=8000),
             )
+        )
+        if len(rows) >= batch_size:
+            conn.executemany(insert_sql, rows)
             count += len(rows)
             rows.clear()
     if rows:
-        conn.executemany(
-            """
-            INSERT INTO document_views
-            (view_id, doc_id, view_type, priority, title, publication_date, publication_year,
-             source_institution, clinical_department, markdown_clean_path, cleaning_quality, cleaning_flags,
-             source_pdf_text_quality, source_pdf_needs_ocr,
-             source_pdf_is_scanned, pdf_text_quality, pdf_needs_ocr, pdf_is_scanned, ocr_engine, ocr_applied,
-             ocr_status, ocr_error, text, title_zh_tokens, text_zh_tokens)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            rows,
-        )
+        conn.executemany(insert_sql, rows)
         count += len(rows)
     return count
-
 
 def build_sqlite_store(
     data_dir: str | Path = DATA_DIR,
@@ -758,7 +680,7 @@ def build_sqlite_store(
     data_path = Path(data_dir)
     allowed_doc_ids = helper_document_ids(data_path)
     init_schema(db_path, reset=reset)
-    with connect(db_path) as conn:
+    with closing(connect(db_path)) as conn:
         helper_clear(conn)
         documents = helper_insert_documents(conn, data_path)
         conn.commit()
@@ -795,7 +717,7 @@ def build_sqlite_store(
 
 
 def stats(db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
-    with connect(db_path) as conn:
+    with closing(connect(db_path)) as conn:
         payload: dict[str, Any] = {}
         for table in [
             "documents",
@@ -869,53 +791,46 @@ def helper_search_document_cards_fts(
     metadata_sql = helper_metadata_where("dc", source_institution, clinical_department, time_range, params, document_kind)
     params.append(topk)
     sql = f"""
-        SELECT dc.doc_id, dc.title, dc.card_text, dc.fields_json, dc.publication_date,
-               dc.source_institution, dc.clinical_department, dc.cleaning_quality, dc.cleaning_flags,
-               dc.source_pdf_text_quality, dc.source_pdf_needs_ocr,
-               dc.source_pdf_is_scanned, dc.pdf_text_quality, dc.pdf_needs_ocr, dc.pdf_is_scanned,
-               dc.ocr_engine, dc.ocr_applied, dc.ocr_status, dc.ocr_error,
-               -- SQLite FTS5 的 BM25 值越小排名越靠前，返回前会统一取负数作为正向分数。
+        SELECT dc.doc_id, dc.title, dc.card_text, dc.publication_date,
+               dc.source_institution, dc.clinical_department, d.cleaning_quality, d.cleaning_flags,
+               d.source_pdf_text_quality, d.source_pdf_needs_ocr, d.source_pdf_is_scanned,
+               d.pdf_text_quality, d.pdf_needs_ocr, d.pdf_is_scanned,
+               d.ocr_engine, d.ocr_applied, d.ocr_status, d.ocr_error,
                bm25({table}, {weights}) AS bm25_score
         FROM {table}
         JOIN document_cards dc ON dc.rowid = {table}.rowid
+        JOIN documents d ON d.doc_id = dc.doc_id
         WHERE {table} MATCH ? {metadata_sql}
         ORDER BY bm25_score ASC
         LIMIT ?
     """
-    with connect(db_path) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(sql, params).fetchall()
-    results = []
-    for row in rows:
-        try:
-            fields = json.loads(row["fields_json"] or "{}")
-        except json.JSONDecodeError:
-            fields = {}
-        results.append(
-            {
-                "doc_id": row["doc_id"],
-                "title": row["title"],
-                "card_text": row["card_text"],
-                "fields": fields,
-                "publication_date": row["publication_date"],
-                "source_institution": row["source_institution"],
-                "clinical_department": row["clinical_department"],
-                "cleaning_quality": row["cleaning_quality"],
-                "cleaning_flags": row["cleaning_flags"],
-                "source_pdf_text_quality": row["source_pdf_text_quality"],
-                "source_pdf_needs_ocr": bool(row["source_pdf_needs_ocr"]),
-                "source_pdf_is_scanned": bool(row["source_pdf_is_scanned"]),
-                "pdf_text_quality": row["pdf_text_quality"],
-                "pdf_needs_ocr": bool(row["pdf_needs_ocr"]),
-                "pdf_is_scanned": bool(row["pdf_is_scanned"]),
-                "ocr_engine": row["ocr_engine"],
-                "ocr_applied": bool(row["ocr_applied"]),
-                "ocr_status": row["ocr_status"],
-                "ocr_error": row["ocr_error"],
-                "score": float(-row["bm25_score"]),
-            }
-        )
-    return results
-
+    return [
+        {
+            "doc_id": row["doc_id"],
+            "title": row["title"],
+            "card_text": row["card_text"],
+            "fields": {},
+            "publication_date": row["publication_date"],
+            "source_institution": row["source_institution"],
+            "clinical_department": row["clinical_department"],
+            "cleaning_quality": row["cleaning_quality"],
+            "cleaning_flags": row["cleaning_flags"],
+            "source_pdf_text_quality": row["source_pdf_text_quality"],
+            "source_pdf_needs_ocr": bool(row["source_pdf_needs_ocr"]),
+            "source_pdf_is_scanned": bool(row["source_pdf_is_scanned"]),
+            "pdf_text_quality": row["pdf_text_quality"],
+            "pdf_needs_ocr": bool(row["pdf_needs_ocr"]),
+            "pdf_is_scanned": bool(row["pdf_is_scanned"]),
+            "ocr_engine": row["ocr_engine"],
+            "ocr_applied": bool(row["ocr_applied"]),
+            "ocr_status": row["ocr_status"],
+            "ocr_error": row["ocr_error"],
+            "score": float(-row["bm25_score"]),
+        }
+        for row in rows
+    ]
 
 def helper_search_document_views_fts(
     query: str,
@@ -935,19 +850,19 @@ def helper_search_document_views_fts(
     params.append(topk)
     sql = f"""
         SELECT v.view_id, v.doc_id, v.view_type, v.priority, v.title, v.text, v.publication_date,
-               v.source_institution, v.clinical_department, v.cleaning_quality, v.cleaning_flags,
-               v.source_pdf_text_quality, v.source_pdf_needs_ocr,
-               v.source_pdf_is_scanned, v.pdf_text_quality, v.pdf_needs_ocr, v.pdf_is_scanned,
-               v.ocr_engine, v.ocr_applied, v.ocr_status, v.ocr_error,
-               -- SQLite FTS5 的 BM25 值越小排名越靠前，返回前会统一取负数作为正向分数。
+               v.source_institution, v.clinical_department, d.cleaning_quality, d.cleaning_flags,
+               d.source_pdf_text_quality, d.source_pdf_needs_ocr, d.source_pdf_is_scanned,
+               d.pdf_text_quality, d.pdf_needs_ocr, d.pdf_is_scanned,
+               d.ocr_engine, d.ocr_applied, d.ocr_status, d.ocr_error,
                bm25({table}, {weights}) AS bm25_score
         FROM {table}
         JOIN document_views v ON v.rowid = {table}.rowid
+        JOIN documents d ON d.doc_id = v.doc_id
         WHERE {table} MATCH ? {metadata_sql}
         ORDER BY bm25_score ASC
         LIMIT ?
     """
-    with connect(db_path) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(sql, params).fetchall()
     return [
         {
@@ -976,7 +891,6 @@ def helper_search_document_views_fts(
         }
         for row in rows
     ]
-
 
 def helper_fuse_document_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
     rank_lists = [[item["doc_id"] for item in results] for results in result_lists if results]
@@ -1123,17 +1037,17 @@ def helper_retrieve_chunks_fts(
     params.append(topk)
     sql = f"""
         SELECT c.chunk_id, c.doc_id, c.content, c.title, c.publication_date, c.source_institution, c.clinical_department,
-               c.section_path, c.chunk_index, c.retrieval_key, c.source_file, c.markdown_clean_path,
+               c.section_path, c.chunk_index, c.retrieval_key, d.source_file, d.markdown_clean_path,
                c.retrieval_text, c.chunk_type, c.token_count, c.is_background, c.is_reference_section,
-               -- SQLite FTS5 的 BM25 值越小排名越靠前，返回前会统一取负数作为正向分数。
                bm25({table}, {weights}) AS bm25_score
         FROM {table}
         JOIN chunks c ON c.rowid = {table}.rowid
+        JOIN documents d ON d.doc_id = c.doc_id
         WHERE {table} MATCH ? {base_sql} {metadata_sql}
         ORDER BY bm25_score ASC
         LIMIT ?
     """
-    with connect(db_path) as conn:
+    with closing(connect(db_path)) as conn:
         rows = conn.execute(sql, params).fetchall()
     results = []
     for row in rows:
@@ -1161,9 +1075,9 @@ def helper_retrieve_chunks_fts(
             "is_background": bool(row["is_background"]),
             "is_reference_section": bool(row["is_reference_section"]),
         }
+        item.update(helper_department_metadata(row["clinical_department"]))
         results.append(helper_enrich_chunk_metadata(item))
     return results
-
 
 def helper_fuse_chunk_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
     rank_lists = [[item["chunk_id"] for item in results] for results in result_lists if results]
@@ -1229,7 +1143,7 @@ def read_document_sqlite(
             LIMIT 1
         """
         params = (query_title, f"%{query_title}%", query_title)
-    with connect(db_path) as conn:
+    with closing(connect(db_path)) as conn:
         row = conn.execute(sql, params).fetchone()
     if not row:
         raise KeyError(f"Document not found: {doc_id or title}")

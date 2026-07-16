@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import json
+from contextlib import closing
+
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +36,9 @@ QUALITY_SELECT_COLUMNS = (
     "cleaning_quality, cleaning_flags, source_pdf_text_quality, source_pdf_needs_ocr, source_pdf_is_scanned, "
     "pdf_text_quality, pdf_needs_ocr, pdf_is_scanned, ocr_engine, ocr_applied, ocr_status, ocr_error"
 )
-
+JOINED_QUALITY_SELECT_COLUMNS = ", ".join(
+    f"d.{column} AS {column}" for column in QUALITY_SELECT_COLUMNS.split(", ")
+)
 
 @dataclass(frozen=True)
 class MultiviewSearchConfig:
@@ -64,7 +67,7 @@ def has_document_representations_sqlite(db_path: str | Path = DEFAULT_DB_PATH) -
     if not path.exists():
         return False
     try:
-        with connect(path) as conn:
+        with closing(connect(path)) as conn:
             table_rows = conn.execute(
                 """
                 SELECT name
@@ -99,24 +102,23 @@ def helper_load_card_rows(
         "document_cards",
         "doc_id",
         doc_ids,
-        f"doc_id, title, card_text, fields_json, publication_date, source_institution, clinical_department, {QUALITY_SELECT_COLUMNS}",
+        f"t.doc_id AS doc_id, t.title AS title, t.card_text AS card_text, "
+        f"t.publication_date AS publication_date, t.source_institution AS source_institution, "
+        f"t.clinical_department AS clinical_department, {JOINED_QUALITY_SELECT_COLUMNS}",
         source_institution,
         clinical_department,
         time_range,
         publication_date,
         document_kind=document_kind,
+        join_documents=True,
     )
     cards: dict[str, dict[str, Any]] = {}
     for doc_id, row in rows.items():
-        try:
-            fields = json.loads(row["fields_json"] or "{}")
-        except json.JSONDecodeError:
-            fields = {}
         cards[doc_id] = {
             "doc_id": row["doc_id"],
             "title": row["title"],
             "card_text": row["card_text"],
-            "fields": fields,
+            "fields": {},
             "publication_date": row["publication_date"],
             "source_institution": row["source_institution"],
             "clinical_department": row["clinical_department"],
@@ -135,7 +137,6 @@ def helper_load_card_rows(
         }
     return cards
 
-
 def helper_load_view_rows(
     db_path: str | Path,
     view_ids: list[str],
@@ -150,12 +151,16 @@ def helper_load_view_rows(
         "document_views",
         "view_id",
         view_ids,
-        f"view_id, doc_id, view_type, priority, title, text, publication_date, source_institution, clinical_department, {QUALITY_SELECT_COLUMNS}",
+        f"t.view_id AS view_id, t.doc_id AS doc_id, t.view_type AS view_type, t.priority AS priority, "
+        f"t.title AS title, t.text AS text, t.publication_date AS publication_date, "
+        f"t.source_institution AS source_institution, t.clinical_department AS clinical_department, "
+        f"{JOINED_QUALITY_SELECT_COLUMNS}",
         source_institution,
         clinical_department,
         time_range,
         publication_date,
         document_kind=document_kind,
+        join_documents=True,
     )
     output = []
     for view_id in view_ids:
@@ -188,7 +193,6 @@ def helper_load_view_rows(
             }
         )
     return output
-
 
 def helper_rank_docs_from_views(views: list[dict[str, Any]], max_views_per_doc: int = 5) -> tuple[list[str], dict[str, list[dict[str, Any]]]]:
     scores: dict[str, float] = {}
