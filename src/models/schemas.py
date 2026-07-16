@@ -25,6 +25,9 @@ class DocumentRecord(BaseModel):
     publication_date: str
     source_institution: str
     clinical_department: str = "未分类"
+    clinical_departments: list[str] = Field(default_factory=list)
+    department_scope: str = "single"
+    document_kind: str = "guideline"
     source_file: str
     markdown_raw_path: str
     markdown_clean_path: str
@@ -50,6 +53,9 @@ class SectionRecord(BaseModel):
     publication_date: str
     source_institution: str
     clinical_department: str = "未分类"
+    clinical_departments: list[str] = Field(default_factory=list)
+    department_scope: str = "single"
+    document_kind: str = "guideline"
     section_path: list[str] = Field(default_factory=list)
     heading: str | None = None
     heading_level: int | None = None
@@ -66,6 +72,9 @@ class ChunkRecord(BaseModel):
     publication_date: str
     source_institution: str
     clinical_department: str = "未分类"
+    clinical_departments: list[str] = Field(default_factory=list)
+    department_scope: str = "single"
+    document_kind: str = "guideline"
     section_path: list[str] = Field(default_factory=list)
     chunk_index: int
     content: str
@@ -86,7 +95,7 @@ class SearchInput(BaseModel):
     time_range: str | dict[str, str] | None = None
     publication_date: str | None = None
     recency_boost: bool = False
-    topk: int = 10
+    topk: int = 20
 
 
 class ReadInput(BaseModel):
@@ -97,7 +106,7 @@ class ReadInput(BaseModel):
 
 class RetrieveInput(BaseModel):
     query: str
-    topk: int = 5
+    topk: int = 30
     source_institution: str | None = None
     clinical_department: str | None = None
     time_range: str | dict[str, str] | None = None
