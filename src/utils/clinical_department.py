@@ -489,7 +489,7 @@ DEPARTMENT_RULES: tuple[DepartmentRule, ...] = (
         ),
     ),
     DepartmentRule(
-        "小儿呼吸科",
+        "小儿内科",
         (
             "pediatric asthma",
             "paediatric asthma",
@@ -505,7 +505,7 @@ DEPARTMENT_RULES: tuple[DepartmentRule, ...] = (
         ),
     ),
     DepartmentRule(
-        "小儿消化科",
+        "小儿内科",
         (
             "pediatric gastro",
             "paediatric gastro",
@@ -701,37 +701,85 @@ DEPARTMENT_RULES: tuple[DepartmentRule, ...] = (
             "饮食",
         ),
     ),
+    DepartmentRule('妇产科', ('obstetrics and gynecology', 'obstetrics & gynecology', '妇产科', '妇产')),
+    DepartmentRule('急诊医学科', ('emergency medicine', 'resuscitation', 'major trauma', '急诊', '复苏', '严重创伤', '多发伤')),
+    DepartmentRule('重症医学科', ('critical care', 'intensive care', 'icu', 'ecmo', '重症', '危重', '体外膜氧合')),
+    DepartmentRule('麻醉科', ('anesthesia', 'anaesthesia', 'sedation', 'perioperative', '麻醉', '镇静', '围术期')),
+    DepartmentRule('医学影像科', ('radiology', 'medical imaging', 'magnetic resonance', 'pet-ct', '影像诊断', '磁共振', '放射诊断')),
+    DepartmentRule('检验科', ('laboratory medicine', 'clinical laboratory', 'diagnostic assay', '临床检验', '检测试剂', '方法学比对')),
+    DepartmentRule('病理科', ('pathology', 'histopathology', 'pathologic diagnosis', '病理诊断', '组织病理')),
+    DepartmentRule('血管外科', ('vascular surgery', 'peripheral arterial', 'venous disease', '血管外科', '外周动脉')),
+
 )
 
 
-def _contains_keyword(text: str, keyword: str) -> bool:
+def helper_contains_keyword(text: str, keyword: str) -> bool:
     key = keyword.lower()
     if re.search(r"[\u4e00-\u9fff]", key):
         return key in text
     return re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", text) is not None
 
 
-def _normalize_text(text: str) -> str:
+def helper_normalize_text(text: str) -> str:
     return unicodedata.normalize("NFKC", text or "").lower()
 
 
-def classify_clinical_department(title: str = "", abstract: str = "", content: str = "") -> str:
-    """Return the best department label for a guideline-like document."""
-
-    title_text = _normalize_text(title)
-    body_text = _normalize_text(f"{abstract or ''}\n{(content or '')[:12000]}")
+def score_clinical_departments(title: str = "", abstract: str = "", content: str = "") -> Counter[str]:
+    """Return deterministic keyword scores for every matched department."""
+    title_text = helper_normalize_text(title)
+    body_text = helper_normalize_text(f"{abstract or ''}\n{(content or '')[:12000]}")
     scores: Counter[str] = Counter()
     for rule in DEPARTMENT_RULES:
         for keyword in rule.keywords:
-            if _contains_keyword(title_text, keyword):
+            if helper_contains_keyword(title_text, keyword):
                 scores[rule.department] += rule.title_bonus
-            if _contains_keyword(body_text, keyword):
+            if helper_contains_keyword(body_text, keyword):
                 scores[rule.department] += rule.text_weight
+    return scores
+
+
+def classify_clinical_departments(
+    title: str = "", abstract: str = "", content: str = "",
+    allowed: Iterable[str] | None = None, relative_threshold: float = 0.35, minimum_score: int = 2,
+) -> dict[str, object]:
+    """Return multi-label departments and single/compositive scope."""
+    scores = score_clinical_departments(title, abstract, content)
+    if allowed is not None:
+        allowed_set = set(allowed)
+        scores = Counter({key: value for key, value in scores.items() if key in allowed_set})
     if not scores:
-        return UNKNOWN_DEPARTMENT
-    department, score = scores.most_common(1)[0]
-    return department if score > 0 else UNKNOWN_DEPARTMENT
+        return {"clinical_departments": [UNKNOWN_DEPARTMENT], "clinical_department": UNKNOWN_DEPARTMENT, "department_scope": "single", "department_scores": {}}
+    ordered = scores.most_common()
+    threshold = max(minimum_score, ordered[0][1] * relative_threshold)
+    labels = [department for department, score in ordered if score >= threshold] or [ordered[0][0]]
+    return {
+        "clinical_departments": labels,
+        "clinical_department": labels[0],
+        "department_scope": "compositive" if len(labels) > 1 else "single",
+        "department_scores": {department: scores[department] for department in labels},
+    }
+
+
+def classify_chunk_departments(
+    section_path: Iterable[str], content: str, parent_departments: Iterable[str], chunk_type: str = "",
+) -> dict[str, object]:
+    """Classify a chunk only among its parent's labels using chunk-local text."""
+    parent = [item for item in parent_departments if item and item != UNKNOWN_DEPARTMENT]
+    result = classify_clinical_departments(
+        title=" > ".join(section_path), abstract=chunk_type, content=content,
+        allowed=parent, relative_threshold=0.5, minimum_score=1,
+    )
+    labels = [item for item in result["clinical_departments"] if item in parent] or [UNKNOWN_DEPARTMENT]
+    result["clinical_departments"] = labels
+    result["clinical_department"] = labels[0]
+    result["department_scope"] = "compositive" if len(labels) > 1 else "single"
+    return result
+
+
+def classify_clinical_department(title: str = "", abstract: str = "", content: str = "") -> str:
+    """Backward-compatible single-label classifier."""
+    return str(classify_clinical_departments(title, abstract, content)["clinical_department"])
 
 
 def allowed_departments() -> Iterable[str]:
-    return [rule.department for rule in DEPARTMENT_RULES] + [UNKNOWN_DEPARTMENT]
+    return list(dict.fromkeys(rule.department for rule in DEPARTMENT_RULES)) + [UNKNOWN_DEPARTMENT]

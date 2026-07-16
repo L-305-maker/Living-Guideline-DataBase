@@ -77,30 +77,30 @@ def extract_source_institution(pdf_path: str | Path, text: str = "") -> str:
     return "Unknown"
 
 
-def _normalize_digits(text: str) -> str:
+def helper_normalize_digits(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
 
 
-def _candidate_years(text: str) -> list[int]:
-    normalized = _normalize_digits(text)
+def helper_candidate_years(text: str) -> list[int]:
+    normalized = helper_normalize_digits(text)
     years = [int(match.group(1)) for match in YEAR_RE.finditer(normalized)]
     return [year for year in years if 2012 <= year <= 2026]
 
 
 def extract_publication_date(pdf_path: str | Path, text: str = "") -> str:
     # Prefer file names because journal headers often contain unrelated historical years.
-    file_years = _candidate_years(str(pdf_path))
+    file_years = helper_candidate_years(str(pdf_path))
     if file_years:
         return f"{file_years[0]}-01-01"
     haystack = f"{Path(pdf_path).name}\n{text[:12000]}"
-    years = _candidate_years(haystack)
+    years = helper_candidate_years(haystack)
     if years:
         return f"{years[0]}-01-01"
     return "unknown"
 
 
-def _title_score(title: str) -> float:
-    normalized = _normalize_digits(title or "").strip()
+def helper_title_score(title: str) -> float:
+    normalized = helper_normalize_digits(title or "").strip()
     if not normalized:
         return -100.0
     visible = [ch for ch in normalized if not ch.isspace()]
@@ -124,7 +124,7 @@ def _title_score(title: str) -> float:
 
 
 def is_suspicious_title(title: str) -> bool:
-    normalized = _normalize_digits(title or "").strip()
+    normalized = helper_normalize_digits(title or "").strip()
     if len(normalized) < 4 or BAD_TITLE_CHARS_RE.search(normalized):
         return True
     journal_header_patterns = [
@@ -148,7 +148,7 @@ def is_suspicious_title(title: str) -> bool:
 
 
 def clean_title(title: str) -> str:
-    title = _normalize_digits(title or "")
+    title = helper_normalize_digits(title or "")
     title = BAD_TITLE_CHARS_RE.sub("", title)
     title = re.sub(r"<!--.*?-->", " ", title)
     title = re.sub(r"\s+", " ", title).strip()
@@ -171,8 +171,8 @@ def extract_title(markdown: str, pdf_path: str | Path) -> str:
     cleaned = [clean_title(candidate) for candidate in candidates]
     usable = [candidate for candidate in cleaned if candidate and not is_suspicious_title(candidate)]
     if usable:
-        return max(usable, key=_title_score)
-    return max((candidate for candidate in cleaned if candidate), key=_title_score, default=clean_title_from_filename(pdf_path))
+        return max(usable, key=helper_title_score)
+    return max((candidate for candidate in cleaned if candidate), key=helper_title_score, default=clean_title_from_filename(pdf_path))
 
 
 def extract_abstract(markdown: str, max_chars: int = 1200) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import OrderedDict
 
 
@@ -12,6 +13,9 @@ FRONT_MATTER_KEYS = [
     "source_institution",
     "source_file",
     "clinical_department",
+    "clinical_departments",
+    "department_scope",
+    "document_kind",
     "source_pdf_text_quality",
     "source_pdf_needs_ocr",
     "source_pdf_is_scanned",
@@ -36,13 +40,15 @@ FRONT_MATTER_KEYS = [
 def dump_front_matter(metadata: dict[str, object], body: str) -> str:
     lines = ["---"]
     for key in FRONT_MATTER_KEYS:
-        value = str(metadata.get(key, "") or "").replace('"', '\\"')
+        raw_value = metadata.get(key, "")
+        value = json.dumps(raw_value, ensure_ascii=False, separators=(",", ":")) if isinstance(raw_value, (list, dict)) else str(raw_value or "")
+        value = value.replace('"', '\\"')
         lines.append(f'{key}: "{value}"')
     lines.append("---")
     return "\n".join(lines) + "\n\n" + body.strip() + "\n"
 
 
-def parse_front_matter(markdown: str) -> tuple[dict[str, str], str]:
+def parse_front_matter(markdown: str) -> tuple[dict[str, object], str]:
     text = markdown.replace("\r\n", "\n").replace("\r", "\n")
     if not text.startswith("---\n"):
         return {}, text
@@ -50,7 +56,7 @@ def parse_front_matter(markdown: str) -> tuple[dict[str, str], str]:
     if end < 0:
         return {}, text
     raw = text[4:end].strip().splitlines()
-    metadata: dict[str, str] = OrderedDict()
+    metadata: dict[str, object] = OrderedDict()
     for line in raw:
         if ":" not in line:
             continue
@@ -58,6 +64,11 @@ def parse_front_matter(markdown: str) -> tuple[dict[str, str], str]:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] == '"':
             value = value[1:-1].replace('\\"', '"')
+        if value.startswith(("[", "{")):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
         metadata[key.strip()] = value
     body = text[text.find("\n", end + 1) + 1 :]
     return metadata, body
