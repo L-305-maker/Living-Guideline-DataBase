@@ -25,7 +25,7 @@ def evaluate_chunk_retrieval(index_dir: str | Path, queries_path: str | Path, to
     service = ChunkRetrieveService(index_dir)
     queries = list(read_jsonl(queries_path))
     if not queries:
-        return {name: 0.0 for name in _metric_names(top_k)}
+        return {name: 0.0 for name in helper_metric_names(top_k)}
 
     recall_hits = {5: 0, 10: 0, 20: 0, 50: 0}
     reciprocal_rank_total = 0.0
@@ -42,7 +42,7 @@ def evaluate_chunk_retrieval(index_dir: str | Path, queries_path: str | Path, to
         for k in recall_hits:
             if relevant_ids and relevant_ids.intersection(result_ids[:k]):
                 recall_hits[k] += 1
-        reciprocal_rank_total += _reciprocal_rank(result_ids[:10], relevant_ids)
+        reciprocal_rank_total += helper_reciprocal_rank(result_ids[:10], relevant_ids)
         if relevant_doc_ids and relevant_doc_ids.intersection(result_doc_ids):
             doc_recall_hits += 1
         top10 = results[:10]
@@ -66,7 +66,7 @@ def format_metrics(metrics: dict[str, float]) -> str:
     return "\n".join(f"{name}: {value:.4f}" for name, value in metrics.items())
 
 
-def _reciprocal_rank(result_ids: list[str], relevant_ids: set[str]) -> float:
+def helper_reciprocal_rank(result_ids: list[str], relevant_ids: set[str]) -> float:
     if not relevant_ids:
         return 0.0
     for index, chunk_id in enumerate(result_ids, start=1):
@@ -75,7 +75,7 @@ def _reciprocal_rank(result_ids: list[str], relevant_ids: set[str]) -> float:
     return 0.0
 
 
-def _metric_names(top_k: int) -> list[str]:
+def helper_metric_names(top_k: int) -> list[str]:
     return [
         "Chunk Recall@5",
         "Chunk Recall@10",

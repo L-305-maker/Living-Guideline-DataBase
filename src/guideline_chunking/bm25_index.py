@@ -28,9 +28,9 @@ def build_chunk_index(
     index_path.mkdir(parents=True, exist_ok=True)
     records = []
     if Path(atomic_chunks_path).exists():
-        records.extend(_index_record(record) for record in read_jsonl(atomic_chunks_path))
+        records.extend(helper_index_record(record) for record in read_jsonl(atomic_chunks_path))
     if Path(table_chunks_path).exists():
-        records.extend(_index_record(record) for record in read_jsonl(table_chunks_path))
+        records.extend(helper_index_record(record) for record in read_jsonl(table_chunks_path))
     write_jsonl(index_path / "chunks.jsonl", records)
     (index_path / "manifest.json").write_text(
         json.dumps({"num_chunks": len(records)}, ensure_ascii=False, indent=2),
@@ -46,6 +46,7 @@ class BM25Index:
         self.avgdl = sum(len(tokens) for tokens in self.tokenized) / max(1, len(self.tokenized))
         self.df: Counter[str] = Counter()
         for tokens in self.tokenized:
+            # 文档频次每篇只计一次，因此用 set 去掉同一文档内的重复词。
             self.df.update(set(tokens))
 
     @classmethod
@@ -59,7 +60,8 @@ class BM25Index:
         results: list[tuple[dict[str, Any], float, list[str]]] = []
         n_docs = max(1, len(self.records))
         for record, tokens in zip(self.records, self.tokenized):
-            if filters and not _passes_filters(record, filters):
+            # 元数据过滤先于计分，可减少无关候选，同时不改变全库 IDF 统计口径。
+            if filters and not helper_passes_filters(record, filters):
                 continue
             tf = Counter(tokens)
             dl = len(tokens) or 1
@@ -69,6 +71,7 @@ class BM25Index:
                 if token not in tf:
                     continue
                 matched_terms.append(token)
+                # 平滑 IDF 抑制高频词，后续长度归一化再避免长文本因词频高而天然占优。
                 idf = math.log(1 + (n_docs - self.df[token] + 0.5) / (self.df[token] + 0.5))
                 freq = tf[token]
                 score += idf * (freq * 2.2) / (freq + 1.2 * (1 - 0.75 + 0.75 * dl / max(self.avgdl, 1)))
@@ -78,7 +81,7 @@ class BM25Index:
         return results[:top_k]
 
 
-def _index_record(record: dict[str, Any]) -> dict[str, Any]:
+def helper_index_record(record: dict[str, Any]) -> dict[str, Any]:
     metadata = record.get("metadata") or {}
     return {
         "chunk_id": record["chunk_id"],
@@ -96,7 +99,7 @@ def _index_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _passes_filters(record: dict[str, Any], filters: dict[str, Any]) -> bool:
+def helper_passes_filters(record: dict[str, Any], filters: dict[str, Any]) -> bool:
     for key, value in filters.items():
         if value is None:
             continue

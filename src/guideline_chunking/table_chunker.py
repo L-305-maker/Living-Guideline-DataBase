@@ -25,6 +25,7 @@ def build_table_chunks(
         table_id = f"{meta.doc_id}_table_{table_index:03d}"
         parent_section_id = section_for_block(section_chunks, block.block_id)
         try:
+            # 表格解析失败只跳过当前表，并通过 warnings 保留可审计信息。
             headers, rows = parse_markdown_table(block.text)
         except ValueError as exc:
             if warnings is not None:
@@ -52,6 +53,7 @@ def build_table_chunks(
             )
         table_title = block.heading_path[-1] if block.heading_path else None
         parent_id = f"{table_id}_parent"
+        # parent chunk 保存完整表格，row chunk 用于精确召回，二者通过 table_id 关联。
         chunks.append(
             TableChunk(
                 chunk_id=parent_id,
@@ -80,11 +82,12 @@ def build_table_chunks(
             )
         )
         for row_index, row in enumerate(rows, start=1):
+            # 行列数不一致时按表头补空值，保持 embedding 模板的列语义稳定。
             values = [(headers[index], row[index] if index < len(row) else "") for index in range(len(headers))]
             row_text = "| " + " | ".join(row) + " |"
             chunks.append(
                 TableChunk(
-                    chunk_id=f"{table_id}_row_{row_index:03d}_{_hash(row_text)}",
+                    chunk_id=f"{table_id}_row_{row_index:03d}_{hash_text(row_text)}",
                     doc_id=meta.doc_id,
                     parent_section_id=parent_section_id,
                     table_id=table_id,
@@ -111,11 +114,12 @@ def build_table_chunks(
                     metadata={**asdict(meta), "columns_and_values": dict(values)},
                 )
             )
-        note = _following_note(block, blocks)
+        # 紧随表格的说明文字单独建 note chunk，既保留语义又不污染行数据。
+        note = helper_following_note(block, blocks)
         if note:
             chunks.append(
                 TableChunk(
-                    chunk_id=f"{table_id}_note_{_hash(note.text)}",
+                    chunk_id=f"{table_id}_note_{hash_text(note.text)}",
                     doc_id=meta.doc_id,
                     parent_section_id=parent_section_id,
                     table_id=table_id,
@@ -147,29 +151,29 @@ def parse_markdown_table(text: str) -> tuple[list[str], list[list[str]]]:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     if len(lines) < 2:
         raise ValueError("Failed to parse markdown table header.")
-    headers = _cells(lines[0])
-    separators = _cells(lines[1])
-    if not headers or not separators or not all(_is_separator(cell) for cell in separators):
+    headers = helper_cells(lines[0])
+    separators = helper_cells(lines[1])
+    if not headers or not separators or not all(helper_is_separator(cell) for cell in separators):
         raise ValueError("Failed to parse markdown table header.")
-    rows = [_cells(line) for line in lines[2:] if line.startswith("|") and line.endswith("|")]
+    rows = [helper_cells(line) for line in lines[2:] if line.startswith("|") and line.endswith("|")]
     return headers, rows
 
 
-def _cells(line: str) -> list[str]:
+def helper_cells(line: str) -> list[str]:
     stripped = line.strip().strip("|")
     return [cell.strip() for cell in stripped.split("|")]
 
 
-def _is_separator(cell: str) -> bool:
+def helper_is_separator(cell: str) -> bool:
     stripped = cell.strip()
     return len(stripped.replace(":", "")) >= 3 and set(stripped.replace(":", "")) == {"-"}
 
 
-def _hash(text: str) -> str:
+def hash_text(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
 
 
-def _following_note(table_block: ParsedBlock, blocks: list[ParsedBlock]) -> ParsedBlock | None:
+def helper_following_note(table_block: ParsedBlock, blocks: list[ParsedBlock]) -> ParsedBlock | None:
     next_order = table_block.order_index + 1
     for block in blocks:
         if block.order_index != next_order:

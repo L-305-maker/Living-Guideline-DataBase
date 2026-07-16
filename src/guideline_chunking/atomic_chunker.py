@@ -33,17 +33,19 @@ def build_atomic_chunks(
 ) -> list[AtomicChunk]:
     chunks: list[AtomicChunk] = []
     for block in sorted(blocks, key=lambda item: item.order_index):
+        # 标题由 section 表示，表格交给 table_chunker，避免生成重复检索内容。
         if block.metadata.get("is_heading") or block.block_type == "table" or not block.text.strip():
             continue
+        # 推荐语句按编号拆分；证据和背景按语义长度拆分；其他块保持原样。
         if block.block_type == "recommendation_candidate":
-            parts = _split_recommendations(block.text)
+            parts = helper_split_recommendations(block.text)
         elif block.block_type in {"evidence_candidate", "rationale_candidate", "background", "unknown"}:
-            parts = _split_semantic(block.text, TARGET_MIN, TARGET_MAX, OVERLAP)
+            parts = helper_split_semantic(block.text, TARGET_MIN, TARGET_MAX, OVERLAP)
         else:
             parts = [block.text]
         for part_index, part in enumerate(parts):
             chunk_type = block.block_type
-            chunk_id = _chunk_id(meta.doc_id, block.block_id, part_index, part)
+            chunk_id = helper_chunk_id(meta.doc_id, block.block_id, part_index, part)
             parent_section_id = section_for_block(section_chunks, block.block_id)
             text_for_embedding = build_text_for_embedding(
                 meta=meta,
@@ -70,15 +72,16 @@ def build_atomic_chunks(
                 next_chunk_id=None,
                 metadata={**asdict(meta), "source_block_type": block.block_type, "part_index": part_index},
             )
-            _warn_for_chunk(chunk, block, warnings)
+            helper_warn_for_chunk(chunk, block, warnings)
             chunks.append(chunk)
             if parent_section_id:
-                _attach_child_chunk(section_chunks, parent_section_id, chunk_id)
-    _wire_prev_next(chunks)
+                helper_attach_child_chunk(section_chunks, parent_section_id, chunk_id)
+    # 全部 chunk 创建后再统一连接前后指针，避免生成过程中引用尚不存在的对象。
+    helper_wire_prev_next(chunks)
     return chunks
 
 
-def _split_recommendations(text: str) -> list[str]:
+def helper_split_recommendations(text: str) -> list[str]:
     starts = [match.start() for match in NUMBERED_RECOMMENDATION_RE.finditer(text)]
     if len(starts) < 2:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -89,7 +92,7 @@ def _split_recommendations(text: str) -> list[str]:
     return [text[starts[i] : starts[i + 1]].strip() for i in range(len(starts) - 1) if text[starts[i] : starts[i + 1]].strip()]
 
 
-def _split_semantic(text: str, min_tokens: int, max_tokens: int, overlap: int) -> list[str]:
+def helper_split_semantic(text: str, min_tokens: int, max_tokens: int, overlap: int) -> list[str]:
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text or "") if part.strip()]
     if not paragraphs:
         return []
@@ -103,7 +106,7 @@ def _split_semantic(text: str, min_tokens: int, max_tokens: int, overlap: int) -
                 chunks.append("\n\n".join(current))
                 current = []
                 current_tokens = 0
-            chunks.extend(_split_long_text(paragraph, max_tokens, overlap))
+            chunks.extend(helper_split_long_text(paragraph, max_tokens, overlap))
             continue
         if current and current_tokens + tokens > max_tokens and current_tokens >= min_tokens:
             chunks.append("\n\n".join(current))
@@ -116,32 +119,32 @@ def _split_semantic(text: str, min_tokens: int, max_tokens: int, overlap: int) -
     return chunks
 
 
-def _split_long_text(text: str, max_tokens: int, overlap: int) -> list[str]:
+def helper_split_long_text(text: str, max_tokens: int, overlap: int) -> list[str]:
     tokens = TOKEN_RE.findall(text)
     parts: list[str] = []
     start = 0
     while start < len(tokens):
         end = min(start + max_tokens, len(tokens))
-        parts.append(_join_tokens(tokens[start:end]))
+        parts.append(helper_join_tokens(tokens[start:end]))
         if end >= len(tokens):
             break
         start = max(start + 1, end - overlap)
     return parts
 
 
-def _join_tokens(tokens: list[str]) -> str:
+def helper_join_tokens(tokens: list[str]) -> str:
     text = " ".join(tokens)
     text = re.sub(r"\s+([,.;:!?，。；：！？)\]])", r"\1", text)
     text = re.sub(r"([(\[])\s+", r"\1", text)
     return text.strip()
 
 
-def _chunk_id(doc_id: str, block_id: str, part_index: int, text: str) -> str:
+def helper_chunk_id(doc_id: str, block_id: str, part_index: int, text: str) -> str:
     digest = hashlib.sha1(f"{block_id}:{part_index}:{text[:80]}".encode("utf-8")).hexdigest()[:10]
     return f"{doc_id}_chunk_{digest}"
 
 
-def _wire_prev_next(chunks: list[AtomicChunk]) -> None:
+def helper_wire_prev_next(chunks: list[AtomicChunk]) -> None:
     by_doc: dict[str, list[AtomicChunk]] = {}
     for chunk in chunks:
         by_doc.setdefault(chunk.doc_id, []).append(chunk)
@@ -152,34 +155,34 @@ def _wire_prev_next(chunks: list[AtomicChunk]) -> None:
             chunk.next_chunk_id = doc_chunks[index + 1].chunk_id if index + 1 < len(doc_chunks) else None
 
 
-def _attach_child_chunk(section_chunks: list[SectionChunk], section_id: str, chunk_id: str) -> None:
+def helper_attach_child_chunk(section_chunks: list[SectionChunk], section_id: str, chunk_id: str) -> None:
     for section in section_chunks:
         if section.section_id == section_id and chunk_id not in section.child_chunk_ids:
             section.child_chunk_ids.append(chunk_id)
             return
 
 
-def _warn_for_chunk(chunk: AtomicChunk, block: ParsedBlock, warnings: list[ChunkBuildWarning] | None) -> None:
+def helper_warn_for_chunk(chunk: AtomicChunk, block: ParsedBlock, warnings: list[ChunkBuildWarning] | None) -> None:
     if warnings is None:
         return
     token_count = estimate_tokens(chunk.text)
     if token_count > TARGET_MAX:
-        warnings.append(_warning("chunk_too_long", block, chunk.chunk_id, f"Chunk has {token_count} tokens.", "medium"))
+        warnings.append(helper_warning("chunk_too_long", block, chunk.chunk_id, f"Chunk has {token_count} tokens.", "medium"))
     if token_count < 10:
-        warnings.append(_warning("chunk_too_short", block, chunk.chunk_id, "Chunk has fewer than 10 tokens.", "low"))
+        warnings.append(helper_warning("chunk_too_short", block, chunk.chunk_id, "Chunk has fewer than 10 tokens.", "low"))
     if not chunk.heading_path:
-        warnings.append(_warning("heading_missing", block, chunk.chunk_id, "Chunk has no heading path.", "medium"))
+        warnings.append(helper_warning("heading_missing", block, chunk.chunk_id, "Chunk has no heading path.", "medium"))
     if chunk.page_start is None:
-        warnings.append(_warning("missing_page_span", block, chunk.chunk_id, "Chunk has no page span.", "low"))
+        warnings.append(helper_warning("missing_page_span", block, chunk.chunk_id, "Chunk has no page span.", "low"))
     if chunk.chunk_type == "reference":
-        warnings.append(_warning("reference_chunk_detected", block, chunk.chunk_id, "Reference chunk detected.", "low"))
+        warnings.append(helper_warning("reference_chunk_detected", block, chunk.chunk_id, "Reference chunk detected.", "low"))
     if chunk.chunk_type == "method":
-        warnings.append(_warning("method_chunk_detected", block, chunk.chunk_id, "Method chunk detected.", "low"))
+        warnings.append(helper_warning("method_chunk_detected", block, chunk.chunk_id, "Method chunk detected.", "low"))
     if chunk.chunk_type == "unknown":
-        warnings.append(_warning("unknown_block_type", block, chunk.chunk_id, "Unknown block type.", "low"))
+        warnings.append(helper_warning("unknown_block_type", block, chunk.chunk_id, "Unknown block type.", "low"))
 
 
-def _warning(
+def helper_warning(
     warning_type: str, block: ParsedBlock, chunk_id: str | None, message: str, severity: str
 ) -> ChunkBuildWarning:
     return ChunkBuildWarning(

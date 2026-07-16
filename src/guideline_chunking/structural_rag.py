@@ -116,7 +116,7 @@ class HashingTextEncoder:
         self.dim = dim
 
     def encode(self, texts: list[str]) -> list[list[float]]:
-        return [_normalize(_hashed_vector(text, self.dim)) for text in texts]
+        return [helper_normalize(helper_hashed_vector(text, self.dim)) for text in texts]
 
 
 class SentenceTransformerEncoder:
@@ -139,7 +139,7 @@ class RuleBasedReranker:
     def rerank(self, query: str, candidates: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
         query_variants = expand_query(query)
         terms = sorted(set(tokenize(" ".join(query_variants))))
-        phrase_terms = _query_phrase_terms(query_variants)
+        phrase_terms = helper_query_phrase_terms(query_variants)
         ranked: list[dict[str, Any]] = []
         for candidate in candidates:
             item = dict(candidate)
@@ -153,7 +153,7 @@ class RuleBasedReranker:
                 ]
             )
             searchable_lower = searchable.lower()
-            overlap = _term_overlap(searchable, terms)
+            overlap = helper_term_overlap(searchable, terms)
             phrase_hits = sum(1 for phrase in phrase_terms if phrase in searchable_lower)
             boost = {
                 "recommendation": 0.18,
@@ -161,9 +161,9 @@ class RuleBasedReranker:
                 "clinical_detail": 0.10,
                 "general": 0.0,
             }.get(chunk.chunk_type, 0.0)
-            if _contains_phrase(searchable, query):
+            if helper_contains_phrase(searchable, query):
                 boost += 0.25
-            elif any(_contains_phrase(searchable, variant) for variant in query_variants[1:]):
+            elif any(helper_contains_phrase(searchable, variant) for variant in query_variants[1:]):
                 boost += 0.18
             boost += min(0.35, phrase_hits * 0.08)
             item["score"] = (
@@ -190,12 +190,12 @@ class CrossEncoderReranker:
     def rerank(self, query: str, candidates: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
         fallback_ranked = self.fallback.rerank(query, candidates, len(candidates))
         try:
-            model = self._load_model()
+            model = self.helper_load_model()
             pairs = [(query, item["chunk"].text_for_embedding) for item in fallback_ranked]
             raw_scores = [float(score) for score in model.predict(pairs, show_progress_bar=False)]
         except Exception:
             return fallback_ranked[:top_k]
-        normalized = _normalize_scores(raw_scores)
+        normalized = helper_normalize_scores(raw_scores)
         output: list[dict[str, Any]] = []
         for item, model_score in zip(fallback_ranked, normalized):
             updated = dict(item)
@@ -204,7 +204,7 @@ class CrossEncoderReranker:
         output.sort(key=lambda item: (-float(item["score"]), item["chunk"].chunk_id))
         return output[:top_k]
 
-    def _load_model(self) -> Any:
+    def helper_load_model(self) -> Any:
         if self._model is None:
             from sentence_transformers import CrossEncoder  # type: ignore
 
@@ -215,7 +215,7 @@ class CrossEncoderReranker:
 class StructuralBM25Index:
     def __init__(self, chunks: list[GuidelineChunk]) -> None:
         self.chunks = chunks
-        self.tokenized = [tokenize(_bm25_text(chunk)) for chunk in chunks]
+        self.tokenized = [tokenize(helper_bm25_text(chunk)) for chunk in chunks]
         self.avgdl = sum(len(tokens) for tokens in self.tokenized) / max(1, len(self.tokenized))
         self.df: Counter[str] = Counter()
         for tokens in self.tokenized:
@@ -228,7 +228,7 @@ class StructuralBM25Index:
         results: list[tuple[str, float]] = []
         n_docs = max(1, len(self.chunks))
         for chunk, tokens in zip(self.chunks, self.tokenized):
-            score = _bm25_score(query_tokens, tokens, self.df, n_docs, self.avgdl)
+            score = helper_bm25_score(query_tokens, tokens, self.df, n_docs, self.avgdl)
             if score > 0:
                 results.append((chunk.chunk_id, score))
         results.sort(key=lambda item: (-item[1], item[0]))
@@ -244,7 +244,7 @@ class DenseVectorIndex:
     def search(self, query: str, top_k: int = 50) -> list[tuple[str, float]]:
         query_vector = self.encoder.encode([query])[0]
         scored = [
-            (chunk.chunk_id, _dot(query_vector, vector))
+            (chunk.chunk_id, helper_dot(query_vector, vector))
             for chunk, vector in zip(self.chunks, self.vectors)
         ]
         scored.sort(key=lambda item: (-item[1], item[0]))
@@ -291,39 +291,42 @@ class GuidelineRAGIndex:
         fused = rrf_fusion(rank_lists)[:fused_top_k]
         candidates = [{"chunk": self.by_id[chunk_id], "score": score} for chunk_id, score in fused if chunk_id in self.by_id]
         reranked = self.reranker.rerank(query, candidates, top_k)
-        return [_result(item["chunk"], float(item["score"])) for item in reranked]
+        return [helper_result(item["chunk"], float(item["score"])) for item in reranked]
 
 
 def build_structural_chunks(markdown: str, doc_id: str, title: str | None = None) -> list[GuidelineChunk]:
     meta = DocumentMeta(doc_id=doc_id, title=title)
-    markdown = _strip_front_matter(markdown)
+    markdown = helper_strip_front_matter(markdown)
     blocks = parse_markdown_document(markdown, meta)
     chunks: list[GuidelineChunk] = []
     consumed_general: set[str] = set()
 
+    # 第一遍优先抽取临床细节和推荐证据，并记录已完整消费的通用块。
     for block in sorted(blocks, key=lambda item: item.order_index):
-        if _skip_block(block) or _is_reference_section(block.heading_path):
+        if helper_skip_block(block) or helper_is_reference_section(block.heading_path):
             continue
-        block_text = _clean_block_text(block.text)
+        block_text = helper_clean_block_text(block.text)
         if not block_text:
             continue
-        detail_texts = _clinical_detail_texts(block_text)
+        detail_texts = helper_clinical_detail_texts(block_text)
         for detail_text in detail_texts:
-            chunks.append(_make_chunk("clinical_detail", detail_text, block, len(chunks)))
+            chunks.append(helper_make_chunk("clinical_detail", detail_text, block, len(chunks)))
         if len(detail_texts) == 1 and detail_texts[0] == block_text:
             consumed_general.add(block.block_id)
-        for sentence in _recommendation_sentences(block_text):
-            evidence = _next_evidence_paragraphs(block, blocks)
-            chunks.extend(_make_recommendation_bundle_chunks(sentence, evidence, block, len(chunks)))
+        for sentence in helper_recommendation_sentences(block_text):
+            evidence = helper_next_evidence_paragraphs(block, blocks)
+            chunks.extend(helper_make_recommendation_bundle_chunks(sentence, evidence, block, len(chunks)))
 
+    # 第二遍只补未消费且不包含推荐句的普通内容，避免重复 chunk。
     for block in sorted(blocks, key=lambda item: item.order_index):
-        if _skip_block(block) or _is_reference_section(block.heading_path) or block.block_id in consumed_general:
+        if helper_skip_block(block) or helper_is_reference_section(block.heading_path) or block.block_id in consumed_general:
             continue
-        block_text = _clean_block_text(block.text)
-        if block_text and not _recommendation_sentences(block_text):
-            chunks.append(_make_chunk("general", block_text, block, len(chunks)))
+        block_text = helper_clean_block_text(block.text)
+        if block_text and not helper_recommendation_sentences(block_text):
+            chunks.append(helper_make_chunk("general", block_text, block, len(chunks)))
     if not chunks:
-        title_text = _first_heading_text(markdown) or title or doc_id
+        # 空文档仍生成标题级兜底 chunk，保证文档在检索库中有稳定入口。
+        title_text = helper_first_heading_text(markdown) or title or doc_id
         title_block = ParsedBlock(
             block_id=f"{doc_id}:title",
             doc_id=doc_id,
@@ -338,7 +341,7 @@ def build_structural_chunks(markdown: str, doc_id: str, title: str | None = None
             order_index=0,
             metadata={"title_only": True},
         )
-        chunks.append(_make_chunk("general", title_text, title_block, 0))
+        chunks.append(helper_make_chunk("general", title_text, title_block, 0))
     return chunks
 
 
@@ -366,10 +369,10 @@ def expand_query(query: str, max_queries: int = 6) -> list[str]:
             for synonym in synonyms:
                 expanded.append(re.sub(re.escape(term), synonym, query, flags=re.I))
     expanded.extend([f"{query} guideline", f"{query} recommendation", f"{query} treatment guideline"])
-    return _unique(expanded)[:max_queries]
+    return helper_unique(expanded)[:max_queries]
 
 
-def _strip_front_matter(markdown: str) -> str:
+def helper_strip_front_matter(markdown: str) -> str:
     if not markdown.startswith("---"):
         return markdown
     lines = markdown.splitlines()
@@ -379,20 +382,20 @@ def _strip_front_matter(markdown: str) -> str:
     return markdown
 
 
-def _skip_block(block: ParsedBlock) -> bool:
+def helper_skip_block(block: ParsedBlock) -> bool:
     text = block.text.strip()
     return bool(
         block.metadata.get("is_heading")
         or not text
-        or _is_page_number_block(text)
-        or _looks_like_reference_list(text)
-        or (_looks_like_garbled_text(text) and not _has_table_separator(text))
+        or helper_is_page_number_block(text)
+        or helper_looks_like_reference_list(text)
+        or (helper_looks_like_garbled_text(text) and not helper_has_table_separator(text))
     )
 
 
-def _is_reference_section(heading_path: list[str]) -> bool:
+def helper_is_reference_section(heading_path: list[str]) -> bool:
     for heading in heading_path:
-        normalized = _normalize_heading_text(heading)
+        normalized = helper_normalize_heading_text(heading)
         without_numbering = re.sub(r"^(?:\d+(?:\.\d+)*|[ivx]+)[\).]?\s+", "", normalized)
         if normalized in {"references", "reference", "bibliography", "参考文献"}:
             return True
@@ -429,12 +432,12 @@ def _is_reference_section(heading_path: list[str]) -> bool:
     return False
 
 
-def _normalize_heading_text(heading: str) -> str:
+def helper_normalize_heading_text(heading: str) -> str:
     normalized = re.sub(r"\s+", " ", heading or "").strip().lower()
     return normalized.strip(" |-:：")
 
 
-def _first_heading_text(markdown: str) -> str | None:
+def helper_first_heading_text(markdown: str) -> str | None:
     for line in markdown.splitlines():
         match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
         if match:
@@ -442,11 +445,11 @@ def _first_heading_text(markdown: str) -> str | None:
     return None
 
 
-def _is_page_number_block(text: str) -> bool:
+def helper_is_page_number_block(text: str) -> bool:
     return bool(re.fullmatch(r"(?:page\s*)?\d{1,4}", text.strip(), re.I))
 
 
-def _looks_like_reference_list(text: str) -> bool:
+def helper_looks_like_reference_list(text: str) -> bool:
     compact = re.sub(r"\s+", " ", text or "").strip()
     bracket_citations = re.findall(r"\[\d{1,4}\]", compact)
     journal_tags = re.findall(r"\[j\]", compact, flags=re.I)
@@ -464,12 +467,12 @@ def _looks_like_reference_list(text: str) -> bool:
     return len(numbered_citations) >= 4 and len(journal_markers) >= 2
 
 
-def _clean_block_text(text: str) -> str:
-    lines = [line for line in (text or "").splitlines() if not _is_page_number_block(line.strip())]
-    return _trim_boilerplate_tail("\n".join(lines).strip())
+def helper_clean_block_text(text: str) -> str:
+    lines = [line for line in (text or "").splitlines() if not helper_is_page_number_block(line.strip())]
+    return helper_trim_boilerplate_tail("\n".join(lines).strip())
 
 
-def _trim_boilerplate_tail(text: str) -> str:
+def helper_trim_boilerplate_tail(text: str) -> str:
     cut = len(text or "")
     for pattern in [
         r"(?im)^\s*参\s*$\s*^\s*考\s*$\s*^\s*文\s*$\s*^\s*献\s*$",
@@ -492,7 +495,7 @@ def _trim_boilerplate_tail(text: str) -> str:
     return (text or "")[:cut].strip()
 
 
-def _starts_boilerplate(text: str) -> bool:
+def helper_starts_boilerplate(text: str) -> bool:
     stripped = re.sub(r"\s+", " ", text or "").strip().lower()
     compact = re.sub(r"\s+", "", text or "")
     return bool(
@@ -517,7 +520,7 @@ def _starts_boilerplate(text: str) -> bool:
     )
 
 
-def _looks_like_garbled_text(text: str) -> bool:
+def helper_looks_like_garbled_text(text: str) -> bool:
     stripped = text.strip()
     compact = re.sub(r"\s+", "", stripped)
     if len(compact) < 300:
@@ -538,7 +541,7 @@ def _looks_like_garbled_text(text: str) -> bool:
     return False
 
 
-def _make_recommendation_bundle(
+def helper_make_recommendation_bundle(
     recommendation: str,
     evidence: list[str],
     block: ParsedBlock,
@@ -549,7 +552,7 @@ def _make_recommendation_bundle(
     if evidence:
         chunk_type = "recommendation_bundle"
         text += "\n\nEvidence:\n" + "\n\n".join(evidence)
-    return _make_chunk(
+    return helper_make_chunk(
         chunk_type,
         text,
         block,
@@ -559,37 +562,37 @@ def _make_recommendation_bundle(
     )
 
 
-def _make_recommendation_bundle_chunks(
+def helper_make_recommendation_bundle_chunks(
     recommendation: str,
     evidence: list[str],
     block: ParsedBlock,
     index: int,
 ) -> list[GuidelineChunk]:
-    if len(_recommendation_bundle_text(recommendation, evidence)) <= MAX_RECOMMENDATION_BUNDLE_CHARS:
-        return [_make_recommendation_bundle(recommendation, evidence, block, index)]
-    evidence_groups = _split_recommendation_evidence(recommendation, evidence)
+    if len(helper_recommendation_bundle_text(recommendation, evidence)) <= MAX_RECOMMENDATION_BUNDLE_CHARS:
+        return [helper_make_recommendation_bundle(recommendation, evidence, block, index)]
+    evidence_groups = helper_split_recommendation_evidence(recommendation, evidence)
     if not evidence_groups:
-        return [_make_recommendation_bundle(recommendation, [], block, index)]
+        return [helper_make_recommendation_bundle(recommendation, [], block, index)]
     return [
-        _make_recommendation_bundle(recommendation, group, block, index + offset)
+        helper_make_recommendation_bundle(recommendation, group, block, index + offset)
         for offset, group in enumerate(evidence_groups)
     ]
 
 
-def _recommendation_bundle_text(recommendation: str, evidence: list[str]) -> str:
+def helper_recommendation_bundle_text(recommendation: str, evidence: list[str]) -> str:
     text = recommendation
     if evidence:
         text += "\n\nEvidence:\n" + "\n\n".join(evidence)
     return text
 
 
-def _split_recommendation_evidence(recommendation: str, evidence: list[str]) -> list[list[str]]:
+def helper_split_recommendation_evidence(recommendation: str, evidence: list[str]) -> list[list[str]]:
     groups: list[list[str]] = []
     current: list[str] = []
     for evidence_text in evidence:
-        for unit in _evidence_bundle_units(recommendation, evidence_text):
+        for unit in helper_evidence_bundle_units(recommendation, evidence_text):
             proposed = [*current, unit]
-            if current and len(_recommendation_bundle_text(recommendation, proposed)) > MAX_RECOMMENDATION_BUNDLE_CHARS:
+            if current and len(helper_recommendation_bundle_text(recommendation, proposed)) > MAX_RECOMMENDATION_BUNDLE_CHARS:
                 groups.append(current)
                 current = [unit]
             else:
@@ -599,16 +602,16 @@ def _split_recommendation_evidence(recommendation: str, evidence: list[str]) -> 
     return groups
 
 
-def _evidence_bundle_units(recommendation: str, text: str) -> list[str]:
-    if len(_recommendation_bundle_text(recommendation, [text])) <= MAX_RECOMMENDATION_BUNDLE_CHARS:
+def helper_evidence_bundle_units(recommendation: str, text: str) -> list[str]:
+    if len(helper_recommendation_bundle_text(recommendation, [text])) <= MAX_RECOMMENDATION_BUNDLE_CHARS:
         return [text]
-    units = _sentence_unit_candidates(text)
+    units = helper_sentence_unit_candidates(text)
     if len(units) <= 1:
-        units = _list_like_units(text)
+        units = helper_list_like_units(text)
     return units if len(units) > 1 else [text]
 
 
-def _list_like_units(text: str) -> list[str]:
+def helper_list_like_units(text: str) -> list[str]:
     parts = [
         part.strip()
         for part in re.split(r";\s*|；\s*|(?=\(\d+\))|(?=\b\d{1,2}[\).]\s+)|(?=•\s*)", text or "")
@@ -621,7 +624,7 @@ def _list_like_units(text: str) -> list[str]:
     return parts
 
 
-def _make_chunk(
+def helper_make_chunk(
     chunk_type: str,
     text: str,
     block: ParsedBlock,
@@ -630,7 +633,7 @@ def _make_chunk(
     evidence: list[str] | None = None,
 ) -> GuidelineChunk:
     section_path = list(block.heading_path) or [str(block.metadata.get("title") or block.doc_id)]
-    chunk_id = _chunk_id(block.doc_id, chunk_type, block.order_index, index, text)
+    chunk_id = helper_chunk_id(block.doc_id, chunk_type, block.order_index, index, text)
     return GuidelineChunk(
         chunk_id=chunk_id,
         chunk_type=chunk_type,
@@ -649,40 +652,40 @@ def _make_chunk(
     )
 
 
-def _recommendation_sentences(text: str) -> list[str]:
+def helper_recommendation_sentences(text: str) -> list[str]:
     sentences: list[str] = []
     for paragraph in re.split(r"\n\s*\n", text or ""):
-        candidates = _sentence_unit_candidates(paragraph)
+        candidates = helper_sentence_unit_candidates(paragraph)
         for sentence in candidates:
-            if RECOMMENDATION_RE.search(sentence) and not _looks_like_non_detail_administrative_text(sentence):
+            if RECOMMENDATION_RE.search(sentence) and not helper_looks_like_non_detail_administrative_text(sentence):
                 sentences.append(sentence)
-    return _unique(sentences)
+    return helper_unique(sentences)
 
 
-def _sentence_candidates(text: str) -> list[str]:
+def helper_sentence_candidates(text: str) -> list[str]:
     lines = [line.strip(" -*\t") for line in (text or "").splitlines() if line.strip()]
     if len(lines) > 1:
         return lines
     return [part.strip() for part in SENTENCE_SPLIT_RE.split(text.strip()) if part.strip()]
 
 
-def _next_evidence_paragraphs(block: ParsedBlock, blocks: list[ParsedBlock], limit: int = 2) -> list[str]:
+def helper_next_evidence_paragraphs(block: ParsedBlock, blocks: list[ParsedBlock], limit: int = 2) -> list[str]:
     evidence: list[str] = []
     for candidate in sorted(blocks, key=lambda item: item.order_index):
         if candidate.order_index <= block.order_index:
             continue
         if candidate.metadata.get("is_heading") or candidate.heading_path != block.heading_path:
             break
-        if _skip_block(candidate) or candidate.block_type == "table":
+        if helper_skip_block(candidate) or candidate.block_type == "table":
             continue
-        text = _clean_block_text(candidate.text)
-        if _looks_like_reference_list(candidate.text):
+        text = helper_clean_block_text(candidate.text)
+        if helper_looks_like_reference_list(candidate.text):
             break
-        if _starts_boilerplate(candidate.text):
+        if helper_starts_boilerplate(candidate.text):
             break
         if not text:
             continue
-        for unit in _evidence_units(text):
+        for unit in helper_evidence_units(text):
             evidence.append(unit)
             if len(evidence) >= limit:
                 break
@@ -691,9 +694,9 @@ def _next_evidence_paragraphs(block: ParsedBlock, blocks: list[ParsedBlock], lim
     return evidence
 
 
-def _evidence_units(text: str) -> list[str]:
-    trimmed = _trim_boilerplate_tail(text)
-    if not trimmed or _starts_boilerplate(trimmed):
+def helper_evidence_units(text: str) -> list[str]:
+    trimmed = helper_trim_boilerplate_tail(text)
+    if not trimmed or helper_starts_boilerplate(trimmed):
         return []
     raw_units = [
         part.strip()
@@ -706,17 +709,17 @@ def _evidence_units(text: str) -> list[str]:
     ]
     units: list[str] = []
     for raw in raw_units:
-        unit = _trim_boilerplate_tail(raw)
-        unit = _trim_reference_tail(unit)
-        if not unit or _starts_boilerplate(unit) or _looks_like_reference_list(unit):
+        unit = helper_trim_boilerplate_tail(raw)
+        unit = helper_trim_reference_tail(unit)
+        if not unit or helper_starts_boilerplate(unit) or helper_looks_like_reference_list(unit):
             break
-        if _looks_like_non_evidence_context(unit):
+        if helper_looks_like_non_evidence_context(unit):
             continue
-        units.append(_compact_evidence_unit(unit))
-    return _unique(units)
+        units.append(helper_compact_evidence_unit(unit))
+    return helper_unique(units)
 
 
-def _trim_reference_tail(text: str) -> str:
+def helper_trim_reference_tail(text: str) -> str:
     match = re.search(
         r"(?is)(?:^|\s)(?:\[\d{1,4}\]|\d{1,4}[\).]?)\s*[\u4e00-\u9fffA-Z][^。\n]{0,360}\[J\]",
         text or "",
@@ -729,13 +732,13 @@ def _trim_reference_tail(text: str) -> str:
     return (text or "").strip()
 
 
-def _looks_like_non_evidence_context(text: str) -> bool:
+def helper_looks_like_non_evidence_context(text: str) -> bool:
     compact = re.sub(r"\s+", " ", text or "").strip().lower()
     if not compact:
         return True
     return bool(
         re.match(r"^(?:续表|表)\s*\d+", text or "")
-        or _looks_like_contributor_list(text)
+        or helper_looks_like_contributor_list(text)
         or compact.startswith(
             (
                 "table ",
@@ -749,7 +752,7 @@ def _looks_like_non_evidence_context(text: str) -> bool:
     )
 
 
-def _looks_like_contributor_list(text: str) -> bool:
+def helper_looks_like_contributor_list(text: str) -> bool:
     if len(text or "") < 80:
         return False
     chinese_affiliations = re.findall(r"[\u4e00-\u9fff]{2,4}\([^)]*(?:医院|大学|科|中心)[^)]*\)", text or "")
@@ -760,65 +763,65 @@ def _looks_like_contributor_list(text: str) -> bool:
     return len(chinese_affiliations) >= 5 or len(english_affiliations) >= 5
 
 
-def _compact_evidence_unit(text: str, max_sentence_units: int = 3) -> str:
+def helper_compact_evidence_unit(text: str, max_sentence_units: int = 3) -> str:
     if len(text) <= 1200:
         return text.strip()
-    candidates = _sentence_unit_candidates(text)
+    candidates = helper_sentence_unit_candidates(text)
     if len(candidates) <= max_sentence_units:
         return text.strip()
     return " ".join(candidates[:max_sentence_units]).strip()
 
 
-def _is_clinical_detail(text: str) -> bool:
+def helper_is_clinical_detail(text: str) -> bool:
     return bool(
         CLINICAL_DETAIL_RE.search(text or "")
-        or _looks_like_table(text)
-        or _looks_like_structured_percent_detail(text)
+        or helper_looks_like_table(text)
+        or helper_looks_like_structured_percent_detail(text)
     )
 
 
-def _clinical_detail_texts(text: str) -> list[str]:
+def helper_clinical_detail_texts(text: str) -> list[str]:
     stripped = (text or "").strip()
     if not stripped:
         return []
-    if _looks_like_garbled_text(stripped) and not _has_table_separator(stripped):
+    if helper_looks_like_garbled_text(stripped) and not helper_has_table_separator(stripped):
         return []
-    if _looks_like_symbol_noise(stripped):
+    if helper_looks_like_symbol_noise(stripped):
         return []
-    if _looks_like_non_detail_administrative_text(stripped):
+    if helper_looks_like_non_detail_administrative_text(stripped):
         return []
-    if _looks_like_affiliation_table(stripped):
+    if helper_looks_like_affiliation_table(stripped):
         return []
-    if _looks_like_table(stripped):
+    if helper_looks_like_table(stripped):
         return [stripped]
     details = [
         sentence
-        for sentence in _clinical_detail_sentence_candidates(stripped)
-        if not _tiny_route_fragment(sentence)
-        and not _too_short_clinical_detail(sentence)
-        and not _looks_like_symbol_noise(sentence)
-        and not _looks_like_non_detail_administrative_text(sentence)
-        and (CLINICAL_DETAIL_RE.search(sentence) or _looks_like_structured_percent_detail(sentence))
+        for sentence in helper_clinical_detail_sentence_candidates(stripped)
+        if not helper_tiny_route_fragment(sentence)
+        and not helper_too_short_clinical_detail(sentence)
+        and not helper_looks_like_symbol_noise(sentence)
+        and not helper_looks_like_non_detail_administrative_text(sentence)
+        and (CLINICAL_DETAIL_RE.search(sentence) or helper_looks_like_structured_percent_detail(sentence))
     ]
-    return _unique(details)
+    return helper_unique(details)
 
 
-def _clinical_detail_sentence_candidates(text: str) -> list[str]:
+def helper_clinical_detail_sentence_candidates(text: str) -> list[str]:
     candidates: list[str] = []
-    for unit in _sentence_unit_candidates(text):
-        candidates.extend(_clinical_detail_list_units(unit))
+    for unit in helper_sentence_unit_candidates(text):
+        candidates.extend(helper_clinical_detail_list_units(unit))
     return candidates
 
 
-def _sentence_unit_candidates(text: str) -> list[str]:
+def helper_sentence_unit_candidates(text: str) -> list[str]:
     candidates: list[str] = []
-    for candidate in _sentence_candidates(text):
-        parts = _split_sentence_like(candidate)
+    for candidate in helper_sentence_candidates(text):
+        parts = helper_split_sentence_like(candidate)
         candidates.extend(parts if len(parts) > 1 else [candidate])
     return candidates
 
 
-def _split_sentence_like(text: str) -> list[str]:
+def helper_split_sentence_like(text: str) -> list[str]:
     parts = [text.strip()]
     for pattern in (CITATION_SENTENCE_SPLIT_RE, SENTENCE_SPLIT_RE):
         next_parts: list[str] = []
@@ -828,14 +831,14 @@ def _split_sentence_like(text: str) -> list[str]:
     return parts
 
 
-def _clinical_detail_list_units(text: str) -> list[str]:
+def helper_clinical_detail_list_units(text: str) -> list[str]:
     if len(text or "") < 500 or len(CLINICAL_DETAIL_RE.findall(text or "")) < 2:
         return [text]
     parts = [part.strip() for part in re.split(r";\s*", text or "") if part.strip()]
     return parts if len(parts) > 1 else [text]
 
 
-def _looks_like_symbol_noise(text: str) -> bool:
+def helper_looks_like_symbol_noise(text: str) -> bool:
     compact = re.sub(r"\s+", "", text or "")
     if len(compact) < 120:
         return False
@@ -861,18 +864,18 @@ def _looks_like_symbol_noise(text: str) -> bool:
     )
 
 
-def _looks_like_non_detail_administrative_text(text: str) -> bool:
-    return _looks_like_abbreviation_glossary(text) or _looks_like_data_structure_text(text)
+def helper_looks_like_non_detail_administrative_text(text: str) -> bool:
+    return helper_looks_like_abbreviation_glossary(text) or helper_looks_like_data_structure_text(text)
 
 
-def _looks_like_abbreviation_glossary(text: str) -> bool:
+def helper_looks_like_abbreviation_glossary(text: str) -> bool:
     if len(text or "") < 180:
         return False
     definitions = re.findall(r"\b[A-Z][A-Z0-9\u2043-]{1,9}\s*[:：]", text or "")
     return len(definitions) >= 6
 
 
-def _looks_like_data_structure_text(text: str) -> bool:
+def helper_looks_like_data_structure_text(text: str) -> bool:
     text = text or ""
     if DOSE_UNIT_RE.search(text):
         return False
@@ -886,10 +889,10 @@ def _looks_like_data_structure_text(text: str) -> bool:
     return marker_hits >= 12
 
 
-def _looks_like_affiliation_table(text: str) -> bool:
+def helper_looks_like_affiliation_table(text: str) -> bool:
     if DOSE_UNIT_RE.search(text) or "%" in text:
         return False
-    if not _looks_like_table(text):
+    if not helper_looks_like_table(text):
         return False
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     if len(lines) < 8:
@@ -909,11 +912,11 @@ def _looks_like_affiliation_table(text: str) -> bool:
     )
 
 
-def _tiny_route_fragment(text: str) -> bool:
+def helper_tiny_route_fragment(text: str) -> bool:
     return text.strip().lower().strip(".:;") in {"iv", "po"}
 
 
-def _too_short_clinical_detail(text: str) -> bool:
+def helper_too_short_clinical_detail(text: str) -> bool:
     compact = re.sub(r"\s+", " ", text or "").strip().strip("。.;")
     if DOSE_UNIT_RE.search(compact):
         return False
@@ -926,19 +929,19 @@ def _too_short_clinical_detail(text: str) -> bool:
     return len(compact) < 16
 
 
-def _looks_like_table(text: str) -> bool:
+def helper_looks_like_table(text: str) -> bool:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    if len(lines) >= 2 and _has_table_separator(text):
+    if len(lines) >= 2 and helper_has_table_separator(text):
         return True
     return sum(1 for line in lines if line.count("|") >= 2) >= 2
 
 
-def _has_table_separator(text: str) -> bool:
+def helper_has_table_separator(text: str) -> bool:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     return any(TABLE_SEPARATOR_RE.match(line) for line in lines)
 
 
-def _looks_like_structured_percent_detail(text: str) -> bool:
+def helper_looks_like_structured_percent_detail(text: str) -> bool:
     if "%" not in (text or ""):
         return False
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -948,7 +951,7 @@ def _looks_like_structured_percent_detail(text: str) -> bool:
     return len(compact) <= 240 and bool(re.match(r"(?:[-*]\s*)?(?:[\w /-]{1,50}[:：]|\d+[\).])", compact))
 
 
-def _bm25_text(chunk: GuidelineChunk) -> str:
+def helper_bm25_text(chunk: GuidelineChunk) -> str:
     return "\n".join(
         [
             " > ".join(chunk.section_path),
@@ -959,7 +962,7 @@ def _bm25_text(chunk: GuidelineChunk) -> str:
     )
 
 
-def _bm25_score(
+def helper_bm25_score(
     query_tokens: list[str],
     tokens: list[str],
     df: Counter[str],
@@ -978,7 +981,7 @@ def _bm25_score(
     return score
 
 
-def _hashed_vector(text: str, dim: int) -> list[float]:
+def helper_hashed_vector(text: str, dim: int) -> list[float]:
     vector = [0.0] * dim
     for token in tokenize(text):
         digest = hashlib.sha1(token.encode("utf-8")).digest()
@@ -988,18 +991,18 @@ def _hashed_vector(text: str, dim: int) -> list[float]:
     return vector
 
 
-def _normalize(vector: list[float]) -> list[float]:
+def helper_normalize(vector: list[float]) -> list[float]:
     norm = math.sqrt(sum(value * value for value in vector))
     if not norm:
         return vector
     return [value / norm for value in vector]
 
 
-def _dot(left: list[float], right: list[float]) -> float:
+def helper_dot(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
 
-def _normalize_scores(scores: list[float]) -> list[float]:
+def helper_normalize_scores(scores: list[float]) -> list[float]:
     if not scores:
         return []
     low = min(scores)
@@ -1009,14 +1012,14 @@ def _normalize_scores(scores: list[float]) -> list[float]:
     return [(score - low) / (high - low) for score in scores]
 
 
-def _term_overlap(text: str, terms: list[str]) -> float:
+def helper_term_overlap(text: str, terms: list[str]) -> float:
     if not terms:
         return 0.0
     token_set = set(tokenize(text))
     return sum(1 for term in terms if term in token_set) / len(terms)
 
 
-def _query_phrase_terms(query_variants: list[str]) -> list[str]:
+def helper_query_phrase_terms(query_variants: list[str]) -> list[str]:
     phrases: set[str] = set()
     for variant in query_variants:
         normalized = re.sub(r"\s+", " ", variant.lower()).strip()
@@ -1029,16 +1032,16 @@ def _query_phrase_terms(query_variants: list[str]) -> list[str]:
     return sorted(phrases)
 
 
-def _contains_phrase(text: str, query: str) -> bool:
+def helper_contains_phrase(text: str, query: str) -> bool:
     return bool(query and query.lower() in (text or "").lower())
 
 
-def _chunk_id(doc_id: str, chunk_type: str, order_index: int, index: int, text: str) -> str:
+def helper_chunk_id(doc_id: str, chunk_type: str, order_index: int, index: int, text: str) -> str:
     digest = hashlib.sha1(f"{doc_id}:{chunk_type}:{order_index}:{index}:{text[:120]}".encode("utf-8")).hexdigest()[:12]
     return f"{doc_id}_{chunk_type}_{digest}"
 
 
-def _unique(items: list[str]) -> list[str]:
+def helper_unique(items: list[str]) -> list[str]:
     seen: set[str] = set()
     output: list[str] = []
     for item in items:
@@ -1050,7 +1053,7 @@ def _unique(items: list[str]) -> list[str]:
     return output
 
 
-def _result(chunk: GuidelineChunk, score: float) -> dict[str, Any]:
+def helper_result(chunk: GuidelineChunk, score: float) -> dict[str, Any]:
     return {
         "chunk_id": chunk.chunk_id,
         "chunk_type": chunk.chunk_type,

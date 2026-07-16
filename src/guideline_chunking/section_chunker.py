@@ -21,11 +21,12 @@ def build_section_chunks(blocks: list[ParsedBlock], meta: DocumentMeta) -> list[
         nonlocal current_blocks
         if not current_blocks:
             return
-        sections.extend(_section_parts(current_blocks, meta))
+        sections.extend(helper_section_parts(current_blocks, meta))
         current_blocks = []
 
+    # 先按原文顺序恢复块序列；heading_path 变化才代表进入新的父章节。
     for block in sorted(blocks, key=lambda item: item.order_index):
-        key = tuple(block.heading_path or [_untitled(meta)])
+        key = tuple(block.heading_path or [helper_untitled(meta)])
         if current_key is not None and key != current_key:
             flush()
         current_key = key
@@ -41,12 +42,13 @@ def section_for_block(section_chunks: list[SectionChunk], block_id: str) -> str 
     return None
 
 
-def _section_parts(blocks: list[ParsedBlock], meta: DocumentMeta) -> list[SectionChunk]:
+def helper_section_parts(blocks: list[ParsedBlock], meta: DocumentMeta) -> list[SectionChunk]:
     parts: list[list[ParsedBlock]] = []
     current: list[ParsedBlock] = []
     current_tokens = 0
     for block in blocks:
         block_tokens = estimate_tokens(block.text)
+        # 只在块边界拆分，避免截断表格、列表或推荐语句的内部结构。
         if current and current_tokens + block_tokens > MAX_SECTION_TOKENS:
             parts.append(current)
             current = []
@@ -58,9 +60,10 @@ def _section_parts(blocks: list[ParsedBlock], meta: DocumentMeta) -> list[Sectio
 
     section_chunks: list[SectionChunk] = []
     for part_index, part in enumerate(parts):
-        path = part[0].heading_path or [_untitled(meta)]
+        path = part[0].heading_path or [helper_untitled(meta)]
         title = path[-1]
-        section_id = _section_id(meta.doc_id, path, part[0].order_index, part_index)
+        # ID 同时包含标题路径、起始顺序和分片号，使同名章节及超长章节分片保持唯一。
+        section_id = helper_section_id(meta.doc_id, path, part[0].order_index, part_index)
         pages = [page for block in part for page in (block.page_start, block.page_end) if page is not None]
         section_chunks.append(
             SectionChunk(
@@ -86,10 +89,10 @@ def estimate_tokens(text: str) -> int:
     return len(TOKEN_RE.findall(text or ""))
 
 
-def _section_id(doc_id: str, path: list[str], order_index: int, part_index: int) -> str:
+def helper_section_id(doc_id: str, path: list[str], order_index: int, part_index: int) -> str:
     digest = hashlib.sha1((" > ".join(path) + f":{order_index}:{part_index}").encode("utf-8")).hexdigest()[:10]
     return f"{doc_id}_sec_{digest}"
 
 
-def _untitled(meta: DocumentMeta) -> str:
+def helper_untitled(meta: DocumentMeta) -> str:
     return meta.title or "Untitled"

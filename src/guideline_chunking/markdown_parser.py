@@ -23,6 +23,7 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
     lines = md_text.splitlines(keepends=True)
     offset = 0
 
+    # 普通文本按空行、标题、页标记和表格边界累计，flush 时一次生成可溯源 block。
     def flush_pending() -> None:
         nonlocal order_index, pending, pending_is_table
         if not pending:
@@ -30,7 +31,7 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
         raw_text = "".join(line for line, _, _ in pending).strip("\n")
         text = raw_text.strip()
         if text:
-            page_start, page_end = _page_span(text, current_page)
+            page_start, page_end = helper_page_span(text, current_page)
             block_type = "table" if pending_is_table else classify_block_type(text, heading_stack)
             blocks.append(
                 ParsedBlock(
@@ -45,7 +46,7 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
                     char_start=pending[0][1],
                     char_end=pending[-1][2],
                     order_index=order_index,
-                    metadata=_meta_payload(meta),
+                    metadata=helper_meta_payload(meta),
                 )
             )
             order_index += 1
@@ -59,6 +60,7 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
         line = raw_line.rstrip("\r\n")
         stripped = line.strip()
 
+        # 页码标记本身不进入正文，只更新后续 block 的页范围。
         page_match = PAGE_RE.search(stripped)
         if page_match:
             flush_pending()
@@ -70,6 +72,7 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
             flush_pending()
             level = len(heading_match.group(1))
             title = heading_match.group(2).strip()
+            # 截断到当前层级的父路径，再追加新标题，保持 heading_path 层级正确。
             heading_stack = heading_stack[: level - 1] + [title]
             block_type = classify_block_type(title, heading_stack)
             blocks.append(
@@ -85,7 +88,7 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
                     char_start=line_start,
                     char_end=line_end,
                     order_index=order_index,
-                    metadata={**_meta_payload(meta), "is_heading": True},
+                    metadata={**helper_meta_payload(meta), "is_heading": True},
                 )
             )
             order_index += 1
@@ -96,6 +99,7 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
             continue
 
         is_table_line = stripped.startswith("|") and stripped.endswith("|")
+        # 表格与普通段落必须分块，否则后续表格解析会收到混合文本。
         if pending and pending_is_table != is_table_line:
             flush_pending()
         pending.append((raw_line, line_start, line_end))
@@ -105,12 +109,12 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
     return blocks
 
 
-def _page_span(text: str, fallback: int | None) -> tuple[int | None, int | None]:
+def helper_page_span(text: str, fallback: int | None) -> tuple[int | None, int | None]:
     pages = [int(group) for match in PAGE_RE.finditer(text or "") for group in match.groups() if group]
     if pages:
         return min(pages), max(pages)
     return fallback, fallback
 
 
-def _meta_payload(meta: DocumentMeta) -> dict[str, str | None]:
+def helper_meta_payload(meta: DocumentMeta) -> dict[str, str | None]:
     return asdict(meta)

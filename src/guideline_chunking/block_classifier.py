@@ -56,7 +56,7 @@ def classify_block_type(block_text: str, heading_path: list[str]) -> str:
     combined = f"{heading_text}\n{text}".strip()
     low_value_context = bool(BAD_RECOMMENDATION_RE.search(combined))
 
-    if _looks_like_markdown_table(text):
+    if helper_looks_like_markdown_table(text):
         return "table"
     if not heading_path and len(text.splitlines()) == 1 and len(text) < 180:
         return "title"
@@ -66,7 +66,7 @@ def classify_block_type(block_text: str, heading_path: list[str]) -> str:
         return "method"
     if SCOPE_RE.search(combined):
         return "scope_candidate"
-    if POPULATION_RE.search(combined) and not _looks_like_pico(text):
+    if POPULATION_RE.search(combined) and not helper_looks_like_pico(text):
         return "population_candidate"
     if RECOMMENDATION_RE.search(combined) and not low_value_context:
         return "recommendation_candidate"
@@ -85,11 +85,11 @@ def classify_block_type(block_text: str, heading_path: list[str]) -> str:
     return "unknown"
 
 
-def _looks_like_markdown_table(text: str) -> bool:
+def helper_looks_like_markdown_table(text: str) -> bool:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     return bool(lines) and all(line.startswith("|") and line.endswith("|") for line in lines)
 
 
-def _looks_like_pico(text: str) -> bool:
+def helper_looks_like_pico(text: str) -> bool:
     lower = text.lower()
     return sum(label in lower for label in ("population", "intervention", "comparator", "outcome")) >= 2

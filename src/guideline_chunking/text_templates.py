@@ -18,23 +18,23 @@ def build_text_for_embedding(
     original_row: str | None = None,
 ) -> str:
     parts: list[str] = []
-    _add(parts, "Document", meta.title)
-    _add(parts, "Publisher", meta.publisher)
-    _add(parts, "Document type", meta.document_type)
-    _add(parts, "Section", " > ".join(heading_path))
-    _add(parts, "Chunk type", chunk_type)
+    add_field(parts, "Document", meta.title)
+    add_field(parts, "Publisher", meta.publisher)
+    add_field(parts, "Document type", meta.document_type)
+    add_field(parts, "Section", " > ".join(heading_path))
+    add_field(parts, "Chunk type", chunk_type)
     if page_start is not None:
         location = f"page {page_start}" if page_end in (None, page_start) else f"page {page_start}-{page_end}"
-        _add(parts, "Source location", location)
-    _add(parts, "Table title", table_title)
+        add_field(parts, "Source location", location)
+    add_field(parts, "Table title", table_title)
     if columns_and_values:
-        _add(parts, "Columns and values", "\n".join(f"{key}: {value}" for key, value in columns_and_values))
-    _add(parts, "Original row", original_row)
-    _add(parts, "Text", text)
+        add_field(parts, "Columns and values", "\n".join(f"{key}: {value}" for key, value in columns_and_values))
+    add_field(parts, "Original row", original_row)
+    add_field(parts, "Text", text)
     return "\n\n".join(parts)
 
 
-def _add(parts: list[str], label: str, value: object | None) -> None:
+def add_field(parts: list[str], label: str, value: object | None) -> None:
     if value in (None, "", [], {}):
         return
     parts.append(f"[{label}]\n{value}")
