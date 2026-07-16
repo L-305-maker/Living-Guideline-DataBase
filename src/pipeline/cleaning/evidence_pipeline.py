@@ -35,6 +35,7 @@ class EvidencePipelinePaths:
 
     data_dir: Path
     raw_pdf_dir: Path
+    consensus_pdf_dir: Path
     markdown_raw_dir: Path
     markdown_clean_dir: Path
     blocks_dir: Path
@@ -48,11 +49,12 @@ class EvidencePipelinePaths:
     run_manifest: Path
 
     @classmethod
-    def from_data_dir(cls, data_dir: str | Path, raw_pdf_dir: str | Path | None = None) -> "EvidencePipelinePaths":
+    def from_data_dir(cls, data_dir: str | Path, raw_pdf_dir: str | Path | None = None, consensus_pdf_dir: str | Path | None = None) -> "EvidencePipelinePaths":
         root = Path(data_dir)
         return cls(
             data_dir=root,
             raw_pdf_dir=Path(raw_pdf_dir) if raw_pdf_dir else root / "raw_pdf",
+            consensus_pdf_dir=Path(consensus_pdf_dir) if consensus_pdf_dir else root.parent / "consensus",
             markdown_raw_dir=root / "markdown_raw",
             markdown_clean_dir=root / "markdown_clean",
             blocks_dir=root / "sections",
@@ -80,8 +82,9 @@ def run_evidence_pipeline(
     *,
     data_dir: str | Path = DATA_DIR,
     raw_pdf_dir: str | Path | None = None,
+    consensus_pdf_dir: str | Path | None = None,
     skip_pdf_to_markdown: bool = False,
-    skip_vector: bool = True,
+    skip_vector: bool = False,
     legacy_json_bm25: bool = False,
     embedding_model: str = "BAAI/bge-m3",
     ocr_mode: str = "auto",
@@ -89,7 +92,8 @@ def run_evidence_pipeline(
 ) -> dict[str, Any]:
     """Run the evidence-library build and return a machine-readable manifest."""
 
-    paths = EvidencePipelinePaths.from_data_dir(data_dir, raw_pdf_dir)
+    # 所有阶段共享同一组规范路径，避免调用方各自推导目录造成产物错位。
+    paths = EvidencePipelinePaths.from_data_dir(data_dir, raw_pdf_dir, consensus_pdf_dir)
     for directory in [
         paths.markdown_raw_dir,
         paths.markdown_clean_dir,
@@ -108,25 +112,31 @@ def run_evidence_pipeline(
         }
     else:
         stages["pdf_to_markdown"] = convert_pdfs(
-            paths.raw_pdf_dir,
-            paths.markdown_raw_dir,
-            paths.raw_manifest,
-            ocr_mode=ocr_mode,
-            ocr_output_dir=paths.data_dir / "ocr_pdf",
-            ocr_languages=ocr_languages,
+            paths.raw_pdf_dir, paths.markdown_raw_dir, paths.raw_manifest,
+            ocr_mode=ocr_mode, ocr_output_dir=paths.data_dir / "ocr_pdf",
+            ocr_languages=ocr_languages, document_kind="guideline",
         )
+        # 共识文件追加到同一原始 manifest，并通过 document_kind 与指南区分。
+        if paths.consensus_pdf_dir.exists():
+            stages["consensus_pdf_to_markdown"] = convert_pdfs(
+                paths.consensus_pdf_dir, paths.markdown_raw_dir, paths.raw_manifest,
+                ocr_mode=ocr_mode, ocr_output_dir=paths.data_dir / "ocr_pdf",
+                ocr_languages=ocr_languages, document_kind="consensus", append=True,
+            )
 
     stages["clean_markdown"] = clean_markdown_dir(paths.markdown_raw_dir, paths.markdown_clean_dir, paths.document_manifest)
     stages["encode_blocks"] = encode_blocks(paths.markdown_clean_dir, paths.blocks_dir)
     stages["document_representations"] = build_document_representations(paths.markdown_clean_dir, paths.data_dir)
     stages["chunk_blocks"] = chunk_blocks(paths.markdown_clean_dir, paths.chunks_dir)
     stages["sqlite_fts"] = build_sqlite_store(paths.data_dir, paths.sqlite_db)
+    # SQLite 建库会产生大量临时对象，向量模型加载前主动回收可降低峰值内存。
     gc.collect()
 
     if legacy_json_bm25:
         stages["legacy_json_bm25"] = build_bm25_indexes(paths.markdown_clean_dir, paths.chunks_dir / "all_chunks.jsonl", paths.index_dir)
     if skip_vector:
-        stages["vector"] = {"skipped": True, "reason": "skip_vector defaults to true for lightweight builds"}
+        # manifest 明确记录跳过原因，服务部署时可判断是否具备向量检索条件。
+        stages["vector"] = {"skipped": True, "reason": "skip_vector was explicitly enabled"}
     else:
         stages["vector"] = build_vector_indexes(
             paths.markdown_clean_dir,

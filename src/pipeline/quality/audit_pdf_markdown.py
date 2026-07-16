@@ -16,7 +16,7 @@ from src.utils.io import DATA_DIR, ensure_parent, read_jsonl
 PAGE_MARKER_RE = re.compile(r"<!--\s*page:\s*\d+\s*-->", re.I)
 
 
-def _pdf_text_stats(path: Path) -> dict[str, Any]:
+def helper_pdf_text_stats(path: Path) -> dict[str, Any]:
     report = inspect_pdf_text_layer(path)
     return {
         "pdf_pages": report.pages,
@@ -34,7 +34,7 @@ def _pdf_text_stats(path: Path) -> dict[str, Any]:
     }
 
 
-def _markdown_stats(path: Path) -> dict[str, Any]:
+def helper_markdown_stats(path: Path) -> dict[str, Any]:
     markdown = path.read_text(encoding="utf-8", errors="replace")
     metadata, body = parse_front_matter(markdown)
     text = re.sub(r"<!--.*?-->", " ", body, flags=re.S)
@@ -73,6 +73,7 @@ def audit_pdf_markdown(
             stats["documents"] += 1
             pdf_path = Path(record.get("source_file") or "")
             if not pdf_path.exists():
+                # manifest 可能保存相对路径，先按当前项目根目录解析一次。
                 pdf_path = Path.cwd() / pdf_path
             md_path = Path(record.get("markdown_clean_path") or "")
             row = {
@@ -94,17 +95,19 @@ def audit_pdf_markdown(
                 handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 continue
             try:
-                row.update(_pdf_text_stats(pdf_path))
-                row.update(_markdown_stats(md_path))
+                row.update(helper_pdf_text_stats(pdf_path))
+                row.update(helper_markdown_stats(md_path))
                 metadata = row.get("metadata") or {}
                 row["source_pdf_text_quality"] = metadata.get("source_pdf_text_quality") or record.get("source_pdf_text_quality") or ""
                 row["effective_pdf_text_quality"] = metadata.get("pdf_text_quality") or record.get("pdf_text_quality") or ""
                 row["ocr_status"] = metadata.get("ocr_status") or record.get("ocr_status") or ""
                 row["ocr_applied"] = (metadata.get("ocr_applied") or str(record.get("ocr_applied") or "")).lower() == "true"
+                # Markdown 与 PDF 文本字符比用于发现抽取严重缺失，分母至少为一。
                 ratio = row["markdown_chars"] / max(1, row["pdf_text_chars"])
                 row["markdown_to_pdf_text_ratio"] = round(ratio, 4)
                 row["needs_ocr"] = bool(row["pdf_needs_ocr"] or row["pdf_text_chars_per_page"] < needs_ocr_chars_per_page)
                 row["low_completeness"] = bool(row["pdf_text_chars"] >= 1000 and ratio < low_completeness_ratio)
+                # 允许少量封面或空白页差异，只有超过固定值和比例阈值才报警。
                 row["page_mismatch"] = bool(
                     row["pdf_pages"] > 0
                     and row["markdown_page_markers"] > 0
@@ -127,6 +130,7 @@ def audit_pdf_markdown(
                 if row["status"] == "ok":
                     stats["ok"] += 1
             except Exception as exc:  # noqa: BLE001
+                # 单篇审计失败写入报告并继续处理，保证全库问题清单尽可能完整。
                 row["status"] = "audit_error"
                 row["error"] = str(exc)
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")

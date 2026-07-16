@@ -113,19 +113,19 @@ def split_section_semantic_content(
     max_tokens: int = MAX_TOKENS,
     overlap_tokens: int = OVERLAP_TOKENS,
 ) -> list[SemanticChunkPart]:
-    cleaned = _strip_leading_heading(content)
+    cleaned = helper_strip_leading_heading(content)
     inferred_type = section_type or classify_section(heading=heading, section_path=section_path or [], content=cleaned)
-    units = _semantic_units(cleaned, inferred_type)
-    return _pack_units(units, min_tokens, target_tokens, max_tokens, overlap_tokens)
+    units = helper_semantic_units(cleaned, inferred_type)
+    return helper_pack_units(units, min_tokens, target_tokens, max_tokens, overlap_tokens)
 
 
 def classify_semantic_text(text: str, section_type: str = "other") -> str:
-    normalized = _normalize(text)
+    normalized = helper_normalize(text)
     if not normalized:
         return section_type
     if section_type == "reference":
         return "reference"
-    if _is_table_text(normalized):
+    if helper_is_table_text(normalized):
         return "table"
     if ACTION_PATTERN.search(normalized) and not BAD_RECOMMENDATION_CONTEXT.search(normalized):
         return "recommendation"
@@ -142,31 +142,31 @@ def classify_semantic_text(text: str, section_type: str = "other") -> str:
     return "other"
 
 
-def _strip_leading_heading(content: str) -> str:
+def helper_strip_leading_heading(content: str) -> str:
     return LEADING_HEADING_RE.sub("", content or "", count=1).strip()
 
 
-def _normalize(text: str) -> str:
+def helper_normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def _is_table_text(text: str) -> bool:
+def helper_is_table_text(text: str) -> bool:
     lines = [line for line in (text or "").splitlines() if line.strip()]
     return bool(lines) and sum(1 for line in lines if TABLE_RE.search(line)) >= max(1, len(lines) // 2)
 
 
-def _semantic_units(content: str, section_type: str) -> list[SemanticUnit]:
+def helper_semantic_units(content: str, section_type: str) -> list[SemanticUnit]:
     units: list[SemanticUnit] = []
-    for block in _raw_blocks(content):
+    for block in helper_raw_blocks(content):
         block_type = classify_semantic_text(block, section_type)
-        for text in _split_block(block, block_type):
+        for text in helper_split_block(block, block_type):
             token_count = estimate_tokens(text)
             if token_count:
                 units.append(SemanticUnit(text=text, unit_type=classify_semantic_text(text, block_type), token_count=token_count))
     return units
 
 
-def _raw_blocks(content: str) -> list[str]:
+def helper_raw_blocks(content: str) -> list[str]:
     blocks: list[str] = []
     table_lines: list[str] = []
     paragraph_lines: list[str] = []
@@ -178,7 +178,7 @@ def _raw_blocks(content: str) -> list[str]:
 
     def flush_paragraph() -> None:
         if paragraph_lines:
-            blocks.extend(_split_paragraph_lines(paragraph_lines))
+            blocks.extend(helper_split_paragraph_lines(paragraph_lines))
             paragraph_lines.clear()
 
     for line in (content or "").splitlines():
@@ -198,13 +198,13 @@ def _raw_blocks(content: str) -> list[str]:
     return [block for block in blocks if block]
 
 
-def _split_paragraph_lines(lines: list[str]) -> list[str]:
+def helper_split_paragraph_lines(lines: list[str]) -> list[str]:
     if len(lines) > 1 and all(BULLET_RE.search(line) for line in lines):
         return [BULLET_RE.sub("", line).strip() for line in lines if line.strip()]
     return [" ".join(lines).strip()]
 
 
-def _split_block(block: str, block_type: str) -> list[str]:
+def helper_split_block(block: str, block_type: str) -> list[str]:
     if block_type == "table":
         return [block]
     if estimate_tokens(block) <= TARGET_TOKENS:
@@ -213,7 +213,7 @@ def _split_block(block: str, block_type: str) -> list[str]:
     return sentences or [block]
 
 
-def _pack_units(
+def helper_pack_units(
     units: list[SemanticUnit],
     min_tokens: int,
     target_tokens: int,
@@ -228,19 +228,21 @@ def _pack_units(
     def flush() -> None:
         nonlocal current, current_tokens, current_type
         if current:
-            chunks.append(_chunk_part(current))
+            chunks.append(helper_chunk_part(current))
         current = []
         current_tokens = 0
         current_type = ""
 
     for unit in units:
         if unit.token_count > max_tokens:
+            # 超长单元无法与相邻语义安全合并，先落盘当前块再单独滑窗切分。
             flush()
-            chunks.extend(_split_long_unit(unit, max_tokens, overlap_tokens))
+            chunks.extend(helper_split_long_unit(unit, max_tokens, overlap_tokens))
             continue
         same_type = not current_type or current_type == unit.unit_type
         would_fit = current_tokens + unit.token_count <= max_tokens
         should_pack = current_tokens < target_tokens or current_tokens < min_tokens
+        # 类型变化、超过硬上限或已达到目标长度时结束当前 chunk。
         if current and (not same_type or not would_fit or not should_pack):
             flush()
         current.append(unit)
@@ -250,13 +252,13 @@ def _pack_units(
     return chunks
 
 
-def _chunk_part(units: list[SemanticUnit]) -> SemanticChunkPart:
+def helper_chunk_part(units: list[SemanticUnit]) -> SemanticChunkPart:
     text = "\n\n".join(unit.text for unit in units if unit.text).strip()
     chunk_type = units[0].unit_type if units else "other"
     return SemanticChunkPart(content=text, chunk_type=chunk_type, token_count=estimate_tokens(text))
 
 
-def _split_long_unit(unit: SemanticUnit, max_tokens: int, overlap_tokens: int) -> list[SemanticChunkPart]:
+def helper_split_long_unit(unit: SemanticUnit, max_tokens: int, overlap_tokens: int) -> list[SemanticChunkPart]:
     overlap = 0 if unit.unit_type in {"recommendation", "table"} else overlap_tokens
     tokens = WORD_OR_CHAR_RE.findall(unit.text)
     if not tokens:
@@ -265,7 +267,7 @@ def _split_long_unit(unit: SemanticUnit, max_tokens: int, overlap_tokens: int) -
     start = 0
     while start < len(tokens):
         end = min(start + max_tokens, len(tokens))
-        text = _join_tokens(tokens[start:end])
+        text = helper_join_tokens(tokens[start:end])
         token_count = estimate_tokens(text)
         if token_count:
             parts.append(SemanticChunkPart(content=text, chunk_type=unit.unit_type, token_count=token_count))
@@ -275,7 +277,7 @@ def _split_long_unit(unit: SemanticUnit, max_tokens: int, overlap_tokens: int) -
     return parts
 
 
-def _join_tokens(tokens: list[str]) -> str:
+def helper_join_tokens(tokens: list[str]) -> str:
     text = " ".join(tokens)
     text = re.sub(r"\s+([,.;:!?，。；：！？%)\]])", r"\1", text)
     text = re.sub(r"([(\[])\s+", r"\1", text)

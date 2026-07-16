@@ -12,17 +12,17 @@ from typing import Any, Iterable
 from src.models.schemas import DocumentRecord, dump_model
 from src.pipeline.cleaning.cleaner import assess_cleaned_body
 from src.pipeline.cleaning.semantic_chunker import retrieval_text
-from src.pipeline.quality.repair_quality import _reference_like, _repair_vector_metadata
+from src.pipeline.quality.repair_quality import helper_reference_like, helper_repair_vector_metadata
 from src.retrieval.document_repr.builder import (
     POPULATION_LINE_RE,
     SCOPE_LINE_RE,
     build_document_card,
     build_document_views,
-    _candidate_lines,
-    _clip,
-    _dedupe_lines,
-    _is_useful_line,
-    _normalize_space,
+    helper_candidate_lines,
+    helper_clip,
+    helper_dedupe_lines,
+    helper_is_useful_line,
+    helper_normalize_space,
 )
 from src.utils.clinical_department import UNKNOWN_DEPARTMENT, classify_clinical_department
 from src.utils.front_matter import dump_front_matter, parse_front_matter
@@ -115,25 +115,25 @@ CITATION_LIKE_RE = re.compile(
 )
 
 
-def _split_flags(value: str | None) -> list[str]:
+def helper_split_flags(value: str | None) -> list[str]:
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
-def _valid_publication_date(value: str | None) -> bool:
+def helper_valid_publication_date(value: str | None) -> bool:
     if not value or value == "unknown":
         return False
     return bool(VALID_DATE_RE.match(value))
 
 
-def _metadata_bool(metadata: dict[str, str], key: str) -> bool:
+def helper_metadata_bool(metadata: dict[str, str], key: str) -> bool:
     return str(metadata.get(key, "")).strip().lower() in {"1", "true", "yes", "y"}
 
 
-def _weak_text(value: str | None, min_chars: int = 80) -> bool:
-    return len(_normalize_space(value or "")) < min_chars
+def helper_weak_text(value: str | None, min_chars: int = 80) -> bool:
+    return len(helper_normalize_space(value or "")) < min_chars
 
 
-def _is_generic_title(title: str) -> bool:
+def helper_is_generic_title(title: str) -> bool:
     normalized = clean_title(title)
     if not normalized:
         return True
@@ -149,7 +149,7 @@ def _is_generic_title(title: str) -> bool:
     return letters / max(1, len(visible)) < 0.35
 
 
-def _clean_title_candidate(line: str) -> str:
+def helper_clean_title_candidate(line: str) -> str:
     line = re.sub(r"^\s*#{1,6}\s*", "", line or "").strip()
     line = re.sub(r"^\s*(?:title|题名)\s*[:\uff1a]\s*", "", line, flags=re.I)
     line = clean_title(line)
@@ -158,17 +158,17 @@ def _clean_title_candidate(line: str) -> str:
     return line
 
 
-def _first_alpha_is_lower(text: str) -> bool:
+def helper_first_alpha_is_lower(text: str) -> bool:
     for char in text:
         if char.isalpha():
             return char.isascii() and char.islower()
     return False
 
 
-def _join_title_lines(lines: list[str]) -> str:
+def helper_join_title_lines(lines: list[str]) -> str:
     output = ""
     for line in lines:
-        stripped = _clean_title_candidate(line)
+        stripped = helper_clean_title_candidate(line)
         if not stripped:
             continue
         if output.endswith("-"):
@@ -180,7 +180,7 @@ def _join_title_lines(lines: list[str]) -> str:
     return clean_title(output)
 
 
-def _candidate_title_blocks(body: str) -> list[tuple[str, int]]:
+def helper_candidate_title_blocks(body: str) -> list[tuple[str, int]]:
     raw_lines = body.splitlines()[:600]
     candidates: list[tuple[str, int]] = []
     seen_early_title = False
@@ -190,7 +190,7 @@ def _candidate_title_blocks(body: str) -> list[tuple[str, int]]:
             continue
         if seen_early_title and (AUTHOR_OR_AFFILIATION_RE.search(stripped) or ABSTRACT_PROSE_START_RE.search(stripped)):
             break
-        single = _clean_title_candidate(stripped)
+        single = helper_clean_title_candidate(stripped)
         if single:
             candidates.append((single, index))
             if index < 40 and STRONG_TITLE_KEYWORD_RE.search(single):
@@ -198,8 +198,8 @@ def _candidate_title_blocks(body: str) -> list[tuple[str, int]]:
         if BODY_SENTENCE_PREFIX_RE.search(stripped) or AUTHOR_OR_AFFILIATION_RE.search(stripped):
             continue
         previous = raw_lines[index - 1].strip() if index > 0 else ""
-        previous_title = _clean_title_candidate(previous) if previous else ""
-        starts_title_block = index == 0 or not previous or _is_generic_title(previous_title)
+        previous_title = helper_clean_title_candidate(previous) if previous else ""
+        starts_title_block = index == 0 or not previous or helper_is_generic_title(previous_title)
         if not starts_title_block:
             continue
         block: list[str] = []
@@ -209,8 +209,8 @@ def _candidate_title_blocks(body: str) -> list[tuple[str, int]]:
             candidate_line = raw_lines[index + offset].strip()
             if not candidate_line:
                 break
-            cleaned_line = _clean_title_candidate(candidate_line)
-            generic_line = _is_generic_title(cleaned_line)
+            cleaned_line = helper_clean_title_candidate(candidate_line)
+            generic_line = helper_is_generic_title(cleaned_line)
             generic_suffix = offset > 0 and bool(STRONG_TITLE_KEYWORD_RE.search(cleaned_line))
             if not cleaned_line or (generic_line and not generic_suffix) or TITLE_NOISE_RE.search(cleaned_line):
                 if offset == 0:
@@ -222,7 +222,7 @@ def _candidate_title_blocks(body: str) -> list[tuple[str, int]]:
                 break
             block.append(candidate_line)
         if len(block) >= 2:
-            joined = _join_title_lines(block)
+            joined = helper_join_title_lines(block)
             if joined:
                 candidates.append((joined, index))
                 if index < 40 and STRONG_TITLE_KEYWORD_RE.search(joined):
@@ -230,12 +230,12 @@ def _candidate_title_blocks(body: str) -> list[tuple[str, int]]:
     return candidates
 
 
-def _title_candidate_score(title: str, index: int) -> float:
-    if not title or _is_generic_title(title) or TITLE_NOISE_RE.search(title):
+def helper_title_candidate_score(title: str, index: int) -> float:
+    if not title or helper_is_generic_title(title) or TITLE_NOISE_RE.search(title):
         return -1000.0
     if SHORT_PUBLISHER_SUBTITLE_RE.search(title) and len(title) < 110:
         return -1000.0
-    if BODY_SENTENCE_PREFIX_RE.search(title) or _first_alpha_is_lower(title):
+    if BODY_SENTENCE_PREFIX_RE.search(title) or helper_first_alpha_is_lower(title):
         return -1000.0
     visible = [char for char in title if not char.isspace()]
     if not visible:
@@ -261,18 +261,18 @@ def _title_candidate_score(title: str, index: int) -> float:
     return score
 
 
-def _find_better_title(body: str, source_file: str) -> str:
-    candidates = _candidate_title_blocks(body)
+def helper_find_better_title(body: str, source_file: str) -> str:
+    candidates = helper_candidate_title_blocks(body)
     filename_title = clean_title_from_filename(source_file)
     if filename_title:
         candidates.append((filename_title, 250))
     if not candidates:
         return ""
-    best_title, _index = max(candidates, key=lambda item: _title_candidate_score(item[0], item[1]))
-    return best_title if _title_candidate_score(best_title, _index) >= 55 else ""
+    best_title, _index = max(candidates, key=lambda item: helper_title_candidate_score(item[0], item[1]))
+    return best_title if helper_title_candidate_score(best_title, _index) >= 55 else ""
 
 
-def _readable_ratio(text: str) -> float:
+def helper_readable_ratio(text: str) -> float:
     compact = re.sub(r"\s+", "", text or "")
     if not compact:
         return 0.0
@@ -280,18 +280,18 @@ def _readable_ratio(text: str) -> float:
     return readable / len(compact)
 
 
-def _usable_abstract(text: str, max_chars: int = 1200) -> str:
-    abstract = _normalize_space(text or "")
+def helper_usable_abstract(text: str, max_chars: int = 1200) -> str:
+    abstract = helper_normalize_space(text or "")
     if len(abstract) > max_chars:
         abstract = abstract[:max_chars].rstrip()
     if len(abstract) < 40:
         return ""
-    if _readable_ratio(abstract) < 0.55:
+    if helper_readable_ratio(abstract) < 0.55:
         return ""
     return abstract
 
 
-def _find_anchored_abstract(body: str, max_chars: int = 1200) -> str:
+def helper_find_anchored_abstract(body: str, max_chars: int = 1200) -> str:
     lines: list[str] = []
     collecting = False
     for raw_line in body.splitlines():
@@ -309,38 +309,38 @@ def _find_anchored_abstract(body: str, max_chars: int = 1200) -> str:
             continue
         if LOW_VALUE_ABSTRACT_RE.search(stripped):
             continue
-        if _is_useful_line(stripped, min_chars=20):
+        if helper_is_useful_line(stripped, min_chars=20):
             lines.append(stripped)
         if sum(len(item) for item in lines) >= max_chars:
             break
-    return _usable_abstract(" ".join(lines), max_chars)
+    return helper_usable_abstract(" ".join(lines), max_chars)
 
 
-def _find_fallback_abstract(body: str, title: str, max_chars: int = 1200) -> str:
-    title_norm = _normalize_space(title).lower()
+def helper_find_fallback_abstract(body: str, title: str, max_chars: int = 1200) -> str:
+    title_norm = helper_normalize_space(title).lower()
     lines: list[str] = []
     for raw_line in extract_abstract(body, max_chars=max_chars * 3).splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#") or stripped.startswith("|") or LOW_VALUE_ABSTRACT_RE.search(stripped):
             continue
-        if _normalize_space(stripped).lower() == title_norm:
+        if helper_normalize_space(stripped).lower() == title_norm:
             continue
-        if _is_useful_line(stripped, min_chars=25):
+        if helper_is_useful_line(stripped, min_chars=25):
             lines.append(stripped)
         if sum(len(item) for item in lines) >= max_chars:
             break
-    return _usable_abstract(" ".join(lines), max_chars)
+    return helper_usable_abstract(" ".join(lines), max_chars)
 
 
-def _find_best_abstract(body: str, title: str) -> str:
-    return _find_anchored_abstract(body) or _find_fallback_abstract(body, title) or _usable_abstract(title, 400)
+def helper_find_best_abstract(body: str, title: str) -> str:
+    return helper_find_anchored_abstract(body) or helper_find_fallback_abstract(body, title) or helper_usable_abstract(title, 400)
 
 
-def _infer_source(source_file: str, body: str) -> str:
+def helper_infer_source(source_file: str, body: str) -> str:
     return extract_source_institution(source_file, body)
 
 
-def _looks_like_text_encoding_failure(metadata: dict[str, str], body: str) -> bool:
+def helper_looks_like_text_encoding_failure(metadata: dict[str, str], body: str) -> bool:
     source_file = (metadata.get("source_file") or "").lower()
     title = metadata.get("title") or ""
     source = metadata.get("source_institution") or ""
@@ -359,13 +359,13 @@ def _looks_like_text_encoding_failure(metadata: dict[str, str], body: str) -> bo
     return marker_count >= 80 or marker_ratio >= 0.08 or (cjk_ratio < 0.12 and symbol_ratio > 0.22)
 
 
-def _apply_audit_quality(metadata: dict[str, str], body: str) -> bool:
+def helper_apply_audit_quality(metadata: dict[str, str], body: str) -> bool:
     original_quality = metadata.get("cleaning_quality", "")
     original_flags = metadata.get("cleaning_flags", "")
     report = assess_cleaned_body(body)
-    flags = _dedupe_lines([*_split_flags(original_flags), *report["flags"]], 40)
-    if _looks_like_text_encoding_failure(metadata, body):
-        flags = _dedupe_lines([*flags, "likely_text_encoding_failure"], 40)
+    flags = helper_dedupe_lines([*helper_split_flags(original_flags), *report["flags"]], 40)
+    if helper_looks_like_text_encoding_failure(metadata, body):
+        flags = helper_dedupe_lines([*flags, "likely_text_encoding_failure"], 40)
     severe = {"low_text_signal", "likely_ocr_failure", "noisy_ocr_lines", "noisy_ocr_title", "likely_text_encoding_failure"}
     if severe & set(flags):
         quality = "poor"
@@ -378,34 +378,34 @@ def _apply_audit_quality(metadata: dict[str, str], body: str) -> bool:
     return metadata.get("cleaning_quality", "") != original_quality or metadata.get("cleaning_flags", "") != original_flags
 
 
-def _content_before_references(body: str) -> str:
+def helper_content_before_references(body: str) -> str:
     match = REFERENCE_START_RE.search(body or "")
     return body[: match.start()] if match else body
 
 
-def _collect_full_text_signals(body: str) -> dict[str, list[str]]:
+def helper_collect_full_text_signals(body: str) -> dict[str, list[str]]:
     signals: dict[str, list[str]] = {"recommendation": [], "question": [], "scope": [], "population": []}
     limits = {"recommendation": 28, "question": 18, "scope": 16, "population": 14}
-    text = _content_before_references(body)
-    for line in _candidate_lines(text):
-        if not _is_useful_line(line):
+    text = helper_content_before_references(body)
+    for line in helper_candidate_lines(text):
+        if not helper_is_useful_line(line):
             continue
         if CITATION_LIKE_RE.search(line) and not re.search(r"(\u63a8\u8350|\u5efa\u8bae|\u5e94\u8be5|\u5e94\u5f53|\u5e94\u4e88)", line):
             continue
         if len(signals["recommendation"]) < limits["recommendation"] and STRICT_RECOMMENDATION_LINE_RE.search(line):
-            signals["recommendation"].append(_clip(line, 800))
+            signals["recommendation"].append(helper_clip(line, 800))
         if len(signals["question"]) < limits["question"] and STRICT_QUESTION_LINE_RE.search(line):
-            signals["question"].append(_clip(line, 700))
+            signals["question"].append(helper_clip(line, 700))
         if len(signals["scope"]) < limits["scope"] and SCOPE_LINE_RE.search(line):
-            signals["scope"].append(_clip(line, 700))
+            signals["scope"].append(helper_clip(line, 700))
         if len(signals["population"]) < limits["population"] and POPULATION_LINE_RE.search(line):
-            signals["population"].append(_clip(line, 650))
+            signals["population"].append(helper_clip(line, 650))
         if all(len(signals[name]) >= limits[name] for name in signals):
             break
-    return {name: _dedupe_lines(values, limits[name]) for name, values in signals.items()}
+    return {name: helper_dedupe_lines(values, limits[name]) for name, values in signals.items()}
 
 
-def _rebuild_card_text(card: dict[str, Any]) -> None:
+def helper_rebuild_card_text(card: dict[str, Any]) -> None:
     fields = card.get("fields") or {}
     card_sections = [
         ("Title", card.get("title", "")),
@@ -422,40 +422,40 @@ def _rebuild_card_text(card: dict[str, Any]) -> None:
         ("Conclusion", fields.get("conclusion", "")),
     ]
     card_text = "\n\n".join(f"[{name}]\n{value}" for name, value in card_sections if value)
-    card["card_text"] = _clip(card_text, 12000)
+    card["card_text"] = helper_clip(card_text, 12000)
 
 
-def _backfill_card_fields(card: dict[str, Any], body: str) -> set[str]:
-    flags = set(_split_flags(card.get("cleaning_flags", "")))
+def helper_backfill_card_fields(card: dict[str, Any], body: str) -> set[str]:
+    flags = set(helper_split_flags(card.get("cleaning_flags", "")))
     if card.get("cleaning_quality") == "poor" or "likely_text_encoding_failure" in flags:
         return set()
     fields = card.setdefault("fields", {})
     changed: set[str] = set()
-    needs_recommendation = _weak_text(fields.get("key_recommendations"), 80)
-    needs_scope = _weak_text("\n".join([fields.get("scope", ""), fields.get("target_population", "")]), 80)
-    needs_pico = _weak_text(fields.get("clinical_questions_pico"), 60)
+    needs_recommendation = helper_weak_text(fields.get("key_recommendations"), 80)
+    needs_scope = helper_weak_text("\n".join([fields.get("scope", ""), fields.get("target_population", "")]), 80)
+    needs_pico = helper_weak_text(fields.get("clinical_questions_pico"), 60)
     if not (needs_recommendation or needs_scope or needs_pico):
         return changed
-    signals = _collect_full_text_signals(body)
+    signals = helper_collect_full_text_signals(body)
     if needs_recommendation and signals["recommendation"]:
         fields["key_recommendations"] = "\n".join(signals["recommendation"])
         changed.add("recommendation_summary")
     if needs_scope:
         if signals["scope"]:
-            fields["scope"] = _clip("\n".join(signals["scope"]), 2200)
+            fields["scope"] = helper_clip("\n".join(signals["scope"]), 2200)
         if signals["population"]:
-            fields["target_population"] = _clip("\n".join(signals["population"]), 1400)
+            fields["target_population"] = helper_clip("\n".join(signals["population"]), 1400)
         if signals["scope"] or signals["population"]:
             changed.add("scope_population")
     if needs_pico and signals["question"]:
         fields["clinical_questions_pico"] = "\n".join(signals["question"])
         changed.add("pico_questions")
     if changed:
-        _rebuild_card_text(card)
+        helper_rebuild_card_text(card)
     return changed
 
 
-def _card_view_text(card: dict[str, Any], view_type: str) -> str:
+def helper_card_view_text(card: dict[str, Any], view_type: str) -> str:
     fields = card.get("fields") or {}
     if view_type == "recommendation_summary":
         return fields.get("key_recommendations", "")
@@ -466,7 +466,7 @@ def _card_view_text(card: dict[str, Any], view_type: str) -> str:
     return ""
 
 
-def _document_record_from_metadata(
+def helper_document_record_from_metadata(
     metadata: dict[str, str],
     abstract: str,
     markdown: str,
@@ -490,26 +490,26 @@ def _document_record_from_metadata(
         cleaning_quality=metadata.get("cleaning_quality", ""),
         cleaning_flags=metadata.get("cleaning_flags", ""),
         source_pdf_text_quality=metadata.get("source_pdf_text_quality", ""),
-        source_pdf_needs_ocr=_metadata_bool(metadata, "source_pdf_needs_ocr"),
-        source_pdf_is_scanned=_metadata_bool(metadata, "source_pdf_is_scanned"),
+        source_pdf_needs_ocr=helper_metadata_bool(metadata, "source_pdf_needs_ocr"),
+        source_pdf_is_scanned=helper_metadata_bool(metadata, "source_pdf_is_scanned"),
         pdf_text_quality=metadata.get("pdf_text_quality", ""),
-        pdf_needs_ocr=_metadata_bool(metadata, "pdf_needs_ocr"),
-        pdf_is_scanned=_metadata_bool(metadata, "pdf_is_scanned"),
+        pdf_needs_ocr=helper_metadata_bool(metadata, "pdf_needs_ocr"),
+        pdf_is_scanned=helper_metadata_bool(metadata, "pdf_is_scanned"),
         ocr_engine=metadata.get("ocr_engine", ""),
-        ocr_applied=_metadata_bool(metadata, "ocr_applied"),
+        ocr_applied=helper_metadata_bool(metadata, "ocr_applied"),
         ocr_status=metadata.get("ocr_status", ""),
         ocr_error=metadata.get("ocr_error", ""),
     )
     return dump_model(record)
 
 
-def _note_example(examples: dict[str, list[dict[str, str]]], key: str, doc_id: str, before: str, after: str) -> None:
+def helper_note_example(examples: dict[str, list[dict[str, str]]], key: str, doc_id: str, before: str, after: str) -> None:
     if len(examples[key]) >= 8:
         return
     examples[key].append({"doc_id": doc_id, "before": before, "after": after})
 
 
-def _sync_sections(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> dict[str, int]:
+def helper_sync_sections(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> dict[str, int]:
     changed_files = 0
     changed_rows = 0
     for path in sorted((data_dir / "sections").glob("*.jsonl")):
@@ -526,7 +526,7 @@ def _sync_sections(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -
                 if new_row.get(key) != doc.get(key):
                     new_row[key] = doc.get(key, "")
                     file_changed = True
-            reference = _reference_like(new_row.get("content", ""), new_row.get("section_path") or [])
+            reference = helper_reference_like(new_row.get("content", ""), new_row.get("section_path") or [])
             if bool(new_row.get("is_reference_section")) != reference:
                 new_row["is_reference_section"] = reference
                 file_changed = True
@@ -539,12 +539,12 @@ def _sync_sections(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -
     return {"section_files_changed": changed_files, "section_rows_changed": changed_rows}
 
 
-def _iter_jsonl_rows(paths: Iterable[Path]) -> Iterable[dict[str, Any]]:
+def helper_iter_jsonl_rows(paths: Iterable[Path]) -> Iterable[dict[str, Any]]:
     for path in paths:
         yield from read_jsonl(path)
 
 
-def _sync_chunks(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> dict[str, int]:
+def helper_sync_chunks(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> dict[str, int]:
     changed_files = 0
     changed_rows = 0
     chunk_dir = data_dir / "chunks"
@@ -581,15 +581,15 @@ def _sync_chunks(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> 
         if file_changed:
             write_jsonl(path, output)
             changed_files += 1
-    write_jsonl(chunk_dir / "all_chunks.jsonl", _iter_jsonl_rows(chunk_files))
+    write_jsonl(chunk_dir / "all_chunks.jsonl", helper_iter_jsonl_rows(chunk_files))
     return {"chunk_files_changed": changed_files, "chunk_rows_changed": changed_rows, "chunks_total": sum(1 for _ in read_jsonl(chunk_dir / "all_chunks.jsonl"))}
 
 
-def _sync_derived_metadata(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def helper_sync_derived_metadata(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
     stats: dict[str, Any] = {}
-    stats.update(_sync_sections(data_dir, documents_by_id))
-    stats.update(_sync_chunks(data_dir, documents_by_id))
-    stats.update(_repair_vector_metadata(data_dir))
+    stats.update(helper_sync_sections(data_dir, documents_by_id))
+    stats.update(helper_sync_chunks(data_dir, documents_by_id))
+    stats.update(helper_repair_vector_metadata(data_dir))
     return stats
 
 
@@ -601,6 +601,7 @@ def backfill_evidence_artifacts(
     data_path = Path(data_dir)
     clean_dir = data_path / "markdown_clean"
     documents_path = data_path / "documents.jsonl"
+    # 旧 documents 仅作为缺失字段回填来源；最终输出仍以 markdown_clean 全量重建为准。
     existing_documents = {record["doc_id"]: record for record in read_jsonl(documents_path)} if documents_path.exists() else {}
 
     counters: Counter[str] = Counter()
@@ -622,36 +623,36 @@ def backfill_evidence_artifacts(
 
         before_title = metadata.get("title", "")
         current_title = clean_title(before_title)
-        if _is_generic_title(current_title):
-            candidate_title = _find_better_title(body, metadata.get("source_file", ""))
+        if helper_is_generic_title(current_title):
+            candidate_title = helper_find_better_title(body, metadata.get("source_file", ""))
             if candidate_title and candidate_title != current_title:
                 metadata["title"] = candidate_title
                 counters["title_backfilled"] += 1
-                _note_example(examples, "title_backfilled", doc_id, before_title, candidate_title)
+                helper_note_example(examples, "title_backfilled", doc_id, before_title, candidate_title)
         else:
             metadata["title"] = current_title
 
         before_source = metadata.get("source_institution", "") or "Unknown"
         if before_source == "Unknown":
-            inferred_source = _infer_source(metadata.get("source_file", ""), body)
+            inferred_source = helper_infer_source(metadata.get("source_file", ""), body)
             if inferred_source and inferred_source != "Unknown":
                 metadata["source_institution"] = inferred_source
                 counters["source_backfilled"] += 1
-                _note_example(examples, "source_backfilled", doc_id, before_source, inferred_source)
+                helper_note_example(examples, "source_backfilled", doc_id, before_source, inferred_source)
 
         before_date = metadata.get("publication_date", "") or "unknown"
-        if not _valid_publication_date(before_date):
+        if not helper_valid_publication_date(before_date):
             inferred_date = extract_publication_date(metadata.get("source_file", ""), body)
-            if _valid_publication_date(inferred_date):
+            if helper_valid_publication_date(inferred_date):
                 metadata["publication_date"] = inferred_date
                 counters["publication_date_backfilled"] += 1
-                _note_example(examples, "publication_date_backfilled", doc_id, before_date, inferred_date)
+                helper_note_example(examples, "publication_date_backfilled", doc_id, before_date, inferred_date)
 
-        abstract = _find_best_abstract(body, metadata.get("title", ""))
+        abstract = helper_find_best_abstract(body, metadata.get("title", ""))
         existing_abstract = existing.get("abstract", "")
-        if _weak_text(existing_abstract, 80) and abstract and abstract != existing_abstract:
+        if helper_weak_text(existing_abstract, 80) and abstract and abstract != existing_abstract:
             counters["abstract_backfilled"] += 1
-            _note_example(examples, "abstract_backfilled", doc_id, existing_abstract, abstract)
+            helper_note_example(examples, "abstract_backfilled", doc_id, existing_abstract, abstract)
 
         before_department = metadata.get("clinical_department", "") or UNKNOWN_DEPARTMENT
         if before_department in {"", UNKNOWN_DEPARTMENT, "Unknown", "未分类"}:
@@ -659,29 +660,31 @@ def backfill_evidence_artifacts(
             if department and department != before_department:
                 metadata["clinical_department"] = department
                 counters["clinical_department_backfilled"] += 1
-                _note_example(examples, "clinical_department_backfilled", doc_id, before_department, department)
+                helper_note_example(examples, "clinical_department_backfilled", doc_id, before_department, department)
 
-        if _apply_audit_quality(metadata, body):
+        if helper_apply_audit_quality(metadata, body):
             counters["quality_reassessed"] += 1
 
         updated_markdown = dump_front_matter(metadata, body)
+        # dry_run 仍计算完整变更和派生对象，但不触碰 Markdown 与 JSONL 文件。
         if updated_markdown != original_markdown:
             counters["markdown_front_matter_changed"] += 1
             if not dry_run:
                 clean_path.write_text(updated_markdown, encoding="utf-8", newline="\n")
 
-        record = _document_record_from_metadata(metadata, abstract, updated_markdown, clean_path, existing)
+        record = helper_document_record_from_metadata(metadata, abstract, updated_markdown, clean_path, existing)
         documents.append(record)
 
         card = build_document_card(updated_markdown, clean_path)
-        changed_views = _backfill_card_fields(card, body)
+        changed_views = helper_backfill_card_fields(card, body)
         for view_type in changed_views:
             counters[f"{view_type}_backfilled"] += 1
-            _note_example(examples, f"{view_type}_backfilled", doc_id, "", _card_view_text(card, view_type)[:500])
+            helper_note_example(examples, f"{view_type}_backfilled", doc_id, "", helper_card_view_text(card, view_type)[:500])
         cards.append(card)
         views.extend(build_document_views(card))
 
     if not dry_run:
+        # 三类主产物来自同一轮内存结果，保证文档、卡片和视图使用一致的元数据快照。
         write_jsonl(documents_path, documents)
         write_jsonl(data_path / "document_cards.jsonl", cards)
         write_jsonl(data_path / "document_views.jsonl", views)
@@ -696,7 +699,8 @@ def backfill_evidence_artifacts(
     }
     derived_stats: dict[str, Any] = {}
     if sync_derived and not dry_run:
-        derived_stats = _sync_derived_metadata(data_path, {record["doc_id"]: record for record in documents})
+        # 主产物落盘后再同步 section/chunk，避免派生记录引用尚未提交的文档元数据。
+        derived_stats = helper_sync_derived_metadata(data_path, {record["doc_id"]: record for record in documents})
 
     report = {
         "dry_run": dry_run,

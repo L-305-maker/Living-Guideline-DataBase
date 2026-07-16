@@ -20,21 +20,21 @@ READABLE_CHAR_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff，。；：、“”‘�
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
-def _year(value: str | None) -> int | None:
+def helper_year(value: str | None) -> int | None:
     match = re.search(r"(19\d{2}|20\d{2})", value or "")
     return int(match.group(1)) if match else None
 
 
-def _valid_publication_date(value: str | None, year_start: int = 2012, year_end: int = 2026) -> bool:
+def helper_valid_publication_date(value: str | None, year_start: int = 2012, year_end: int = 2026) -> bool:
     if not value or value == "unknown":
         return False
     if not VALID_DATE_RE.match(value):
         return False
-    year = _year(value)
+    year = helper_year(value)
     return year is not None and year_start <= year <= year_end
 
 
-def _reference_like(content: str, section_path: list[Any] | None = None) -> bool:
+def helper_reference_like(content: str, section_path: list[Any] | None = None) -> bool:
     normalized_path = [str(item).strip() for item in (section_path or []) if str(item).strip()]
     return bool(
         any(REFERENCE_RE.match(item) for item in normalized_path)
@@ -43,7 +43,7 @@ def _reference_like(content: str, section_path: list[Any] | None = None) -> bool
     )
 
 
-def _fallback_abstract(body: str, max_chars: int = 800) -> str:
+def helper_fallback_abstract(body: str, max_chars: int = 800) -> str:
     text = re.sub(r"<!--.*?-->", " ", body or "", flags=re.S)
     lines: list[str] = []
     for raw_line in text.splitlines():
@@ -59,7 +59,7 @@ def _fallback_abstract(body: str, max_chars: int = 800) -> str:
     return re.sub(r"\s+", " ", " ".join(lines)).strip()[:max_chars]
 
 
-def _readable_ratio(text: str) -> float:
+def helper_readable_ratio(text: str) -> float:
     compact = re.sub(r"\s+", "", text or "")
     if not compact:
         return 0.0
@@ -67,16 +67,16 @@ def _readable_ratio(text: str) -> float:
     return readable / len(compact)
 
 
-def _usable_abstract(text: str) -> str:
+def helper_usable_abstract(text: str) -> str:
     abstract = re.sub(r"\s+", " ", text or "").strip()
     if len(abstract) > 800:
         abstract = abstract[:800]
-    if not abstract or CONTROL_CHAR_RE.search(abstract) or _readable_ratio(abstract) < 0.55:
+    if not abstract or CONTROL_CHAR_RE.search(abstract) or helper_readable_ratio(abstract) < 0.55:
         return ""
     return abstract
 
 
-def _load_markdown(record: dict[str, Any]) -> tuple[Path | None, dict[str, str], str, str]:
+def helper_load_markdown(record: dict[str, Any]) -> tuple[Path | None, dict[str, str], str, str]:
     path_value = record.get("markdown_clean_path") or ""
     path = Path(path_value) if path_value else None
     if path is not None and path.exists():
@@ -86,8 +86,8 @@ def _load_markdown(record: dict[str, Any]) -> tuple[Path | None, dict[str, str],
     return None, {}, "", ""
 
 
-def _repair_document(record: dict[str, Any], year_start: int, year_end: int) -> tuple[dict[str, Any], bool]:
-    path, metadata, body, markdown = _load_markdown(record)
+def helper_repair_document(record: dict[str, Any], year_start: int, year_end: int) -> tuple[dict[str, Any], bool]:
+    path, metadata, body, markdown = helper_load_markdown(record)
     changed = False
     repaired = dict(record)
 
@@ -102,14 +102,14 @@ def _repair_document(record: dict[str, Any], year_start: int, year_end: int) -> 
         repaired["title"] = current_title
 
     current_date = repaired.get("publication_date") or metadata.get("publication_date") or "unknown"
-    if not _valid_publication_date(current_date, year_start, year_end):
+    if not helper_valid_publication_date(current_date, year_start, year_end):
         candidate_date = extract_publication_date(source_file, body or markdown)
         if candidate_date != current_date:
             repaired["publication_date"] = candidate_date
             changed = True
 
     if body:
-        abstract = _usable_abstract(extract_abstract(body)) or _usable_abstract(_fallback_abstract(body))
+        abstract = helper_usable_abstract(extract_abstract(body)) or helper_usable_abstract(helper_fallback_abstract(body))
         if not abstract:
             abstract = repaired.get("title", "")
         if abstract != repaired.get("abstract", ""):
@@ -135,7 +135,7 @@ def _repair_document(record: dict[str, Any], year_start: int, year_end: int) -> 
     return repaired, changed
 
 
-def _repair_sections(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict[str, int]:
+def helper_repair_sections(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict[str, int]:
     changed_files = 0
     changed_rows = 0
     for path in sorted((data_dir / "sections").glob("*.jsonl")):
@@ -153,7 +153,7 @@ def _repair_sections(data_dir: Path, documents: dict[str, dict[str, Any]]) -> di
                 if value is not None and new_row.get(key) != value:
                     new_row[key] = value
                     file_changed = True
-            reference = _reference_like(new_row.get("content", ""), new_row.get("section_path") or [])
+            reference = helper_reference_like(new_row.get("content", ""), new_row.get("section_path") or [])
             if bool(new_row.get("is_reference_section")) != reference:
                 new_row["is_reference_section"] = reference
                 file_changed = True
@@ -166,7 +166,7 @@ def _repair_sections(data_dir: Path, documents: dict[str, dict[str, Any]]) -> di
     return {"section_files_changed": changed_files, "section_rows_changed": changed_rows}
 
 
-def _repair_chunks(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict[str, int]:
+def helper_repair_chunks(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict[str, int]:
     changed_files = 0
     changed_rows = 0
     all_rows: list[dict[str, Any]] = []
@@ -186,7 +186,7 @@ def _repair_chunks(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict
                 if value is not None and new_row.get(key) != value:
                     new_row[key] = value
                     file_changed = True
-            reference = _reference_like(new_row.get("content", ""), new_row.get("section_path") or [])
+            reference = helper_reference_like(new_row.get("content", ""), new_row.get("section_path") or [])
             if bool(new_row.get("is_reference_section")) != reference:
                 new_row["is_reference_section"] = reference
                 file_changed = True
@@ -201,7 +201,7 @@ def _repair_chunks(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict
     return {"chunk_files_changed": changed_files, "chunk_rows_changed": changed_rows, "chunks_total": len(all_rows)}
 
 
-def _repair_vector_metadata(data_dir: Path) -> dict[str, Any]:
+def helper_repair_vector_metadata(data_dir: Path) -> dict[str, Any]:
     index_dir = data_dir / "index"
     metadata_path = index_dir / "vector_indexes_metadata.json"
     metadata: dict[str, Any] = {}
@@ -253,21 +253,21 @@ def repair_quality(data_dir: str | Path = DATA_DIR, year_start: int = 2012, year
     for record in read_jsonl(documents_path):
         old_title = record.get("title")
         old_date = record.get("publication_date")
-        repaired, changed = _repair_document(record, year_start, year_end)
+        repaired, changed = helper_repair_document(record, year_start, year_end)
         if changed:
             changed_documents += 1
         if repaired.get("title") != old_title:
             title_repairs += 1
         if repaired.get("publication_date") != old_date:
             date_repairs += 1
-        if _valid_publication_date(repaired.get("publication_date"), year_start, year_end):
+        if helper_valid_publication_date(repaired.get("publication_date"), year_start, year_end):
             repaired_documents.append(repaired)
 
     write_jsonl(documents_path, repaired_documents)
     documents_by_id = {record["doc_id"]: record for record in repaired_documents}
-    section_stats = _repair_sections(data_path, documents_by_id)
-    chunk_stats = _repair_chunks(data_path, documents_by_id)
-    vector_stats = _repair_vector_metadata(data_path)
+    section_stats = helper_repair_sections(data_path, documents_by_id)
+    chunk_stats = helper_repair_chunks(data_path, documents_by_id)
+    vector_stats = helper_repair_vector_metadata(data_path)
 
     return {
         "documents": len(repaired_documents),

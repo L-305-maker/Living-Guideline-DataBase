@@ -96,7 +96,7 @@ def assess_pdf_text_layer(
     )
 
 
-def _page_image_area_ratio(page: Any) -> float:
+def helper_page_image_area_ratio(page: Any) -> float:
     page_area = max(1.0, float(page.rect.width * page.rect.height))
     image_area = 0.0
     try:
@@ -132,7 +132,7 @@ def inspect_pdf_text_layer(pdf_path: str | Path) -> PdfTextLayerReport:
                 PdfPageTextStats(
                     page_number=index,
                     text_chars=len("".join(text.split())),
-                    image_area_ratio=_page_image_area_ratio(page),
+                    image_area_ratio=helper_page_image_area_ratio(page),
                 )
             )
         return assess_pdf_text_layer(pages)

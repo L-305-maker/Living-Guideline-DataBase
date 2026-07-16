@@ -16,10 +16,10 @@ from typing import Any
 from src.models.schemas import DocumentRecord, dump_model
 from src.pipeline.ocr.ocrmypdf_runner import OcrResult, run_ocrmypdf
 from src.pipeline.ocr.pdf_quality import PdfTextLayerReport, inspect_pdf_text_layer
-from src.utils.clinical_department import classify_clinical_department
+from src.utils.clinical_department import classify_clinical_departments
 from src.utils.front_matter import dump_front_matter, parse_front_matter
 from src.utils.ids import make_doc_id, sha256_file, sha256_text
-from src.utils.io import DATA_DIR, ensure_dir, write_jsonl
+from src.utils.io import DATA_DIR, ensure_dir, read_jsonl, write_jsonl
 from src.utils.metadata import extract_abstract, extract_publication_date, extract_source_institution, extract_title
 
 
@@ -55,7 +55,7 @@ class PdfTextLine:
     bold: bool
 
 
-def _needs_join_space(left: str, right: str) -> bool:
+def helper_needs_join_space(left: str, right: str) -> bool:
     if not left or not right:
         return False
     if left[-1].isspace() or right[0].isspace():
@@ -69,7 +69,7 @@ def _needs_join_space(left: str, right: str) -> bool:
     return True
 
 
-def _merge_adjacent_line_fragments(lines: list[PdfTextLine]) -> list[PdfTextLine]:
+def helper_merge_adjacent_line_fragments(lines: list[PdfTextLine]) -> list[PdfTextLine]:
     if not lines:
         return []
     merged: list[PdfTextLine] = []
@@ -82,7 +82,7 @@ def _merge_adjacent_line_fragments(lines: list[PdfTextLine]) -> list[PdfTextLine
         similar_size = abs(previous.size - line.size) <= max(1.0, min(previous.size, line.size) * 0.12)
         small_gap = -1.0 <= line.x0 - previous.x1 <= max(8.0, min(previous.size, line.size) * 0.8)
         if same_baseline and similar_size and small_gap:
-            spacer = " " if _needs_join_space(previous.text, line.text) else ""
+            spacer = " " if helper_needs_join_space(previous.text, line.text) else ""
             combined_text = f"{previous.text}{spacer}{line.text}"
             total_len = max(1, len(previous.text) + len(line.text))
             merged[-1] = PdfTextLine(
@@ -99,7 +99,7 @@ def _merge_adjacent_line_fragments(lines: list[PdfTextLine]) -> list[PdfTextLine
     return merged
 
 
-def _open_doc(pdf_path: str | Path):
+def helper_open_doc(pdf_path: str | Path):
     try:
         import fitz  # type: ignore
     except ImportError as exc:
@@ -107,7 +107,7 @@ def _open_doc(pdf_path: str | Path):
     return fitz.open(str(pdf_path))
 
 
-def _with_pymupdf4llm(pdf_path: Path) -> str | None:
+def helper_with_pymupdf4llm(pdf_path: Path) -> str | None:
     try:
         import pymupdf4llm  # type: ignore
     except ImportError:
@@ -118,17 +118,17 @@ def _with_pymupdf4llm(pdf_path: Path) -> str | None:
         return None
 
 
-def _normalize_pdf_text_line(text: str) -> str:
+def helper_normalize_pdf_text_line(text: str) -> str:
     return WHITESPACE_RE.sub(" ", (text or "").replace("\u00a0", " ")).strip()
 
 
-def _is_bold_span(span: dict[str, Any]) -> bool:
+def helper_is_bold_span(span: dict[str, Any]) -> bool:
     font = str(span.get("font") or "").lower()
     flags = int(span.get("flags") or 0)
     return "bold" in font or bool(flags & 16)
 
 
-def _join_spans(spans: list[dict[str, Any]]) -> str:
+def helper_join_spans(spans: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     previous_x1: float | None = None
     for span in spans:
@@ -150,21 +150,21 @@ def _join_spans(spans: list[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
-def _collect_text_lines(page: Any) -> list[PdfTextLine]:
+def helper_collect_text_lines(page: Any) -> list[PdfTextLine]:
     lines: list[PdfTextLine] = []
     for block in page.get_text("dict", sort=False).get("blocks", []):
         if block.get("type") != 0:
             continue
         for raw_line in block.get("lines", []):
             spans = [span for span in raw_line.get("spans", []) if str(span.get("text") or "").strip()]
-            text = _normalize_pdf_text_line(_join_spans(spans))
+            text = helper_normalize_pdf_text_line(helper_join_spans(spans))
             if not text:
                 continue
             bbox = raw_line.get("bbox") or block.get("bbox") or (0.0, 0.0, 0.0, 0.0)
             weights = [max(1, len(str(span.get("text") or "").strip())) for span in spans]
             sizes = [float(span.get("size") or 0.0) for span in spans]
             weighted_size = sum(size * weight for size, weight in zip(sizes, weights)) / max(1, sum(weights))
-            bold_weight = sum(weight for span, weight in zip(spans, weights) if _is_bold_span(span))
+            bold_weight = sum(weight for span, weight in zip(spans, weights) if helper_is_bold_span(span))
             lines.append(
                 PdfTextLine(
                     text=text,
@@ -176,10 +176,10 @@ def _collect_text_lines(page: Any) -> list[PdfTextLine]:
                     bold=bold_weight / max(1, sum(weights)) >= 0.55,
                 )
             )
-    return _merge_adjacent_line_fragments(lines)
+    return helper_merge_adjacent_line_fragments(lines)
 
 
-def _body_text_size(lines: list[PdfTextLine]) -> float:
+def helper_body_text_size(lines: list[PdfTextLine]) -> float:
     candidates = [
         line.size
         for line in lines
@@ -190,14 +190,14 @@ def _body_text_size(lines: list[PdfTextLine]) -> float:
     return float(median(candidates)) if candidates else 10.0
 
 
-def _uppercase_ratio(text: str) -> float:
+def helper_uppercase_ratio(text: str) -> float:
     letters = [char for char in text if char.isalpha()]
     if not letters:
         return 0.0
     return sum(1 for char in letters if char.upper() == char and char.lower() != char) / len(letters)
 
 
-def _detect_column_start(lines: list[PdfTextLine], page_width: float) -> float | None:
+def helper_detect_column_start(lines: list[PdfTextLine], page_width: float) -> float | None:
     midpoint = page_width / 2.0
     left = [
         line
@@ -218,8 +218,8 @@ def _detect_column_start(lines: list[PdfTextLine], page_width: float) -> float |
     return None
 
 
-def _reading_order(lines: list[PdfTextLine], page_width: float) -> list[PdfTextLine]:
-    column_start = _detect_column_start(lines, page_width)
+def helper_reading_order(lines: list[PdfTextLine], page_width: float) -> list[PdfTextLine]:
+    column_start = helper_detect_column_start(lines, page_width)
     if column_start is None:
         return sorted(lines, key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
 
@@ -235,7 +235,7 @@ def _reading_order(lines: list[PdfTextLine], page_width: float) -> list[PdfTextL
     )
 
 
-def _heading_level(line: PdfTextLine, body_size: float) -> int | None:
+def helper_heading_level(line: PdfTextLine, body_size: float) -> int | None:
     text = line.text.strip()
     if not text or text.startswith("#") or LIST_ITEM_RE.match(text):
         return None
@@ -244,7 +244,7 @@ def _heading_level(line: PdfTextLine, body_size: float) -> int | None:
     normalized = text.strip(" :")
     if normalized.casefold() in TABLE_VALUE_HEADINGS or normalized.startswith(("[", "(")) or CITATION_LABEL_RE.match(normalized):
         return None
-    uppercase_ratio = _uppercase_ratio(normalized)
+    uppercase_ratio = helper_uppercase_ratio(normalized)
     common_heading = bool(COMMON_SECTION_RE.match(normalized) or CHINESE_COMMON_SECTION_RE.match(normalized))
     chinese_numbered_heading = bool(CHINESE_NUMBERED_SECTION_RE.match(normalized))
 
@@ -267,7 +267,7 @@ def _heading_level(line: PdfTextLine, body_size: float) -> int | None:
     return None
 
 
-def _append_markdown_line(parts: list[str], line: str) -> None:
+def helper_append_markdown_line(parts: list[str], line: str) -> None:
     if not line:
         if parts and parts[-1] != "":
             parts.append("")
@@ -275,26 +275,26 @@ def _append_markdown_line(parts: list[str], line: str) -> None:
     parts.append(line)
 
 
-def _format_pdf_lines_as_markdown(lines: list[PdfTextLine], page_width: float) -> list[str]:
-    ordered = _reading_order(lines, page_width)
-    body_size = _body_text_size(ordered)
+def helper_format_pdf_lines_as_markdown(lines: list[PdfTextLine], page_width: float) -> list[str]:
+    ordered = helper_reading_order(lines, page_width)
+    body_size = helper_body_text_size(ordered)
     parts: list[str] = []
     for line in ordered:
-        level = _heading_level(line, body_size)
+        level = helper_heading_level(line, body_size)
         if level is None:
-            _append_markdown_line(parts, line.text)
+            helper_append_markdown_line(parts, line.text)
             continue
         if parts and parts[-1] != "":
             parts.append("")
-        _append_markdown_line(parts, f"{'#' * level} {line.text.strip()}")
+        helper_append_markdown_line(parts, f"{'#' * level} {line.text.strip()}")
         parts.append("")
     while parts and parts[-1] == "":
         parts.pop()
     return parts
 
 
-def _with_pymupdf_plain(pdf_path: Path) -> str:
-    doc = _open_doc(pdf_path)
+def helper_with_pymupdf_plain(pdf_path: Path) -> str:
+    doc = helper_open_doc(pdf_path)
     try:
         parts: list[str] = []
         for page_no, page in enumerate(doc, start=1):
@@ -308,46 +308,46 @@ def _with_pymupdf_plain(pdf_path: Path) -> str:
         doc.close()
 
 
-def _with_pymupdf(pdf_path: Path) -> str:
-    doc = _open_doc(pdf_path)
+def helper_with_pymupdf(pdf_path: Path) -> str:
+    doc = helper_open_doc(pdf_path)
     try:
         parts: list[str] = []
         for page_no, page in enumerate(doc, start=1):
             parts.append(f"<!-- page: {page_no} -->")
-            lines = _collect_text_lines(page)
+            lines = helper_collect_text_lines(page)
             if lines:
-                parts.extend(_format_pdf_lines_as_markdown(lines, float(page.rect.width)))
+                parts.extend(helper_format_pdf_lines_as_markdown(lines, float(page.rect.width)))
             else:
                 text = page.get_text("text", sort=True).strip()
                 if text:
                     parts.append(text)
             parts.append("")
         markdown = "\n".join(parts).strip()
-        return markdown + "\n" if markdown else _with_pymupdf_plain(pdf_path)
+        return markdown + "\n" if markdown else helper_with_pymupdf_plain(pdf_path)
     finally:
         doc.close()
 
 
-def _ensure_title_heading(markdown: str, title: str) -> str:
+def helper_ensure_title_heading(markdown: str, title: str) -> str:
     body = markdown.strip()
     if body.startswith("# "):
         return body + "\n"
     return f"# {title}\n\n{body}\n"
 
 
-def _inspect_pdf_for_ingestion(pdf: Path) -> PdfTextLayerReport | None:
+def helper_inspect_pdf_for_ingestion(pdf: Path) -> PdfTextLayerReport | None:
     try:
         return inspect_pdf_text_layer(pdf)
     except Exception:
         return None
 
 
-def _ocr_output_path(pdf: Path, output_dir: str | Path | None) -> Path:
+def helper_ocr_output_path(pdf: Path, output_dir: str | Path | None) -> Path:
     root = Path(output_dir) if output_dir else pdf.parent / "ocr_pdf"
     return root / f"{pdf.stem}.ocr.pdf"
 
 
-def _unique_doc_id_and_path(doc_id: str, pdf: Path, output_dir: str | Path) -> tuple[str, Path]:
+def helper_unique_doc_id_and_path(doc_id: str, pdf: Path, output_dir: str | Path) -> tuple[str, Path]:
     out_dir = ensure_dir(output_dir)
     out_path = out_dir / f"{doc_id}.md"
     if not out_path.exists():
@@ -363,7 +363,7 @@ def _unique_doc_id_and_path(doc_id: str, pdf: Path, output_dir: str | Path) -> t
     return unique_doc_id, out_dir / f"{unique_doc_id}.md"
 
 
-def _maybe_run_ocr(
+def helper_maybe_run_ocr(
     pdf: Path,
     report: PdfTextLayerReport | None,
     *,
@@ -378,10 +378,10 @@ def _maybe_run_ocr(
     should_ocr = ocr_mode == "force" or bool(report and report.needs_ocr)
     if not should_ocr:
         return OcrResult("none", False, str(pdf), "", "")
-    return run_ocrmypdf(pdf, _ocr_output_path(pdf, ocr_output_dir), languages=ocr_languages, force_ocr=ocr_mode == "force")
+    return run_ocrmypdf(pdf, helper_ocr_output_path(pdf, ocr_output_dir), languages=ocr_languages, force_ocr=ocr_mode == "force")
 
 
-def _pdf_quality_metadata(report: PdfTextLayerReport | None, prefix: str = "pdf") -> dict[str, str]:
+def helper_pdf_quality_metadata(report: PdfTextLayerReport | None, prefix: str = "pdf") -> dict[str, str]:
     if report is None:
         return {
             f"{prefix}_text_quality": "unknown",
@@ -391,7 +391,7 @@ def _pdf_quality_metadata(report: PdfTextLayerReport | None, prefix: str = "pdf"
     return report.as_metadata(prefix)
 
 
-def _ocr_status(ocr_mode: str, source_report: PdfTextLayerReport | None, output_report: PdfTextLayerReport | None, result: OcrResult) -> str:
+def helper_ocr_status(ocr_mode: str, source_report: PdfTextLayerReport | None, output_report: PdfTextLayerReport | None, result: OcrResult) -> str:
     source_needs_ocr = bool(source_report and source_report.needs_ocr)
     if ocr_mode == "never":
         return "needed_but_disabled" if source_needs_ocr else "not_needed"
@@ -413,12 +413,15 @@ def convert_pdf(
     ocr_mode: str = "auto",
     ocr_output_dir: str | Path | None = None,
     ocr_languages: str = "chi_sim+eng",
+    document_kind: str = "guideline",
 ) -> DocumentRecord:
     """Convert one PDF to front-matter Markdown under data/markdown_raw/{doc_id}.md."""
 
+    if document_kind not in {"guideline", "consensus"}:
+        raise ValueError("document_kind must be guideline or consensus")
     pdf = Path(pdf_path)
-    pdf_report = _inspect_pdf_for_ingestion(pdf)
-    ocr_result = _maybe_run_ocr(
+    pdf_report = helper_inspect_pdf_for_ingestion(pdf)
+    ocr_result = helper_maybe_run_ocr(
         pdf,
         pdf_report,
         ocr_mode=ocr_mode,
@@ -426,17 +429,18 @@ def convert_pdf(
         ocr_languages=ocr_languages,
     )
     conversion_pdf = Path(ocr_result.output_pdf) if ocr_result.applied else pdf
-    conversion_report = _inspect_pdf_for_ingestion(conversion_pdf) if ocr_result.applied else pdf_report
-    raw = _with_pymupdf4llm(conversion_pdf) or _with_pymupdf(conversion_pdf)
+    conversion_report = helper_inspect_pdf_for_ingestion(conversion_pdf) if ocr_result.applied else pdf_report
+    raw = helper_with_pymupdf4llm(conversion_pdf) or helper_with_pymupdf(conversion_pdf)
     title = extract_title(raw, pdf)
     source_institution = extract_source_institution(pdf, raw)
     publication_date = extract_publication_date(pdf, raw)
     file_sha = sha256_file(pdf)
     doc_id = make_doc_id(source_institution, publication_date, file_sha)
-    doc_id, out_path = _unique_doc_id_and_path(doc_id, pdf, output_dir)
-    body = _ensure_title_heading(raw, title)
+    doc_id, out_path = helper_unique_doc_id_and_path(doc_id, pdf, output_dir)
+    body = helper_ensure_title_heading(raw, title)
     abstract = extract_abstract(body)
-    clinical_department = classify_clinical_department(title, abstract, body)
+    department_result = classify_clinical_departments(title, abstract, body)
+    clinical_department = str(department_result["clinical_department"])
     metadata = {
         "id": doc_id,
         "title": title,
@@ -444,11 +448,14 @@ def convert_pdf(
         "source_institution": source_institution,
         "source_file": str(pdf),
         "clinical_department": clinical_department,
-        **_pdf_quality_metadata(pdf_report, "source_pdf"),
-        **_pdf_quality_metadata(conversion_report, "pdf"),
+        "clinical_departments": department_result["clinical_departments"],
+        "department_scope": department_result["department_scope"],
+        "document_kind": document_kind,
+        **helper_pdf_quality_metadata(pdf_report, "source_pdf"),
+        **helper_pdf_quality_metadata(conversion_report, "pdf"),
         "ocr_engine": ocr_result.engine,
         "ocr_applied": str(ocr_result.applied).lower(),
-        "ocr_status": _ocr_status(ocr_mode, pdf_report, conversion_report, ocr_result),
+        "ocr_status": helper_ocr_status(ocr_mode, pdf_report, conversion_report, ocr_result),
         "ocr_error": ocr_result.error,
     }
     markdown = dump_front_matter(metadata, body)
@@ -459,6 +466,9 @@ def convert_pdf(
         publication_date=publication_date,
         source_institution=source_institution,
         clinical_department=clinical_department,
+        clinical_departments=department_result["clinical_departments"],
+        department_scope=str(department_result["department_scope"]),
+        document_kind=document_kind,
         source_file=str(pdf),
         markdown_raw_path=str(out_path),
         markdown_clean_path="",
@@ -477,7 +487,7 @@ def convert_pdf(
     )
 
 
-def _deduplicate_doc_id(record: DocumentRecord, seen: set[str]) -> DocumentRecord:
+def helper_deduplicate_doc_id(record: DocumentRecord, seen: set[str]) -> DocumentRecord:
     if record.doc_id not in seen:
         seen.add(record.doc_id)
         return record
@@ -494,8 +504,8 @@ def _deduplicate_doc_id(record: DocumentRecord, seen: set[str]) -> DocumentRecor
     return record
 
 
-def _convert_pdf_worker(payload: tuple[str, str, str, str | None, str]) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
-    pdf_path, output_dir, ocr_mode, ocr_output_dir, ocr_languages = payload
+def helper_convert_pdf_worker(payload: tuple[str, str, str, str | None, str, str]) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+    pdf_path, output_dir, ocr_mode, ocr_output_dir, ocr_languages, document_kind = payload
     try:
         return (
             dump_model(
@@ -505,6 +515,7 @@ def _convert_pdf_worker(payload: tuple[str, str, str, str | None, str]) -> tuple
                     ocr_mode=ocr_mode,
                     ocr_output_dir=ocr_output_dir,
                     ocr_languages=ocr_languages,
+                    document_kind=document_kind,
                 )
             ),
             None,
@@ -513,7 +524,7 @@ def _convert_pdf_worker(payload: tuple[str, str, str, str | None, str]) -> tuple
         return None, {"source_file": str(pdf_path), "error": str(exc)}
 
 
-def _progress(done: int, total: int, progress_every: int) -> None:
+def helper_progress(done: int, total: int, progress_every: int) -> None:
     if progress_every <= 0:
         return
     if done == total or done % progress_every == 0:
@@ -530,11 +541,36 @@ def convert_all(
     ocr_languages: str = "chi_sim+eng",
     workers: int = 1,
     progress_every: int = 100,
+    document_kind: str = "guideline",
+    append: bool = False,
 ) -> dict[str, Any]:
+    if document_kind not in {"guideline", "consensus"}:
+        raise ValueError("document_kind must be guideline or consensus")
+    all_existing_records = list(read_jsonl(manifest_path)) if append and Path(manifest_path).exists() else []
+    existing_records = [
+        record for record in all_existing_records
+        if (path := Path(record.get("source_file") or "")).is_file()
+    ]
+    stale_records_skipped = len(all_existing_records) - len(existing_records)
+    existing_hashes = {
+        sha256_file(path) for record in existing_records
+        if (path := Path(record.get("source_file") or "")).is_file()
+    }
     raw_records: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    pdf_paths = sorted(Path(input_dir).rglob("*.pdf"))
+    pdf_paths = []
+    duplicate_files = 0
+    seen_hashes = set(existing_hashes)
+    for path in sorted(Path(input_dir).rglob("*.pdf")):
+        # 内容哈希用于跳过完全相同的 PDF；文件名不同不代表证据不同。
+        file_hash = sha256_file(path)
+        if file_hash in seen_hashes:
+            duplicate_files += 1
+            continue
+        seen_hashes.add(file_hash)
+        pdf_paths.append(path)
     total = len(pdf_paths)
+    # 单进程路径便于调试；多进程路径只传递可序列化参数，避免共享 PDF 句柄。
     if workers <= 1:
         for done, pdf_path in enumerate(pdf_paths, start=1):
             try:
@@ -546,35 +582,42 @@ def convert_all(
                             ocr_mode=ocr_mode,
                             ocr_output_dir=ocr_output_dir,
                             ocr_languages=ocr_languages,
+                            document_kind=document_kind,
                         )
                     )
                 )
             except Exception as exc:  # noqa: BLE001
                 errors.append({"source_file": str(pdf_path), "error": str(exc)})
-            _progress(done, total, progress_every)
+            helper_progress(done, total, progress_every)
     else:
         payloads = [
-            (str(pdf_path), str(output_dir), ocr_mode, str(ocr_output_dir) if ocr_output_dir else None, ocr_languages)
+            (str(pdf_path), str(output_dir), ocr_mode, str(ocr_output_dir) if ocr_output_dir else None, ocr_languages, document_kind)
             for pdf_path in pdf_paths
         ]
+        # 使用 as_completed 收集结果，使慢 PDF 不会阻塞其他已完成任务落盘。
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_convert_pdf_worker, payload) for payload in payloads]
+            futures = [executor.submit(helper_convert_pdf_worker, payload) for payload in payloads]
             for done, future in enumerate(as_completed(futures), start=1):
                 record, error = future.result()
                 if record is not None:
                     raw_records.append(record)
                 if error is not None:
                     errors.append(error)
-                _progress(done, total, progress_every)
+                helper_progress(done, total, progress_every)
 
-    records: list[dict[str, Any]] = []
-    seen_doc_ids: set[str] = set()
+    records: list[dict[str, Any]] = list(existing_records)
+    # 内容标题可能生成相同 doc_id，最终写 manifest 前按来源路径追加稳定后缀。
+    seen_doc_ids: set[str] = {record["doc_id"] for record in existing_records}
     for record in sorted(raw_records, key=lambda item: item.get("source_file", "")):
-        records.append(dump_model(_deduplicate_doc_id(DocumentRecord(**record), seen_doc_ids)))
+        records.append(dump_model(helper_deduplicate_doc_id(DocumentRecord(**record), seen_doc_ids)))
     write_jsonl(manifest_path, records)
-    write_jsonl(Path(manifest_path).with_name("pdf_to_md_errors.jsonl"), errors)
+    write_jsonl(Path(manifest_path).with_name(f"pdf_to_md_{document_kind}_errors.jsonl"), errors)
     return {
-        "converted": len(records),
+        "converted": len(raw_records),
+        "total_manifest_records": len(records),
+        "duplicates_skipped": duplicate_files,
+        "stale_records_skipped": stale_records_skipped,
+        "document_kind": document_kind,
         "failed": len(errors),
         "manifest": str(manifest_path),
         "ocr_mode": ocr_mode,
@@ -595,6 +638,8 @@ def main() -> None:
     parser.add_argument("--ocr-languages", default="chi_sim+eng")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--progress-every", type=int, default=100)
+    parser.add_argument("--document-kind", choices=["guideline", "consensus"], default="guideline")
+    parser.add_argument("--append", action="store_true")
     args = parser.parse_args()
     print(
         json.dumps(
@@ -607,6 +652,8 @@ def main() -> None:
                 ocr_languages=args.ocr_languages,
                 workers=args.workers,
                 progress_every=args.progress_every,
+                document_kind=args.document_kind,
+                append=args.append,
             ),
             ensure_ascii=False,
             indent=2,

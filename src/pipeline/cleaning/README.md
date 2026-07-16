@@ -1,71 +1,41 @@
-﻿# cleaning 阶段
+# cleaning 清洗与派生产物
 
-`src/pipeline/cleaning/` 现在只服务于“指南证据库”任务：把原始 PDF 转为 Markdown，清洗 Markdown，再按完整 block 和小 chunk 两层结构建库。
-
-本阶段不再抽取 `Recommendation`、`PICOQuestion`、`GradeCandidate` 等结构化推荐对象。block 被视为可追溯的原文证据单元，chunk 是面向检索和向量化的更小文本单元。
-
-## 数据流
-
-```text
-raw_pdf/
-  -> pdf_to_markdown.py
-     -> inspect PDF text layer / image pages
-     -> optional OCRmyPDF for scanned or low-text PDFs
-  -> markdown_raw/
-  -> markdown_cleaner.py
-  -> markdown_clean/
-  -> block_encoder.py
-  -> sections/
-  -> block_chunker.py
-  -> chunks.jsonl
-```
-
-## 核心文件
+## 模块职责
 
 | 文件 | 作用 |
 | --- | --- |
-| `pdf_to_markdown.py` | 调用 `src.pipeline.cleaning.pdf_to_md`，把 PDF 批量转换为 Markdown。 |
-| `markdown_cleaner.py` | 调用 `src.pipeline.cleaning.cleaner`，清理页眉页脚、目录、参考文献等噪声。 |
-| `block_encoder.py` | 调用 `src.pipeline.cleaning.encoder`，把清洗后的 Markdown 编码为完整 block。 |
-| `block_chunker.py` | 调用 `src.pipeline.cleaning.chunker`，把单个 block 切分成检索 chunk。 |
-| `evidence_pipeline.py` | 串联 PDF->Markdown->clean->block->chunk->SQLite/FTS/vector 的证据库构建流程。 |
+| `pdf_to_md.py` | 批量 PDF 转换、内容哈希去重、OCR 决策、并行执行和 manifest |
+| `pdf_to_markdown.py` | 单文档转换的兼容入口 |
+| `cleaner.py`、`markdown_cleaner.py` | 清理页眉页脚、异常字符和版式噪声，并评估质量 |
+| `chunker.py`、`semantic_chunker.py` | 按标题和语义边界生成分块 |
+| `block_chunker.py`、`block_encoder.py` | 块级切分与编码辅助逻辑 |
+| `encoder.py` | 文本向量编码的通用封装 |
+| `evidence_pipeline.py` | 串联转换、清洗、派生产物和索引前准备 |
+| `add_clinical_departments.py` | 为文档和派生记录补充分科标签 |
 
-## 扫描版 PDF
+## 输入与输出
 
-`pdf_to_md.py` 会先检查每个 PDF 的文本层和图片页比例，并在 front matter / manifest 中写入：
+典型输入为 `data/raw_pdf/**/*.pdf`。主要输出：
 
-- `source_pdf_text_quality`, `source_pdf_needs_ocr`, `source_pdf_is_scanned`: 原始 PDF 的质量和扫描件判断
-- `pdf_text_quality`: `ok` / `warning` / `poor`
-- `pdf_needs_ocr`: 是否需要 OCR
-- `pdf_is_scanned`: 是否像扫描件
-- `ocr_engine`, `ocr_applied`, `ocr_status`, `ocr_error`: OCR 尝试结果
+- `data/markdown_raw/*.md`：原始 Markdown。
+- `data/markdown_clean/*.md`：带 front matter 的权威清洗文本。
+- `data/documents.jsonl`：文档级元数据和正文路径。
+- `data/sections/*.jsonl`、`data/chunks/*.jsonl`：章节与分块数据。
+- `data/document_cards.jsonl`、`data/document_views.jsonl`：文档召回文本。
 
-默认 `--ocr-mode auto`。当检测到扫描件或文本层过少时，如果本机安装了 OCRmyPDF，会自动生成 OCR 后 PDF 再转 Markdown；如果未安装，则不中断流水线，只标记 `ocr_status=needed_unavailable` 和 `ocr_error`，方便后续重跑。
+## 关键逻辑
 
-注意：`pdf_*` 表示实际用于抽取 Markdown 的 PDF。如果 OCR 成功，它会反映 OCR 输出 PDF 的质量；`source_pdf_*` 始终保留原始 PDF 的状态。
+- PDF 去重基于内容哈希；同内容不同名称只保留一份。
+- 多进程转换只传可序列化参数，结果使用 `as_completed` 收集。
+- 相同标题可能产生相同 `doc_id`，写 manifest 前会追加稳定后缀。
+- 切分优先保留标题、列表、表格和推荐语句边界；超长单元才拆分。
+- `cleaning_quality` 与 `cleaning_flags` 会影响重排分数。
 
-检索阶段不会硬过滤低质量文档，而是在最终 rerank 时降权：
+## 变更与验证
 
-- `cleaning_quality=poor`
-- `pdf_text_quality=poor`
-- `pdf_needs_ocr=true`
-- `ocr_status=needed_unavailable/failed/needed_but_disabled`
-- `cleaning_flags` 中出现 `likely_ocr_failure`、`low_text_signal`、`noisy_ocr_lines`
-
-降权明细会写入搜索结果的 `match_reason.quality_penalties` 和 `match_reason.quality_multiplier`，便于排查为什么某篇扫描件文档排名靠后。
-
-```powershell
-python -m src.pipeline.cleaning.pdf_to_md --input-dir data/evidence/raw_pdf --output-dir data/evidence/markdown_raw --ocr-mode auto --ocr-languages chi_sim+eng
-```
-
-强制重跑 OCR：
+修改清洗规则后重建 clean Markdown 和派生产物；修改切分规则后重建词法及向量索引。
 
 ```powershell
-python -m src.pipeline.cleaning.pdf_to_md --input-dir data/evidence/raw_pdf --output-dir data/evidence/markdown_raw --ocr-mode force
+python -B -m pytest tests/test_markdown_cleaner.py tests/test_pdf_ocr_ingestion.py -q -p no:cacheprovider
+python -B -m compileall -q src/pipeline/cleaning
 ```
-
-## 设计边界
-
-- cleaning 只生成证据检索需要的 Markdown、block、chunk 和索引。
-- 推荐语句、PICO、GRADE、人工审核、发布版本等旧链路已经迁移到 `legacy_recommendation_pipeline/`。
-- 默认向量化粒度是 chunk，不是整篇 document；document/block 主要承担溯源和展示。

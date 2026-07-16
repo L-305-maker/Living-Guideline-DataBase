@@ -1,26 +1,28 @@
-# Pipeline 数据流
+# pipeline 数据处理流水线
 
-`src/pipeline/` 负责把指南 PDF 处理成可检索证据库。
+## 职责
 
-## 目录职责
+该目录负责把原始 PDF 转换成可检索、可审计的数据产物。
 
-| 目录 | 作用 |
-| --- | --- |
-| `cleaning/` | PDF 转 Markdown、Markdown 清洗、block 编码、chunk 切分。 |
-| `ocr/` | OCR 辅助处理。 |
-| `quality/` | Markdown 和索引产物的质量审计、修复脚本。 |
-| `orchestration/` | 一键构建证据库入口。 |
+| 子目录 | 处理阶段 | 主要输出 |
+| --- | --- | --- |
+| `cleaning/` | PDF 转 Markdown、文本清洗、分块和证据流水线 | Markdown、documents、sections、chunks |
+| `ocr/` | PDF 文本质量判断、本地或百度 OCR | OCR Markdown、页缓存和执行清单 |
+| `quality/` | PDF/Markdown 对账、元数据回填和质量修复 | 审计报告、修复后的主产物 |
+| `orchestration/` | 串联各阶段并记录运行结果 | 阶段统计和流水线报告 |
 
-## 当前主流程
+## 推荐执行顺序
 
-```mermaid
-flowchart TD
-    A["Raw PDF"] --> B["Markdown"]
-    B --> C["Clean Markdown"]
-    C --> D["Complete Block"]
-    D --> E["Retrieval Chunk"]
-    E --> F["SQLite FTS / BM25 / Vector Index"]
-    F --> G["MCP search/read/retrieve"]
-```
+1. 转换 PDF，并在自动模式下标记低文本质量文件。
+2. 对候选文档执行 OCR，再生成或替换 Markdown 正文。
+3. 清洗 Markdown，保留 front matter、标题层级和来源信息。
+4. 生成文档、章节、分块、卡片和视图。
+5. 执行质量审计，处理缺失文件、OCR 未解决项和完整度异常。
+6. 最后入库与向量化，避免索引指向过期内容。
 
-旧的 Recommendation、PICO、GRADE、LLM review、publish 等链路已经迁移到 `legacy_recommendation_pipeline/`。
+## 维护原则
+
+- 每个阶段只读取约定的上一阶段产物，不从多个目录猜测最新版本。
+- 支持 `dry_run` 的操作先查看报告，再执行实际写入。
+- 修改正文后更新内容哈希；修改主元数据后同步所有派生产物。
+- 大批量处理保留错误清单，单篇失败不应中止整个语料库。

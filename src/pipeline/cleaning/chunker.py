@@ -17,6 +17,7 @@ from src.pipeline.cleaning.semantic_chunker import (
     split_section_semantic_content,
 )
 from src.retrieval.document_repr.section_classifier import classify_section
+from src.utils.clinical_department import classify_chunk_departments
 from src.utils.front_matter import parse_front_matter
 from src.utils.ids import make_chunk_id
 from src.utils.io import DATA_DIR, ensure_dir, iter_markdown_files, write_jsonl
@@ -58,6 +59,8 @@ def chunk_markdown(markdown: str, clean_path: str = "") -> list[ChunkRecord]:
         ):
             chunk_id = make_chunk_id(section.doc_id, chunk_index)
             retrieval = retrieval_text(section.title, section.section_path, part.chunk_type, part.content)
+            parent_departments = metadata.get("clinical_departments") or section.clinical_departments or [section.clinical_department]
+            department_result = classify_chunk_departments(section.section_path, part.content, parent_departments, part.chunk_type)
             chunks.append(
                 ChunkRecord(
                     chunk_id=chunk_id,
@@ -65,7 +68,10 @@ def chunk_markdown(markdown: str, clean_path: str = "") -> list[ChunkRecord]:
                     title=section.title,
                     publication_date=section.publication_date or "unknown",
                     source_institution=section.source_institution or "Unknown",
-                    clinical_department=section.clinical_department or metadata.get("clinical_department") or "未分类",
+                    clinical_department=department_result["clinical_department"],
+                    clinical_departments=department_result["clinical_departments"],
+                    department_scope=department_result["department_scope"],
+                    document_kind=metadata.get("document_kind") or "guideline",
                     section_path=section.section_path,
                     chunk_index=chunk_index,
                     content=part.content,
@@ -97,12 +103,25 @@ def chunk_file(clean_path: str | Path, output_dir: str | Path = DATA_DIR / "chun
 def chunk_all(input_dir: str | Path = DATA_DIR / "markdown_clean", output_dir: str | Path = DATA_DIR / "chunks") -> dict[str, Any]:
     all_chunks: list[dict[str, Any]] = []
     docs = 0
+    active_doc_ids: set[str] = set()
     for path in iter_markdown_files(input_dir):
         chunks = chunk_file(path, output_dir)
+        active_doc_ids.add(chunks[0].doc_id if chunks else path.stem)
         docs += 1
         all_chunks.extend(dump_model(chunk) for chunk in chunks)
-    write_jsonl(Path(output_dir) / "all_chunks.jsonl", all_chunks)
-    return {"documents": docs, "chunks": len(all_chunks), "chunks_dir": str(output_dir)}
+    chunks_dir = Path(output_dir)
+    write_jsonl(chunks_dir / "all_chunks.jsonl", all_chunks)
+    stale_files_removed = 0
+    for path in chunks_dir.glob("*.jsonl"):
+        if path.name != "all_chunks.jsonl" and path.stem not in active_doc_ids:
+            path.unlink()
+            stale_files_removed += 1
+    return {
+        "documents": docs,
+        "chunks": len(all_chunks),
+        "stale_files_removed": stale_files_removed,
+        "chunks_dir": str(output_dir),
+    }
 
 
 def main() -> None:

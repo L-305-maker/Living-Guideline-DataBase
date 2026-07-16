@@ -19,7 +19,7 @@ REFERENCE_MARKER_RE = re.compile(r"<!--\s*reference_section:\s*true\s*-->", re.I
 REFERENCE_LIST_RE = re.compile(r"(?:^|\n)\s*(?:#{1,6}\s*)?(?:REFERENCES|BIBLIOGRAPHY|\u53c2\u8003\u6587\u732e)\s*\n\s*(?:\d+\.|\[\d+\])", re.I)
 
 
-def _is_reference_section(content: str, section_path: list[str]) -> bool:
+def helper_is_reference_section(content: str, section_path: list[str]) -> bool:
     normalized_path = [item.strip() for item in section_path if item and item.strip()]
     return bool(
         any(REFERENCE_RE.match(item) for item in normalized_path)
@@ -36,6 +36,9 @@ def encode_markdown(markdown: str) -> list[SectionRecord]:
     publication_date = metadata.get("publication_date") or "unknown"
     source_institution = metadata.get("source_institution") or "Unknown"
     clinical_department = metadata.get("clinical_department") or "未分类"
+    clinical_departments = metadata.get("clinical_departments") or [clinical_department]
+    department_scope = metadata.get("department_scope") or ("compositive" if len(clinical_departments) > 1 else "single")
+    document_kind = metadata.get("document_kind") or "guideline"
     if not matches:
         return [
             SectionRecord(
@@ -44,13 +47,16 @@ def encode_markdown(markdown: str) -> list[SectionRecord]:
                 publication_date=publication_date,
                 source_institution=source_institution,
                 clinical_department=clinical_department,
+                clinical_departments=clinical_departments,
+                department_scope=department_scope,
+                document_kind=document_kind,
                 section_path=["Document"],
                 heading="Document",
                 heading_level=1,
                 char_start=0,
                 char_end=len(body),
                 content=body.strip(),
-                is_reference_section=_is_reference_section(body, ["Document"]),
+                is_reference_section=helper_is_reference_section(body, ["Document"]),
             )
         ]
 
@@ -65,6 +71,9 @@ def encode_markdown(markdown: str) -> list[SectionRecord]:
                 publication_date=publication_date,
                 source_institution=source_institution,
                 clinical_department=clinical_department,
+                clinical_departments=clinical_departments,
+                department_scope=department_scope,
+                document_kind=document_kind,
                 section_path=["Preface"],
                 heading="Preface",
                 heading_level=1,
@@ -84,7 +93,7 @@ def encode_markdown(markdown: str) -> list[SectionRecord]:
         start = match.start()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
         content = body[start:end].strip()
-        is_reference_section = _is_reference_section(content, path)
+        is_reference_section = helper_is_reference_section(content, path)
         sections.append(
             SectionRecord(
                 doc_id=doc_id,
@@ -92,6 +101,9 @@ def encode_markdown(markdown: str) -> list[SectionRecord]:
                 publication_date=publication_date,
                 source_institution=source_institution,
                 clinical_department=clinical_department,
+                clinical_departments=clinical_departments,
+                department_scope=department_scope,
+                document_kind=document_kind,
                 section_path=path,
                 heading=heading,
                 heading_level=level,
@@ -115,11 +127,23 @@ def encode_file(clean_path: str | Path, output_dir: str | Path = DATA_DIR / "sec
 def encode_all(input_dir: str | Path = DATA_DIR / "markdown_clean", output_dir: str | Path = DATA_DIR / "sections") -> dict[str, Any]:
     count_docs = 0
     count_sections = 0
+    active_doc_ids: set[str] = set()
     for path in iter_markdown_files(input_dir):
         sections = encode_file(path, output_dir)
+        active_doc_ids.add(sections[0].doc_id)
         count_docs += 1
         count_sections += len(sections)
-    return {"documents": count_docs, "sections": count_sections, "sections_dir": str(output_dir)}
+    stale_files_removed = 0
+    for path in Path(output_dir).glob("*.jsonl"):
+        if path.stem not in active_doc_ids:
+            path.unlink()
+            stale_files_removed += 1
+    return {
+        "documents": count_docs,
+        "sections": count_sections,
+        "stale_files_removed": stale_files_removed,
+        "sections_dir": str(output_dir),
+    }
 
 
 def main() -> None:

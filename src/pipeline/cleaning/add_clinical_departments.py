@@ -15,13 +15,13 @@ from src.utils.io import DATA_DIR, read_jsonl
 from src.utils.metadata import extract_abstract
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
+def helper_write_text_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8", newline="\n")
     os.replace(tmp, path)
 
 
-def _write_jsonl_atomic(path: Path, records: list[dict[str, Any]]) -> int:
+def helper_write_jsonl_atomic(path: Path, records: list[dict[str, Any]]) -> int:
     tmp = path.with_name(path.name + ".tmp")
     with tmp.open("w", encoding="utf-8", newline="\n") as handle:
         for rec in records:
@@ -30,7 +30,7 @@ def _write_jsonl_atomic(path: Path, records: list[dict[str, Any]]) -> int:
     return len(records)
 
 
-def _rewrite_jsonl_stream(path: Path, department_by_doc: dict[str, str]) -> tuple[int, int]:
+def helper_rewrite_jsonl_stream(path: Path, department_by_doc: dict[str, str]) -> tuple[int, int]:
     if not path.exists():
         return 0, 0
     tmp = path.with_name(path.name + ".tmp")
@@ -51,7 +51,7 @@ def _rewrite_jsonl_stream(path: Path, department_by_doc: dict[str, str]) -> tupl
     return total, changed
 
 
-def _read_front_matter_metadata(path: Path) -> dict[str, str]:
+def helper_read_front_matter_metadata(path: Path) -> dict[str, str]:
     lines: list[str] = []
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         first = handle.readline()
@@ -71,7 +71,7 @@ def load_existing_departments(markdown_dirs: list[Path]) -> dict[str, str]:
         if not directory.exists():
             continue
         for path in sorted(directory.glob("*.md")):
-            metadata = _read_front_matter_metadata(path)
+            metadata = helper_read_front_matter_metadata(path)
             doc_id = metadata.get("id")
             department = metadata.get("clinical_department")
             if doc_id and department:
@@ -84,7 +84,7 @@ def classify_markdown(
     force: bool = True,
     seed_departments: dict[str, str] | None = None,
 ) -> tuple[str | None, str | None, bool]:
-    fast_metadata = _read_front_matter_metadata(path)
+    fast_metadata = helper_read_front_matter_metadata(path)
     doc_id = fast_metadata.get("id")
     if not doc_id:
         return None, None, False
@@ -114,7 +114,7 @@ def classify_markdown(
     changed = metadata.get("clinical_department") != department
     if changed:
         metadata["clinical_department"] = department
-        _write_text_atomic(path, dump_front_matter(metadata, body))
+        helper_write_text_atomic(path, dump_front_matter(metadata, body))
     return doc_id, department, changed
 
 
@@ -151,7 +151,7 @@ def update_manifest(path: Path, department_by_doc: dict[str, str]) -> tuple[int,
             rec["clinical_department"] = department
             changed += 1
         records.append(rec)
-    _write_jsonl_atomic(path, records)
+    helper_write_jsonl_atomic(path, records)
     return len(records), changed
 
 
@@ -164,7 +164,7 @@ def update_partitioned_jsonl(directory: Path, department_by_doc: dict[str, str])
     for path in sorted(directory.glob("*.jsonl")):
         if path.name == "all_chunks.jsonl":
             continue
-        rows, updates = _rewrite_jsonl_stream(path, department_by_doc)
+        rows, updates = helper_rewrite_jsonl_stream(path, department_by_doc)
         files += 1
         total += rows
         changed += updates
@@ -183,7 +183,7 @@ def backfill(data_dir: str | Path = DATA_DIR, force: bool = True, reuse_existing
     chunk_files, chunk_rows, chunk_changed = update_partitioned_jsonl(data_path / "chunks", department_by_doc)
     all_chunks_pending_replace = False
     try:
-        all_chunk_rows, all_chunk_changed = _rewrite_jsonl_stream(data_path / "chunks" / "all_chunks.jsonl", department_by_doc)
+        all_chunk_rows, all_chunk_changed = helper_rewrite_jsonl_stream(data_path / "chunks" / "all_chunks.jsonl", department_by_doc)
     except PermissionError:
         all_chunks_pending_replace = True
         tmp_path = data_path / "chunks" / "all_chunks.jsonl.tmp"

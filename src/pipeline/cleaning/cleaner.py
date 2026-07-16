@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from src.models.schemas import DocumentRecord, dump_model
-from src.utils.clinical_department import classify_clinical_department
+from src.utils.clinical_department import classify_clinical_departments
 from src.utils.front_matter import dump_front_matter, parse_front_matter
 from src.utils.ids import sha256_text
 from src.utils.io import DATA_DIR, ensure_dir, iter_markdown_files
@@ -70,7 +70,7 @@ OCR_PUNCT_TRANSLATION = str.maketrans(
 )
 
 
-def _split_pages(body: str) -> list[list[str]]:
+def helper_split_pages(body: str) -> list[list[str]]:
     pages: list[list[str]] = []
     current: list[str] = []
     for line in body.splitlines():
@@ -84,8 +84,8 @@ def _split_pages(body: str) -> list[list[str]]:
     return pages
 
 
-def _repeated_headers_footers(body: str) -> set[str]:
-    pages = _split_pages(body)
+def helper_repeated_headers_footers(body: str) -> set[str]:
+    pages = helper_split_pages(body)
     if len(pages) < 3:
         return set()
     counts: Counter[str] = Counter()
@@ -98,12 +98,12 @@ def _repeated_headers_footers(body: str) -> set[str]:
     return {line for line, count in counts.items() if count >= threshold}
 
 
-def _fix_english_linebreaks(text: str) -> str:
+def helper_fix_english_linebreaks(text: str) -> str:
     text = re.sub(r"(?<=[A-Za-z])-\n(?=[A-Za-z])", "", text)
     return re.sub(r"(?<=[a-z,;])\n(?=[a-z(])", " ", text)
 
 
-def _join_spaced_alnum_runs(text: str) -> str:
+def helper_join_spaced_alnum_runs(text: str) -> str:
     def repl(match: re.Match[str]) -> str:
         value = match.group(0)
         compact = re.sub(r"\s+", "", value)
@@ -114,18 +114,18 @@ def _join_spaced_alnum_runs(text: str) -> str:
     return SPACED_ALNUM_RUN_RE.sub(repl, text)
 
 
-def _normalize_ocr_text(text: str) -> str:
+def helper_normalize_ocr_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = text.translate(OCR_PUNCT_TRANSLATION)
     text = PRIVATE_USE_RE.sub("", text)
-    return "\n".join(_join_spaced_alnum_runs(line) for line in text.splitlines())
+    return "\n".join(helper_join_spaced_alnum_runs(line) for line in text.splitlines())
 
 
-def _visible_chars(text: str) -> list[str]:
+def helper_visible_chars(text: str) -> list[str]:
     return [char for char in text if not char.isspace()]
 
 
-def _is_weird_text_layer_char(char: str) -> bool:
+def helper_is_weird_text_layer_char(char: str) -> bool:
     codepoint = ord(char)
     return (
         0x7F <= codepoint <= 0x9F
@@ -136,7 +136,7 @@ def _is_weird_text_layer_char(char: str) -> bool:
     )
 
 
-def _text_signal_stats(text: str) -> dict[str, float]:
+def helper_text_signal_stats(text: str) -> dict[str, float]:
     visible_count = 0
     signal = 0
     cjk = 0
@@ -152,7 +152,7 @@ def _text_signal_stats(text: str) -> dict[str, float]:
             signal += 1
         if is_cjk:
             cjk += 1
-        if _is_weird_text_layer_char(char):
+        if helper_is_weird_text_layer_char(char):
             weird += 1
         if char in MOJIBAKE_MARKER_CHARS:
             mojibake_markers += 1
@@ -173,7 +173,7 @@ def _text_signal_stats(text: str) -> dict[str, float]:
     }
 
 
-def _looks_like_form_text(text: str) -> bool:
+def helper_looks_like_form_text(text: str) -> bool:
     visible_count = 0
     underline_count = 0
     for char in text:
@@ -189,11 +189,11 @@ def _looks_like_form_text(text: str) -> bool:
     return (repeated_blanks >= 5 and form_word_count >= 3) or (repeated_blanks >= 12 and underline_ratio > 0.12)
 
 
-def _looks_like_pdf_text_mojibake(text: str) -> bool:
-    stats = _text_signal_stats(text)
+def helper_looks_like_pdf_text_mojibake(text: str) -> bool:
+    stats = helper_text_signal_stats(text)
     if stats["visible"] < 1000:
         return False
-    if _looks_like_form_text(text):
+    if helper_looks_like_form_text(text):
         return False
     if stats["weird_ratio"] > 0.12:
         return True
@@ -204,7 +204,7 @@ def _looks_like_pdf_text_mojibake(text: str) -> bool:
     return False
 
 
-def _content_visible_count(body: str) -> int:
+def helper_content_visible_count(body: str) -> int:
     return sum(
         1
         for line in body.splitlines()
@@ -214,25 +214,25 @@ def _content_visible_count(body: str) -> int:
     )
 
 
-def _metadata_flags(metadata: dict[str, Any]) -> list[str]:
+def helper_metadata_flags(metadata: dict[str, Any]) -> list[str]:
     return [flag.strip() for flag in re.split(r"[,;]\s*", str(metadata.get("cleaning_flags", ""))) if flag.strip()]
 
 
-def _add_metadata_flag(metadata: dict[str, Any], flag: str) -> None:
-    flags = _metadata_flags(metadata)
+def helper_add_metadata_flag(metadata: dict[str, Any], flag: str) -> None:
+    flags = helper_metadata_flags(metadata)
     if flag not in flags:
         flags.append(flag)
     metadata["cleaning_flags"] = ",".join(flags)
 
 
-def _trim_bibliographic_prefix(line: str) -> str:
+def helper_trim_bibliographic_prefix(line: str) -> str:
     match = ABSTRACT_MARKER_RE.search(line)
     if match and match.start() > 80:
         return line[match.start() :]
     return line
 
 
-def _strip_inline_noise(line: str) -> str:
+def helper_strip_inline_noise(line: str) -> str:
     if CONTACT_LINE_RE.match(line):
         return ""
     line = JOURNAL_HEADER_RE.sub(" ", line)
@@ -240,11 +240,11 @@ def _strip_inline_noise(line: str) -> str:
     line = PII_RE.sub(" ", line)
     line = EMAIL_ADDRESS_RE.sub(" ", line)
     line = INLINE_NOISE_RE.sub(" ", line)
-    line = _trim_bibliographic_prefix(line)
+    line = helper_trim_bibliographic_prefix(line)
     return re.sub(r"\s+", " ", line).strip()
 
 
-def _is_low_signal_line(line: str) -> bool:
+def helper_is_low_signal_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or HEADING_RE.match(stripped):
         return False
@@ -259,7 +259,7 @@ def _is_low_signal_line(line: str) -> bool:
     return signal / max(1, len(visible)) < 0.25
 
 
-def _is_bad_heading_line(line: str) -> bool:
+def helper_is_bad_heading_line(line: str) -> bool:
     stripped = line.strip()
     if re.match(r"^#{1,6}\s*$", stripped):
         return True
@@ -274,7 +274,7 @@ def _is_bad_heading_line(line: str) -> bool:
     return bool(NOISY_LINE_RE.match(title) and letters < 6)
 
 
-def _fragmented_latin_ocr(body: str) -> bool:
+def helper_fragmented_latin_ocr(body: str) -> bool:
     token_count = 0
     single_alpha_count = 0
     digit_count = 0
@@ -296,7 +296,7 @@ def _fragmented_latin_ocr(body: str) -> bool:
     return fragmented_ratio > 0.45 and natural_ratio < 0.18
 
 
-def _is_noisy_title(title: str) -> bool:
+def helper_is_noisy_title(title: str) -> bool:
     normalized = unicodedata.normalize("NFKC", title or "").strip()
     if not normalized:
         return False
@@ -308,7 +308,7 @@ def _is_noisy_title(title: str) -> bool:
     return len(visible) >= 12 and symbols / max(1, len(visible)) > 0.35 and letters < 12
 
 
-def _is_cjk_prose(line: str) -> bool:
+def helper_is_cjk_prose(line: str) -> bool:
     stripped = line.strip()
     if not stripped or PAGE_RE.match(stripped) or HEADING_RE.match(stripped):
         return False
@@ -317,17 +317,17 @@ def _is_cjk_prose(line: str) -> bool:
     return len(CJK_RE.findall(stripped)) >= 3
 
 
-def _fix_cjk_linebreaks(lines: list[str]) -> list[str]:
+def helper_fix_cjk_linebreaks(lines: list[str]) -> list[str]:
     merged: list[str] = []
     for line in lines:
-        if merged and _is_cjk_prose(merged[-1]) and _is_cjk_prose(line) and not CJK_TERMINAL_RE.search(merged[-1].strip()):
+        if merged and helper_is_cjk_prose(merged[-1]) and helper_is_cjk_prose(line) and not CJK_TERMINAL_RE.search(merged[-1].strip()):
             merged[-1] = merged[-1].rstrip() + line.lstrip()
         else:
             merged.append(line)
     return merged
 
 
-def _mark_references(body: str) -> str:
+def helper_mark_references(body: str) -> str:
     def repl(match: re.Match[str]) -> str:
         return f"{match.group(1)}{match.group(2)}\n<!-- reference_section: true -->"
 
@@ -335,27 +335,28 @@ def _mark_references(body: str) -> str:
 
 
 def assess_cleaned_body(body: str) -> dict[str, Any]:
-    stats = _text_signal_stats(body)
+    stats = helper_text_signal_stats(body)
     visible_count = int(stats["visible"])
     cjk = int(stats["cjk"])
-    form_like = _looks_like_form_text(body)
+    form_like = helper_looks_like_form_text(body)
     journal_headers = len(JOURNAL_HEADER_RE.findall(body))
     doi_residue = len(DOI_RE.findall(body))
     email_residue = len(EMAIL_ADDRESS_RE.findall(body))
     page_markers = sum(1 for line in body.splitlines() if PAGE_RE.match(line))
     bad_glyphs = len(BAD_GLYPHS_RE.findall(body)) + len(PRIVATE_USE_RE.findall(body))
-    noisy_lines = sum(1 for line in body.splitlines() if _is_low_signal_line(line) or _is_bad_heading_line(line))
+    noisy_lines = sum(1 for line in body.splitlines() if helper_is_low_signal_line(line) or helper_is_bad_heading_line(line))
     signal_ratio = stats["signal_ratio"]
     flags: list[str] = []
+    # 多个独立信号共同描述清洗质量；单个弱信号不会直接判定 OCR 失败。
     if visible_count < 300:
         flags.append("very_short_text")
     if signal_ratio < 0.45 and not form_like:
         flags.append("low_text_signal")
     if not form_like and (noisy_lines >= 2 or (visible_count < 500 and noisy_lines >= 1)):
         flags.append("noisy_ocr_lines")
-    if not form_like and cjk == 0 and visible_count > 300 and (signal_ratio < 0.60 or _fragmented_latin_ocr(body)):
+    if not form_like and cjk == 0 and visible_count > 300 and (signal_ratio < 0.60 or helper_fragmented_latin_ocr(body)):
         flags.append("likely_ocr_failure")
-    if _looks_like_pdf_text_mojibake(body):
+    if helper_looks_like_pdf_text_mojibake(body):
         flags.append("pdf_text_mojibake")
         if "likely_ocr_failure" not in flags:
             flags.append("likely_ocr_failure")
@@ -369,6 +370,7 @@ def assess_cleaned_body(body: str) -> dict[str, Any]:
         flags.append("page_marker_residue")
     if bad_glyphs:
         flags.append("bad_glyph_residue")
+    # 只有影响正文可读性的核心标记判为 poor，残留页码等轻问题只标 warning。
     quality = "poor" if {"low_text_signal", "likely_ocr_failure", "noisy_ocr_lines"} & set(flags) else ("warning" if flags else "ok")
     return {
         "quality": quality,
@@ -378,11 +380,12 @@ def assess_cleaned_body(body: str) -> dict[str, Any]:
     }
 
 
-def _apply_quality_metadata(metadata: dict[str, str], body: str) -> None:
+def helper_apply_quality_metadata(metadata: dict[str, str], body: str) -> None:
     report = assess_cleaned_body(body)
-    flags = _metadata_flags(metadata) + list(report["flags"])
-    if _is_noisy_title(metadata.get("title", "")):
+    flags = helper_metadata_flags(metadata) + list(report["flags"])
+    if helper_is_noisy_title(metadata.get("title", "")):
         flags.append("noisy_ocr_title")
+    # PDF 文本层乱码通常需要 OCR，统一补充失败标记供后续重排降权。
     if "pdf_text_mojibake" in flags and "likely_ocr_failure" not in flags:
         flags.append("likely_ocr_failure")
     seen_flags = []
@@ -407,7 +410,7 @@ def _apply_quality_metadata(metadata: dict[str, str], body: str) -> None:
     metadata["cleaning_flags"] = ",".join(seen_flags)
 
 
-def _loss_preserving_body(body: str, repeated: set[str]) -> str:
+def helper_loss_preserving_body(body: str, repeated: set[str]) -> str:
     lines: list[str] = []
     for line in body.splitlines():
         stripped = line.strip()
@@ -415,15 +418,15 @@ def _loss_preserving_body(body: str, repeated: set[str]) -> str:
             continue
         if stripped in repeated:
             continue
-        cleaned_line = _strip_inline_noise(line)
+        cleaned_line = helper_strip_inline_noise(line)
         lines.append(re.sub(r"[ \t]+", " ", cleaned_line).rstrip())
-    lines = _fix_cjk_linebreaks(lines)
-    return _mark_references("\n".join(lines))
+    lines = helper_fix_cjk_linebreaks(lines)
+    return helper_mark_references("\n".join(lines))
 
 
-def _should_use_loss_preserving_body(original_body: str, cleaned_body: str, original_mojibake: bool = False) -> bool:
-    original_visible = _content_visible_count(original_body)
-    cleaned_visible = _content_visible_count(cleaned_body)
+def helper_should_use_loss_preserving_body(original_body: str, cleaned_body: str, original_mojibake: bool = False) -> bool:
+    original_visible = helper_content_visible_count(original_body)
+    cleaned_visible = helper_content_visible_count(cleaned_body)
     if original_visible < 1000:
         return False
     if original_mojibake:
@@ -436,15 +439,15 @@ def _should_use_loss_preserving_body(original_body: str, cleaned_body: str, orig
 def clean_markdown_text(markdown: str) -> str:
     metadata, body = parse_front_matter(markdown)
     body = body.replace("\r\n", "\n").replace("\r", "\n")
-    body = _normalize_ocr_text(body)
+    body = helper_normalize_ocr_text(body)
     body = CONTROL_RE.sub("", body)
     body = BAD_GLYPHS_RE.sub("", body)
-    body = _fix_english_linebreaks(body)
+    body = helper_fix_english_linebreaks(body)
     normalized_body = body
-    original_mojibake = _looks_like_pdf_text_mojibake(normalized_body)
+    original_mojibake = helper_looks_like_pdf_text_mojibake(normalized_body)
     if original_mojibake:
-        _add_metadata_flag(metadata, "pdf_text_mojibake")
-    repeated = _repeated_headers_footers(body)
+        helper_add_metadata_flag(metadata, "pdf_text_mojibake")
+    repeated = helper_repeated_headers_footers(body)
     lines: list[str] = []
     for line in body.splitlines():
         stripped = line.strip()
@@ -452,21 +455,21 @@ def clean_markdown_text(markdown: str) -> str:
             continue
         if stripped in repeated:
             continue
-        cleaned_line = _strip_inline_noise(line)
-        if _is_bad_heading_line(cleaned_line):
+        cleaned_line = helper_strip_inline_noise(line)
+        if helper_is_bad_heading_line(cleaned_line):
             continue
-        if _is_low_signal_line(cleaned_line):
+        if helper_is_low_signal_line(cleaned_line):
             continue
         lines.append(re.sub(r"[ \t]+", " ", cleaned_line).rstrip())
-    lines = _fix_cjk_linebreaks(lines)
+    lines = helper_fix_cjk_linebreaks(lines)
     body = "\n".join(lines)
-    body = _mark_references(body)
-    if _should_use_loss_preserving_body(normalized_body, body, original_mojibake=original_mojibake):
-        body = _loss_preserving_body(normalized_body, repeated)
-        _add_metadata_flag(metadata, "clean_loss_fallback")
+    body = helper_mark_references(body)
+    if helper_should_use_loss_preserving_body(normalized_body, body, original_mojibake=original_mojibake):
+        body = helper_loss_preserving_body(normalized_body, repeated)
+        helper_add_metadata_flag(metadata, "clean_loss_fallback")
     body = re.sub(r"\n{3,}", "\n\n", body).strip() + "\n"
     if metadata:
-        _apply_quality_metadata(metadata, body)
+        helper_apply_quality_metadata(metadata, body)
     return dump_front_matter(metadata, body) if metadata else body
 
 
@@ -476,14 +479,13 @@ def clean_file(raw_path: str | Path, output_dir: str | Path = DATA_DIR / "markdo
     metadata, body = parse_front_matter(cleaned)
     doc_id = metadata["id"]
     abstract = extract_abstract(body)
-    clinical_department = metadata.get("clinical_department") or classify_clinical_department(
-        metadata.get("title", ""),
-        abstract,
-        body,
-    )
+    department_result = classify_clinical_departments(str(metadata.get("title", "")), abstract, body)
+    clinical_department = str(department_result["clinical_department"])
     metadata["clinical_department"] = clinical_department
+    metadata["clinical_departments"] = department_result["clinical_departments"]
+    metadata["department_scope"] = department_result["department_scope"]
     if "cleaning_quality" not in metadata:
-        _apply_quality_metadata(metadata, body)
+        helper_apply_quality_metadata(metadata, body)
     cleaned = dump_front_matter(metadata, body)
     out_path = ensure_dir(output_dir) / f"{doc_id}.md"
     out_path.write_text(cleaned, encoding="utf-8", newline="\n")
@@ -493,6 +495,9 @@ def clean_file(raw_path: str | Path, output_dir: str | Path = DATA_DIR / "markdo
         publication_date=metadata.get("publication_date") or "unknown",
         source_institution=metadata.get("source_institution") or "Unknown",
         clinical_department=clinical_department,
+        clinical_departments=department_result["clinical_departments"],
+        department_scope=str(department_result["department_scope"]),
+        document_kind=str(metadata.get("document_kind") or "guideline"),
         source_file=metadata.get("source_file", ""),
         markdown_raw_path=str(raw_file),
         markdown_clean_path=str(out_path),
@@ -513,6 +518,22 @@ def clean_file(raw_path: str | Path, output_dir: str | Path = DATA_DIR / "markdo
     )
 
 
+def helper_raw_metadata(path: Path) -> dict[str, Any]:
+    metadata, _body = parse_front_matter(path.read_text(encoding="utf-8", errors="replace"))
+    return metadata
+
+
+def helper_source_file_exists(metadata: dict[str, Any]) -> bool:
+    value = str(metadata.get("source_file") or "").strip()
+    return bool(value and Path(value).is_file())
+
+
+def helper_document_kind_priority(path: Path) -> tuple[bool, bool, str]:
+    metadata = helper_raw_metadata(path)
+    is_consensus = str(metadata.get("document_kind") or "guideline") == "consensus"
+    return not helper_source_file_exists(metadata), is_consensus, str(path)
+
+
 def clean_all(
     input_dir: str | Path = DATA_DIR / "markdown_raw",
     output_dir: str | Path = DATA_DIR / "markdown_clean",
@@ -521,10 +542,51 @@ def clean_all(
 ) -> dict[str, Any]:
     manifest = Path(manifest_path)
     ensure_dir(manifest.parent)
+    clean_dir = ensure_dir(output_dir)
+    excluded_manifest = manifest.with_name("documents_excluded.jsonl")
     count = 0
+    duplicates_skipped = 0
+    missing_sources_skipped = 0
+    excluded: list[dict[str, str]] = []
+    active_clean_paths: set[Path] = set()
+    seen_body_hashes: dict[str, str] = {}
+    paths = list(iter_markdown_files(input_dir))
+    paths.sort(key=helper_document_kind_priority)
     with manifest.open("w", encoding="utf-8", newline="\n") as handle:
-        for path in iter_markdown_files(input_dir):
-            handle.write(json.dumps(dump_model(clean_file(path, output_dir)), ensure_ascii=False, separators=(",", ":")) + "\n")
+        for path in paths:
+            metadata = helper_raw_metadata(path)
+            doc_id = str(metadata.get("id") or path.stem)
+            if not helper_source_file_exists(metadata):
+                excluded.append(
+                    {
+                        "doc_id": doc_id,
+                        "reason": "missing_source_pdf",
+                        "source_file": str(metadata.get("source_file") or ""),
+                        "markdown_raw_path": str(path),
+                    }
+                )
+                missing_sources_skipped += 1
+                continue
+            record = clean_file(path, output_dir)
+            clean_path = Path(record.markdown_clean_path)
+            _clean_metadata, body = parse_front_matter(clean_path.read_text(encoding="utf-8", errors="replace"))
+            body_hash = sha256_text(body)
+            if body_hash in seen_body_hashes:
+                clean_path.unlink(missing_ok=True)
+                excluded.append(
+                    {
+                        "doc_id": record.doc_id,
+                        "reason": "duplicate_clean_body",
+                        "canonical_doc_id": seen_body_hashes[body_hash],
+                        "source_file": record.source_file,
+                        "markdown_raw_path": str(path),
+                    }
+                )
+                duplicates_skipped += 1
+                continue
+            seen_body_hashes[body_hash] = record.doc_id
+            active_clean_paths.add(clean_path.resolve())
+            handle.write(json.dumps(dump_model(record), ensure_ascii=False, separators=(",", ":")) + "\n")
             count += 1
             if progress_every > 0 and count % progress_every == 0:
                 print(
@@ -532,7 +594,22 @@ def clean_all(
                     file=sys.stderr,
                     flush=True,
                 )
-    return {"cleaned": count, "manifest": str(manifest_path)}
+    stale_clean_removed = 0
+    for path in iter_markdown_files(clean_dir):
+        if path.resolve() not in active_clean_paths:
+            path.unlink()
+            stale_clean_removed += 1
+    with excluded_manifest.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in excluded:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return {
+        "cleaned": count,
+        "duplicates_skipped": duplicates_skipped,
+        "missing_sources_skipped": missing_sources_skipped,
+        "stale_clean_removed": stale_clean_removed,
+        "manifest": str(manifest_path),
+        "excluded_manifest": str(excluded_manifest),
+    }
 
 
 def main() -> None:

@@ -1,37 +1,31 @@
-﻿# orchestration 阶段
+# orchestration 流水线编排
 
-`src/pipeline/orchestration/` 是当前证据库构建的一键入口，负责调用 cleaning 阶段并生成可供 MCP 检索使用的数据目录。
+## 模块职责
 
-## 数据流
+`run_pipeline.py` 负责按固定顺序调用数据处理阶段、收集阶段结果并输出汇总。该层只做编排，不应复制清洗、切分、入库或检索的业务逻辑。
 
-```text
-run_pipeline.py
-  -> PDF to Markdown
-  -> clean Markdown
-  -> encode blocks
-  -> split chunks
-  -> build SQLite FTS
-  -> optionally build BM25 JSON/vector index
-  -> manifest.json
-```
+## 编排原则
 
-## 入口
+- 每个阶段必须明确输入路径、输出路径和完成条件。
+- 后一阶段只在前一阶段产物可读且统计合理时执行。
+- 单篇文档错误由具体阶段记录；编排层汇总错误数和产物路径。
+- 重跑应尽量利用已有产物，但不能把文件存在等同于内容仍然有效。
+- 内容、模型或 ID 规则变化时，应显式失效对应下游索引。
+
+## 维护步骤
+
+新增阶段时：
+
+1. 先在所属模块实现并单独验证函数或命令。
+2. 在编排层添加最小调用和结果汇总。
+3. 记录阶段耗时、处理数、失败数和关键产物路径。
+4. 添加从上游输入到下游产物的集成测试。
+
+## 排错顺序
+
+先定位第一个统计异常或产物缺失的阶段，再运行该阶段的独立命令。不要直接从最终检索异常反推所有上游步骤，也不要在编排层吞掉异常后继续生成看似成功的报告。
 
 ```powershell
-python -m src.pipeline.orchestration.run_pipeline --data-dir data/evidence --skip-vector
+python -B -m src.pipeline.orchestration.run_pipeline --help
+python -B -m py_compile src/pipeline/orchestration/run_pipeline.py
 ```
-
-常用参数：
-
-| 参数 | 作用 |
-| --- | --- |
-| `--data-dir` | 数据根目录，默认 `data/evidence`。 |
-| `--raw-pdf-dir` | 原始 PDF 目录；不传则使用 `data_dir/raw_pdfs`。 |
-| `--skip-pdf-to-markdown` | 已经有 Markdown 时跳过 PDF 转换。 |
-| `--skip-vector` | 跳过向量索引构建，只保留 SQLite/FTS。 |
-| `--legacy-json-bm25` | 额外生成旧 JSON BM25 索引。 |
-| `--embedding-model` | 构建向量索引时使用的 embedding 模型。 |
-
-## 设计边界
-
-`run_pipeline.py` 不再调度 Recommendation/PICO/GRADE 抽取，也不做人工审核或推荐发布。它只产出面向循证医学 Agent 的证据检索库。

@@ -21,6 +21,8 @@ def convert_pdfs(
     ocr_mode: str = "auto",
     ocr_output_dir: str | Path | None = None,
     ocr_languages: str = "chi_sim+eng",
+    document_kind: str = "guideline",
+    append: bool = False,
 ) -> dict[str, Any]:
     """Convert raw PDF files to front-matter Markdown and write a manifest."""
 
@@ -31,6 +33,8 @@ def convert_pdfs(
         ocr_mode=ocr_mode,
         ocr_output_dir=ocr_output_dir,
         ocr_languages=ocr_languages,
+        document_kind=document_kind,
+        append=append,
     )
 
 
