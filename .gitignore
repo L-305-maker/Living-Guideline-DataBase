@@ -1,0 +1,16 @@
+qdrant_storage/
+.vscode
+outputs/
+.playwright-cli/
+.env
+data/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.agents/
+.vs/
+.ruff_cache/
+deploy/
+.codex/
+tests/
+tmp/

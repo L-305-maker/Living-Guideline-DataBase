@@ -1,6 +1,8 @@
 requests>=2.31
+scrapling[fetchers]>=0.4.9,<0.5
 pdfplumber>=0.11
 pymupdf>=1.24
 psycopg[binary]>=3.2
 mcp>=1.9
 sentence-transformers>=3.0
+faiss-cpu>=1.8
