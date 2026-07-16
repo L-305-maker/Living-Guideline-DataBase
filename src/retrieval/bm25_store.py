@@ -22,7 +22,7 @@ def tokenize(text: str) -> list[str]:
     return [token.lower() for token in TOKEN_RE.findall(text or "")]
 
 
-def _parse_time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
+def helper_parse_time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
     if not time_range:
         return None, None
     if isinstance(time_range, dict):
@@ -33,8 +33,8 @@ def _parse_time_range(time_range: str | dict[str, str] | None) -> tuple[str | No
     return str(time_range), None
 
 
-def _in_time_range(publication_date: str, time_range: str | dict[str, str] | None) -> bool:
-    start, end = _parse_time_range(time_range)
+def helper_in_time_range(publication_date: str, time_range: str | dict[str, str] | None) -> bool:
+    start, end = helper_parse_time_range(time_range)
     if not start and not end:
         return True
     value = publication_date or "unknown"
@@ -52,7 +52,7 @@ class BM25Store:
         self.records = records
         self.text_field = text_field
         self.id_field = id_field
-        self.tokenized = [tokenize(_record_text(record, text_field)) for record in records]
+        self.tokenized = [tokenize(helper_record_text(record, text_field)) for record in records]
         self.avgdl = sum(len(tokens) for tokens in self.tokenized) / max(1, len(self.tokenized))
         self.df: Counter[str] = Counter()
         for tokens in self.tokenized:
@@ -77,7 +77,7 @@ class BM25Store:
                 continue
             if clinical_department and clinical_department.lower() not in (record.get("clinical_department") or "").lower():
                 continue
-            if not _in_time_range(record.get("publication_date", ""), time_range):
+            if not helper_in_time_range(record.get("publication_date", ""), time_range):
                 continue
             if exclude_reference_sections and record.get("is_reference_section"):
                 continue
@@ -96,11 +96,11 @@ class BM25Store:
         return results[:top_n]
 
 
-def _record_text(record: dict[str, Any], text_field: str) -> str:
+def helper_record_text(record: dict[str, Any], text_field: str) -> str:
     return str(record.get(text_field) or record.get("content") or "")
 
 
-def _card_records(clean_dir: str | Path, cards_path: str | Path | None = None) -> list[dict[str, Any]]:
+def helper_card_records(clean_dir: str | Path, cards_path: str | Path | None = None) -> list[dict[str, Any]]:
     path = Path(cards_path) if cards_path else None
     if path and path.exists():
         return list(read_jsonl(path))
@@ -111,17 +111,17 @@ def _card_records(clean_dir: str | Path, cards_path: str | Path | None = None) -
     return records
 
 
-def _view_records(clean_dir: str | Path, views_path: str | Path | None = None) -> list[dict[str, Any]]:
+def helper_view_records(clean_dir: str | Path, views_path: str | Path | None = None) -> list[dict[str, Any]]:
     path = Path(views_path) if views_path else None
     if path and path.exists():
         return list(read_jsonl(path))
     views: list[dict[str, Any]] = []
-    for card in _card_records(clean_dir):
+    for card in helper_card_records(clean_dir):
         views.extend(build_document_views(card))
     return views
 
 
-def _chunk_records(chunks_path: str | Path) -> list[dict[str, Any]]:
+def helper_chunk_records(chunks_path: str | Path) -> list[dict[str, Any]]:
     path = Path(chunks_path)
     data_dir = path.parent.parent
     return list(iter_normalized_chunks(data_dir, path))
@@ -134,9 +134,9 @@ def build_bm25_indexes(
 ) -> dict[str, Any]:
     out = ensure_dir(output_dir)
     data_dir = Path(output_dir).parent
-    cards = _card_records(clean_dir, data_dir / "document_cards.jsonl")
-    views = _view_records(clean_dir, data_dir / "document_views.jsonl")
-    chunks = _chunk_records(chunks_path) if Path(chunks_path).exists() else []
+    cards = helper_card_records(clean_dir, data_dir / "document_cards.jsonl")
+    views = helper_view_records(clean_dir, data_dir / "document_views.jsonl")
+    chunks = helper_chunk_records(chunks_path) if Path(chunks_path).exists() else []
     cards_payload = {"kind": "document_cards", "records": cards}
     views_payload = {"kind": "document_views", "records": views}
     chunks_payload = {"kind": "chunks", "records": chunks}

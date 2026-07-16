@@ -46,14 +46,14 @@ CHUNK_TYPE_WEIGHTS: dict[str, float] = {
 }
 
 
-def _join_path(section_path: Iterable[object] | None) -> str:
+def helper_join_path(section_path: Iterable[object] | None) -> str:
     return " ".join(str(item) for item in (section_path or []) if item is not None)
 
 
 def classify_section(heading: str = "", section_path: Iterable[object] | None = None, content: str = "") -> str:
     """Return the highest-value semantic type for a section."""
 
-    path_text = _join_path(section_path)
+    path_text = helper_join_path(section_path)
     heading_text = heading or path_text
     haystack = f"{heading_text}\n{path_text}\n{content[:1200]}"
     normalized_heading = (heading_text or "").strip()

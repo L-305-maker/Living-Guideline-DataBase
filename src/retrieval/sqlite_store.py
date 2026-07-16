@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS documents (
     publication_year INTEGER,
     source_institution TEXT NOT NULL DEFAULT 'Unknown',
     clinical_department TEXT NOT NULL DEFAULT '未分类',
+    document_kind TEXT NOT NULL DEFAULT 'guideline',
     source_file TEXT NOT NULL DEFAULT '',
     markdown_raw_path TEXT NOT NULL DEFAULT '',
     markdown_clean_path TEXT NOT NULL DEFAULT '',
@@ -251,6 +252,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS document_views_zh_fts USING fts5(
 
 CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_institution);
 CREATE INDEX IF NOT EXISTS idx_documents_department ON documents(clinical_department);
+CREATE INDEX IF NOT EXISTS idx_documents_kind_department ON documents(document_kind, clinical_department);
 CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(publication_date);
 CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(publication_year);
 CREATE INDEX IF NOT EXISTS idx_documents_pdf_quality ON documents(pdf_text_quality);
@@ -286,24 +288,24 @@ def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def _year(publication_date: str | None) -> int | None:
+def helper_year(publication_date: str | None) -> int | None:
     match = re.search(r"(19\d{2}|20\d{2})", publication_date or "")
     return int(match.group(1)) if match else None
 
 
-def _json(value: Any) -> str:
+def serialize_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _truthy(value: Any) -> bool:
+def helper_truthy(value: Any) -> bool:
     return value is True or str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
-def _section_path_text(section_path: Iterable[Any]) -> str:
+def helper_section_path_text(section_path: Iterable[Any]) -> str:
     return " ".join(str(item) for item in section_path if item is not None)
 
 
-def _enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
+def helper_enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
     chunk_type = str(item.get("chunk_type") or "") or classify_chunk(item)
     item["chunk_type"] = chunk_type
     item["token_count"] = int(item.get("token_count") or estimate_tokens(item.get("content", "")))
@@ -317,7 +319,7 @@ def _enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _zh_token_text(text: str, max_chars: int | None = None) -> str:
+def helper_zh_token_text(text: str, max_chars: int | None = None) -> str:
     if max_chars is not None:
         text = (text or "")[:max_chars]
     tokens: list[str] = []
@@ -345,14 +347,14 @@ def _zh_token_text(text: str, max_chars: int | None = None) -> str:
     return " ".join(tokens)
 
 
-def _fts_query(query: str) -> str:
+def helper_fts_query(query: str) -> str:
     tokens = [token.replace('"', '""') for token in TOKEN_RE.findall(query or "")]
     if not tokens:
         return '""'
     return " OR ".join(f'"{token}"' for token in tokens)
 
 
-def _zh_fts_query(query: str) -> str:
+def helper_zh_fts_query(query: str) -> str:
     tokens: list[str] = []
     seen: set[str] = set()
 
@@ -380,7 +382,7 @@ def _zh_fts_query(query: str) -> str:
     return " OR ".join(f'"{token}"' for token in tokens[:16])
 
 
-def _time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
+def helper_time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
     if not time_range:
         return None, None
     if isinstance(time_range, dict):
@@ -402,13 +404,19 @@ def init_schema(db_path: str | Path = DEFAULT_DB_PATH, reset: bool = False) -> d
             wal_path.unlink()
         if shm_path.exists():
             shm_path.unlink()
-    with connect(path) as conn:
+    conn = connect(path)
+    try:
+        document_columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+        if document_columns and "document_kind" not in document_columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN document_kind TEXT NOT NULL DEFAULT 'guideline'")
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+    finally:
+        conn.close()
     return {"ok": True, "db_path": str(path)}
 
 
-def _clear(conn: sqlite3.Connection) -> None:
+def helper_clear(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM document_views_zh_fts")
     conn.execute("DELETE FROM document_views_fts")
     conn.execute("DELETE FROM document_cards_zh_fts")
@@ -422,7 +430,21 @@ def _clear(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM documents")
 
 
-def _insert_documents(conn: sqlite3.Connection, data_dir: Path) -> int:
+def helper_department_text(record: dict[str, Any]) -> str:
+    labels = record.get("clinical_departments") or [record.get("clinical_department") or "未分类"]
+    return "|".join(dict.fromkeys(str(label) for label in labels if label)) or "未分类"
+
+
+def helper_department_metadata(value: str) -> dict[str, Any]:
+    labels = [label for label in str(value or "").split("|") if label] or ["未分类"]
+    return {
+        "clinical_department": labels[0],
+        "clinical_departments": labels,
+        "department_scope": "compositive" if len(labels) > 1 else "single",
+    }
+
+
+def helper_insert_documents(conn: sqlite3.Connection, data_dir: Path) -> int:
     rows = []
     for rec in read_jsonl(data_dir / "documents.jsonl"):
         clean_path = Path(rec.get("markdown_clean_path") or "")
@@ -432,9 +454,10 @@ def _insert_documents(conn: sqlite3.Connection, data_dir: Path) -> int:
             rec.get("title") or "",
             rec.get("abstract") or "",
             rec.get("publication_date") or "unknown",
-            _year(rec.get("publication_date")),
+            helper_year(rec.get("publication_date")),
             rec.get("source_institution") or "Unknown",
-            rec.get("clinical_department") or "未分类",
+            helper_department_text(rec),
+            rec.get("document_kind") or "guideline",
             rec.get("source_file") or "",
             rec.get("markdown_raw_path") or "",
             rec.get("markdown_clean_path") or "",
@@ -442,42 +465,42 @@ def _insert_documents(conn: sqlite3.Connection, data_dir: Path) -> int:
             rec.get("cleaning_quality") or "",
             rec.get("cleaning_flags") or "",
             rec.get("source_pdf_text_quality") or "",
-            1 if _truthy(rec.get("source_pdf_needs_ocr")) else 0,
-            1 if _truthy(rec.get("source_pdf_is_scanned")) else 0,
+            1 if helper_truthy(rec.get("source_pdf_needs_ocr")) else 0,
+            1 if helper_truthy(rec.get("source_pdf_is_scanned")) else 0,
             rec.get("pdf_text_quality") or "",
-            1 if _truthy(rec.get("pdf_needs_ocr")) else 0,
-            1 if _truthy(rec.get("pdf_is_scanned")) else 0,
+            1 if helper_truthy(rec.get("pdf_needs_ocr")) else 0,
+            1 if helper_truthy(rec.get("pdf_is_scanned")) else 0,
             rec.get("ocr_engine") or "",
-            1 if _truthy(rec.get("ocr_applied")) else 0,
+            1 if helper_truthy(rec.get("ocr_applied")) else 0,
             rec.get("ocr_status") or "",
             rec.get("ocr_error") or "",
             content_for_tokens,
-            _zh_token_text(rec.get("title") or ""),
-            _zh_token_text(rec.get("abstract") or ""),
-            _zh_token_text(content_for_tokens, max_chars=8000),
+            helper_zh_token_text(rec.get("title") or ""),
+            helper_zh_token_text(rec.get("abstract") or ""),
+            helper_zh_token_text(content_for_tokens, max_chars=8000),
         )
         rows.append(row)
     conn.executemany(
         """
         INSERT INTO documents
-        (doc_id, title, abstract, publication_date, publication_year, source_institution, clinical_department, source_file,
+        (doc_id, title, abstract, publication_date, publication_year, source_institution, clinical_department, document_kind, source_file,
          markdown_raw_path, markdown_clean_path, content_sha256, cleaning_quality, cleaning_flags,
          source_pdf_text_quality, source_pdf_needs_ocr,
          source_pdf_is_scanned, pdf_text_quality, pdf_needs_ocr, pdf_is_scanned,
          ocr_engine, ocr_applied, ocr_status, ocr_error, content_md, title_zh_tokens,
          abstract_zh_tokens, content_zh_tokens)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         rows,
     )
     return len(rows)
 
 
-def _document_ids(data_dir: Path) -> set[str]:
+def helper_document_ids(data_dir: Path) -> set[str]:
     return {record["doc_id"] for record in read_jsonl(data_dir / "documents.jsonl")}
 
 
-def _insert_sections(conn: sqlite3.Connection, data_dir: Path, batch_size: int, allowed_doc_ids: set[str]) -> int:
+def helper_insert_sections(conn: sqlite3.Connection, data_dir: Path, batch_size: int, allowed_doc_ids: set[str]) -> int:
     count = 0
     batch = []
     for path in sorted((data_dir / "sections").glob("*.jsonl")):
@@ -485,17 +508,17 @@ def _insert_sections(conn: sqlite3.Connection, data_dir: Path, batch_size: int, 
             if rec.get("doc_id") not in allowed_doc_ids:
                 continue
             section_path = rec.get("section_path") or []
-            section_path_text = _section_path_text(section_path)
+            section_path_text = helper_section_path_text(section_path)
             batch.append(
                 (
                     rec["doc_id"],
                     section_index,
                     rec.get("title") or "",
                     rec.get("publication_date") or "unknown",
-                    _year(rec.get("publication_date")),
+                    helper_year(rec.get("publication_date")),
                     rec.get("source_institution") or "Unknown",
-                    rec.get("clinical_department") or "未分类",
-                    _json(section_path),
+                    helper_department_text(rec),
+                    serialize_json(section_path),
                     section_path_text,
                     rec.get("heading"),
                     rec.get("heading_level"),
@@ -503,9 +526,9 @@ def _insert_sections(conn: sqlite3.Connection, data_dir: Path, batch_size: int, 
                     rec.get("char_end"),
                     1 if rec.get("is_reference_section") else 0,
                     rec.get("content") or "",
-                    _zh_token_text(rec.get("title") or ""),
-                    _zh_token_text(section_path_text),
-                    _zh_token_text(rec.get("content") or "", max_chars=8000),
+                    helper_zh_token_text(rec.get("title") or ""),
+                    helper_zh_token_text(section_path_text),
+                    helper_zh_token_text(rec.get("content") or "", max_chars=8000),
                 )
             )
             if len(batch) >= batch_size:
@@ -536,12 +559,12 @@ def _insert_sections(conn: sqlite3.Connection, data_dir: Path, batch_size: int, 
     return count
 
 
-def _insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: int) -> int:
+def helper_insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: int) -> int:
     count = 0
     rows = []
     for rec in iter_normalized_chunks(data_dir):
         section_path = rec.get("section_path") or []
-        section_path_text = _section_path_text(section_path)
+        section_path_text = helper_section_path_text(section_path)
         content = rec.get("content") or ""
         retrieval_text = rec.get("retrieval_text") or content
         chunk_type = rec.get("chunk_type") or "other"
@@ -550,10 +573,10 @@ def _insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: int) ->
             rec["doc_id"],
             rec.get("title") or "",
             rec.get("publication_date") or "unknown",
-            _year(rec.get("publication_date")),
+            helper_year(rec.get("publication_date")),
             rec.get("source_institution") or "Unknown",
-            rec.get("clinical_department") or "未分类",
-            _json(section_path),
+            helper_department_text(rec),
+            serialize_json(section_path),
             section_path_text,
             rec.get("chunk_index") or 0,
             content,
@@ -565,9 +588,9 @@ def _insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: int) ->
             rec.get("markdown_clean_path") or "",
             1 if rec.get("is_background") else 0,
             1 if rec.get("is_reference_section") else 0,
-            _zh_token_text(rec.get("title") or ""),
-            _zh_token_text(section_path_text),
-            _zh_token_text(retrieval_text, max_chars=8000),
+            helper_zh_token_text(rec.get("title") or ""),
+            helper_zh_token_text(section_path_text),
+            helper_zh_token_text(retrieval_text, max_chars=8000),
         )
         rows.append(row)
         if len(rows) >= batch_size:
@@ -602,7 +625,7 @@ def _insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: int) ->
     return count
 
 
-def _insert_document_cards(conn: sqlite3.Connection, data_dir: Path, allowed_doc_ids: set[str]) -> int:
+def helper_insert_document_cards(conn: sqlite3.Connection, data_dir: Path, allowed_doc_ids: set[str]) -> int:
     path = data_dir / "document_cards.jsonl"
     if not path.exists():
         return 0
@@ -617,26 +640,26 @@ def _insert_document_cards(conn: sqlite3.Connection, data_dir: Path, allowed_doc
             doc_id,
             rec.get("title") or "",
             rec.get("publication_date") or "unknown",
-            _year(rec.get("publication_date")),
+            helper_year(rec.get("publication_date")),
             rec.get("source_institution") or "Unknown",
-            rec.get("clinical_department") or "未分类",
+            helper_department_text(rec),
             rec.get("markdown_clean_path") or "",
             rec.get("cleaning_quality") or "",
             rec.get("cleaning_flags") or "",
             rec.get("source_pdf_text_quality") or "",
-            1 if _truthy(rec.get("source_pdf_needs_ocr")) else 0,
-            1 if _truthy(rec.get("source_pdf_is_scanned")) else 0,
+            1 if helper_truthy(rec.get("source_pdf_needs_ocr")) else 0,
+            1 if helper_truthy(rec.get("source_pdf_is_scanned")) else 0,
             rec.get("pdf_text_quality") or "",
-            1 if _truthy(rec.get("pdf_needs_ocr")) else 0,
-            1 if _truthy(rec.get("pdf_is_scanned")) else 0,
+            1 if helper_truthy(rec.get("pdf_needs_ocr")) else 0,
+            1 if helper_truthy(rec.get("pdf_is_scanned")) else 0,
             rec.get("ocr_engine") or "",
-            1 if _truthy(rec.get("ocr_applied")) else 0,
+            1 if helper_truthy(rec.get("ocr_applied")) else 0,
             rec.get("ocr_status") or "",
             rec.get("ocr_error") or "",
             card_text,
-            _json(fields),
-            _zh_token_text(rec.get("title") or ""),
-            _zh_token_text(card_text, max_chars=12000),
+            serialize_json(fields),
+            helper_zh_token_text(rec.get("title") or ""),
+            helper_zh_token_text(card_text, max_chars=12000),
         )
         rows.append(row)
     if rows:
@@ -655,7 +678,7 @@ def _insert_document_cards(conn: sqlite3.Connection, data_dir: Path, allowed_doc
     return len(rows)
 
 
-def _insert_document_views(conn: sqlite3.Connection, data_dir: Path, allowed_doc_ids: set[str], batch_size: int) -> int:
+def helper_insert_document_views(conn: sqlite3.Connection, data_dir: Path, allowed_doc_ids: set[str], batch_size: int) -> int:
     path = data_dir / "document_views.jsonl"
     if not path.exists():
         return 0
@@ -673,25 +696,25 @@ def _insert_document_views(conn: sqlite3.Connection, data_dir: Path, allowed_doc
             float(rec.get("priority") or 1.0),
             rec.get("title") or "",
             rec.get("publication_date") or "unknown",
-            _year(rec.get("publication_date")),
+            helper_year(rec.get("publication_date")),
             rec.get("source_institution") or "Unknown",
-            rec.get("clinical_department") or "未分类",
+            helper_department_text(rec),
             rec.get("markdown_clean_path") or "",
             rec.get("cleaning_quality") or "",
             rec.get("cleaning_flags") or "",
             rec.get("source_pdf_text_quality") or "",
-            1 if _truthy(rec.get("source_pdf_needs_ocr")) else 0,
-            1 if _truthy(rec.get("source_pdf_is_scanned")) else 0,
+            1 if helper_truthy(rec.get("source_pdf_needs_ocr")) else 0,
+            1 if helper_truthy(rec.get("source_pdf_is_scanned")) else 0,
             rec.get("pdf_text_quality") or "",
-            1 if _truthy(rec.get("pdf_needs_ocr")) else 0,
-            1 if _truthy(rec.get("pdf_is_scanned")) else 0,
+            1 if helper_truthy(rec.get("pdf_needs_ocr")) else 0,
+            1 if helper_truthy(rec.get("pdf_is_scanned")) else 0,
             rec.get("ocr_engine") or "",
-            1 if _truthy(rec.get("ocr_applied")) else 0,
+            1 if helper_truthy(rec.get("ocr_applied")) else 0,
             rec.get("ocr_status") or "",
             rec.get("ocr_error") or "",
             text,
-            _zh_token_text(rec.get("title") or ""),
-            _zh_token_text(text, max_chars=8000),
+            helper_zh_token_text(rec.get("title") or ""),
+            helper_zh_token_text(text, max_chars=8000),
         )
         rows.append(row)
         if len(rows) >= batch_size:
@@ -733,19 +756,19 @@ def build_sqlite_store(
     reset: bool = True,
 ) -> dict[str, Any]:
     data_path = Path(data_dir)
-    allowed_doc_ids = _document_ids(data_path)
+    allowed_doc_ids = helper_document_ids(data_path)
     init_schema(db_path, reset=reset)
     with connect(db_path) as conn:
-        _clear(conn)
-        documents = _insert_documents(conn, data_path)
+        helper_clear(conn)
+        documents = helper_insert_documents(conn, data_path)
         conn.commit()
-        document_cards = _insert_document_cards(conn, data_path, allowed_doc_ids)
+        document_cards = helper_insert_document_cards(conn, data_path, allowed_doc_ids)
         conn.commit()
-        document_views = _insert_document_views(conn, data_path, allowed_doc_ids, batch_size)
+        document_views = helper_insert_document_views(conn, data_path, allowed_doc_ids, batch_size)
         conn.commit()
-        sections = _insert_sections(conn, data_path, batch_size, allowed_doc_ids)
+        sections = helper_insert_sections(conn, data_path, batch_size, allowed_doc_ids)
         conn.commit()
-        chunks = _insert_chunks(conn, data_path, batch_size)
+        chunks = helper_insert_chunks(conn, data_path, batch_size)
         conn.commit()
         conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
         conn.execute("INSERT INTO chunks_zh_fts(chunks_zh_fts) VALUES('rebuild')")
@@ -801,12 +824,13 @@ def stats(db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
     return payload
 
 
-def _metadata_where(
+def helper_metadata_where(
     alias: str,
     source_institution: str | None,
     clinical_department: str | None,
     time_range: str | dict[str, str] | None,
     params: list[Any],
+    document_kind: str | None = None,
 ) -> str:
     clauses = []
     if source_institution:
@@ -815,7 +839,10 @@ def _metadata_where(
     if clinical_department:
         clauses.append(f"{alias}.clinical_department LIKE ?")
         params.append(f"%{clinical_department}%")
-    start, end = _time_range(time_range)
+    if document_kind:
+        clauses.append(f"EXISTS (SELECT 1 FROM documents d_kind WHERE d_kind.doc_id={alias}.doc_id AND d_kind.document_kind=?)")
+        params.append(document_kind)
+    start, end = helper_time_range(time_range)
     if start:
         clauses.append(f"{alias}.publication_date >= ?")
         params.append(start)
@@ -825,7 +852,7 @@ def _metadata_where(
     return " AND " + " AND ".join(clauses) if clauses else ""
 
 
-def _search_document_cards_fts(
+def helper_search_document_cards_fts(
     query: str,
     db_path: str | Path = DEFAULT_DB_PATH,
     source_institution: str | None = None,
@@ -833,12 +860,13 @@ def _search_document_cards_fts(
     time_range: str | dict[str, str] | None = None,
     topk: int = 50,
     zh: bool = False,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     table = "document_cards_zh_fts" if zh else "document_cards_fts"
     weights = "5.0, 3.0" if zh else "5.0, 1.0, 3.0"
-    fts = _zh_fts_query(query) if zh else _fts_query(query)
+    fts = helper_zh_fts_query(query) if zh else helper_fts_query(query)
     params: list[Any] = [fts]
-    metadata_sql = _metadata_where("dc", source_institution, clinical_department, time_range, params)
+    metadata_sql = helper_metadata_where("dc", source_institution, clinical_department, time_range, params, document_kind)
     params.append(topk)
     sql = f"""
         SELECT dc.doc_id, dc.title, dc.card_text, dc.fields_json, dc.publication_date,
@@ -846,6 +874,7 @@ def _search_document_cards_fts(
                dc.source_pdf_text_quality, dc.source_pdf_needs_ocr,
                dc.source_pdf_is_scanned, dc.pdf_text_quality, dc.pdf_needs_ocr, dc.pdf_is_scanned,
                dc.ocr_engine, dc.ocr_applied, dc.ocr_status, dc.ocr_error,
+               -- SQLite FTS5 的 BM25 值越小排名越靠前，返回前会统一取负数作为正向分数。
                bm25({table}, {weights}) AS bm25_score
         FROM {table}
         JOIN document_cards dc ON dc.rowid = {table}.rowid
@@ -888,7 +917,7 @@ def _search_document_cards_fts(
     return results
 
 
-def _search_document_views_fts(
+def helper_search_document_views_fts(
     query: str,
     db_path: str | Path = DEFAULT_DB_PATH,
     source_institution: str | None = None,
@@ -896,12 +925,13 @@ def _search_document_views_fts(
     time_range: str | dict[str, str] | None = None,
     topk: int = 50,
     zh: bool = False,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     table = "document_views_zh_fts" if zh else "document_views_fts"
     weights = "1.5, 4.0, 3.0" if zh else "1.5, 4.0, 1.0, 3.0"
-    fts = _zh_fts_query(query) if zh else _fts_query(query)
+    fts = helper_zh_fts_query(query) if zh else helper_fts_query(query)
     params: list[Any] = [fts]
-    metadata_sql = _metadata_where("v", source_institution, clinical_department, time_range, params)
+    metadata_sql = helper_metadata_where("v", source_institution, clinical_department, time_range, params, document_kind)
     params.append(topk)
     sql = f"""
         SELECT v.view_id, v.doc_id, v.view_type, v.priority, v.title, v.text, v.publication_date,
@@ -909,6 +939,7 @@ def _search_document_views_fts(
                v.source_pdf_text_quality, v.source_pdf_needs_ocr,
                v.source_pdf_is_scanned, v.pdf_text_quality, v.pdf_needs_ocr, v.pdf_is_scanned,
                v.ocr_engine, v.ocr_applied, v.ocr_status, v.ocr_error,
+               -- SQLite FTS5 的 BM25 值越小排名越靠前，返回前会统一取负数作为正向分数。
                bm25({table}, {weights}) AS bm25_score
         FROM {table}
         JOIN document_views v ON v.rowid = {table}.rowid
@@ -947,7 +978,7 @@ def _search_document_views_fts(
     ]
 
 
-def _fuse_document_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
+def helper_fuse_document_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
     rank_lists = [[item["doc_id"] for item in results] for results in result_lists if results]
     if not rank_lists:
         return []
@@ -964,7 +995,7 @@ def _fuse_document_results(result_lists: list[list[dict[str, Any]]], topk: int) 
     return output
 
 
-def _view_results_as_documents(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def helper_view_results_as_documents(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output = []
     seen: set[str] = set()
     for item in results:
@@ -1007,17 +1038,19 @@ def search_documents_sqlite(
     clinical_department: str | None = None,
     time_range: str | dict[str, str] | None = None,
     topk: int = 10,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     pool_size = max(50, topk)
-    card_lexical = _search_document_cards_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=False)
-    card_zh = _search_document_cards_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=True)
-    view_lexical = _view_results_as_documents(
-        _search_document_views_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=False)
+    card_lexical = helper_search_document_cards_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=False, document_kind=document_kind)
+    card_zh = helper_search_document_cards_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=True, document_kind=document_kind)
+    view_lexical = helper_view_results_as_documents(
+        helper_search_document_views_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=False, document_kind=document_kind)
     )
-    view_zh = _view_results_as_documents(
-        _search_document_views_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=True)
+    view_zh = helper_view_results_as_documents(
+        helper_search_document_views_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=True, document_kind=document_kind)
     )
-    return _fuse_document_results([card_zh, card_lexical, view_zh, view_lexical], topk)
+    # 中文分词表与通用词法表分别召回，再按文档 ID 融合，兼顾中英文和混合查询。
+    return helper_fuse_document_results([card_zh, card_lexical, view_zh, view_lexical], topk)
 
 
 def search_document_cards_sqlite(
@@ -1027,14 +1060,15 @@ def search_document_cards_sqlite(
     clinical_department: str | None = None,
     time_range: str | dict[str, str] | None = None,
     topk: int = 50,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     pool_size = max(50, topk)
-    lexical = _search_document_cards_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=False)
-    zh_results = _search_document_cards_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=True)
-    return _fuse_document_results([zh_results, lexical], topk)
+    lexical = helper_search_document_cards_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=False, document_kind=document_kind)
+    zh_results = helper_search_document_cards_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=True, document_kind=document_kind)
+    return helper_fuse_document_results([zh_results, lexical], topk)
 
 
-def _fuse_view_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
+def helper_fuse_view_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
     rank_lists = [[item["view_id"] for item in results] for results in result_lists if results]
     if not rank_lists:
         return []
@@ -1058,14 +1092,15 @@ def search_document_views_sqlite(
     clinical_department: str | None = None,
     time_range: str | dict[str, str] | None = None,
     topk: int = 80,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     pool_size = max(80, topk)
-    lexical = _search_document_views_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=False)
-    zh_results = _search_document_views_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=True)
-    return _fuse_view_results([zh_results, lexical], topk)
+    lexical = helper_search_document_views_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=False, document_kind=document_kind)
+    zh_results = helper_search_document_views_fts(query, db_path, source_institution, clinical_department, time_range, pool_size, zh=True, document_kind=document_kind)
+    return helper_fuse_view_results([zh_results, lexical], topk)
 
 
-def _retrieve_chunks_fts(
+def helper_retrieve_chunks_fts(
     query: str,
     db_path: str | Path = DEFAULT_DB_PATH,
     source_institution: str | None = None,
@@ -1074,21 +1109,23 @@ def _retrieve_chunks_fts(
     topk: int = 50,
     exclude_reference_sections: bool = True,
     zh: bool = False,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     table = "chunks_zh_fts" if zh else "chunks_fts"
     weights = "4.0, 2.0, 1.0" if zh else "4.0, 2.0, 2.0, 1.0"
-    fts = _zh_fts_query(query) if zh else _fts_query(query)
+    fts = helper_zh_fts_query(query) if zh else helper_fts_query(query)
     params: list[Any] = [fts]
     clauses = []
     if exclude_reference_sections:
         clauses.append("c.is_reference_section = 0")
-    metadata_sql = _metadata_where("c", source_institution, clinical_department, time_range, params)
+    metadata_sql = helper_metadata_where("c", source_institution, clinical_department, time_range, params, document_kind)
     base_sql = (" AND " + " AND ".join(clauses)) if clauses else ""
     params.append(topk)
     sql = f"""
         SELECT c.chunk_id, c.doc_id, c.content, c.title, c.publication_date, c.source_institution, c.clinical_department,
                c.section_path, c.chunk_index, c.retrieval_key, c.source_file, c.markdown_clean_path,
                c.retrieval_text, c.chunk_type, c.token_count, c.is_background, c.is_reference_section,
+               -- SQLite FTS5 的 BM25 值越小排名越靠前，返回前会统一取负数作为正向分数。
                bm25({table}, {weights}) AS bm25_score
         FROM {table}
         JOIN chunks c ON c.rowid = {table}.rowid
@@ -1124,11 +1161,11 @@ def _retrieve_chunks_fts(
             "is_background": bool(row["is_background"]),
             "is_reference_section": bool(row["is_reference_section"]),
         }
-        results.append(_enrich_chunk_metadata(item))
+        results.append(helper_enrich_chunk_metadata(item))
     return results
 
 
-def _fuse_chunk_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
+def helper_fuse_chunk_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
     rank_lists = [[item["chunk_id"] for item in results] for results in result_lists if results]
     if not rank_lists:
         return []
@@ -1153,15 +1190,16 @@ def retrieve_chunks_sqlite(
     time_range: str | dict[str, str] | None = None,
     topk: int = 5,
     exclude_reference_sections: bool = True,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     pool_size = max(50, topk)
-    lexical = _retrieve_chunks_fts(
-        query, db_path, source_institution, clinical_department, time_range, pool_size, exclude_reference_sections, zh=False
+    lexical = helper_retrieve_chunks_fts(
+        query, db_path, source_institution, clinical_department, time_range, pool_size, exclude_reference_sections, zh=False, document_kind=document_kind
     )
-    zh_results = _retrieve_chunks_fts(
-        query, db_path, source_institution, clinical_department, time_range, pool_size, exclude_reference_sections, zh=True
+    zh_results = helper_retrieve_chunks_fts(
+        query, db_path, source_institution, clinical_department, time_range, pool_size, exclude_reference_sections, zh=True, document_kind=document_kind
     )
-    return _fuse_chunk_results([zh_results, lexical], topk)
+    return helper_fuse_chunk_results([zh_results, lexical], topk)
 
 
 def read_document_sqlite(
@@ -1174,7 +1212,7 @@ def read_document_sqlite(
         raise ValueError("read_document_sqlite requires either doc_id or title")
     if doc_id:
         sql = """
-            SELECT doc_id, title, publication_date, source_institution, clinical_department,
+            SELECT doc_id, title, publication_date, source_institution, clinical_department, document_kind,
                    source_file, content_md, markdown_clean_path
             FROM documents
             WHERE doc_id=?
@@ -1183,7 +1221,7 @@ def read_document_sqlite(
     else:
         query_title = (title or "").strip()
         sql = """
-            SELECT doc_id, title, publication_date, source_institution, clinical_department,
+            SELECT doc_id, title, publication_date, source_institution, clinical_department, document_kind,
                    source_file, content_md, markdown_clean_path
             FROM documents
             WHERE title = ? OR title LIKE ?
@@ -1213,6 +1251,7 @@ def read_document_sqlite(
         "publication_date": row["publication_date"],
         "source_institution": row["source_institution"],
         "clinical_department": row["clinical_department"],
+        "document_kind": row["document_kind"],
         "source_file": row["source_file"],
         "markdown_clean_path": row["markdown_clean_path"],
         "content": content,

@@ -31,7 +31,7 @@ DOCUMENT_QUALITY_COLUMNS = (
 )
 
 
-def _time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
+def helper_time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
     if not time_range:
         return None, None
     if isinstance(time_range, dict):
@@ -42,7 +42,7 @@ def _time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, st
     return str(time_range), None
 
 
-def _metadata_sql(
+def helper_metadata_sql(
     source_institution: str | None,
     clinical_department: str | None,
     time_range: str | dict[str, str] | None,
@@ -57,7 +57,7 @@ def _metadata_sql(
     if clinical_department:
         clauses.append("clinical_department LIKE ?")
         params.append(f"%{clinical_department}%")
-    start, end = _time_range(time_range)
+    start, end = helper_time_range(time_range)
     if start:
         clauses.append("publication_date >= ?")
         params.append(start)
@@ -72,7 +72,7 @@ def _metadata_sql(
     return (" AND ".join(clauses), params)
 
 
-def _select_by_ids(
+def helper_select_by_ids(
     db_path: str | Path,
     table: str,
     id_field: str,
@@ -83,25 +83,29 @@ def _select_by_ids(
     time_range: str | dict[str, str] | None,
     publication_date: str | None,
     exclude_reference_sections: bool = False,
+    document_kind: str | None = None,
 ) -> dict[str, sqlite3.Row]:
     if not ids:
         return {}
     placeholders = ",".join("?" for _ in ids)
     where = [f"{id_field} IN ({placeholders})"]
     params: list[Any] = list(ids)
-    metadata_where, metadata_params = _metadata_sql(
+    metadata_where, metadata_params = helper_metadata_sql(
         source_institution, clinical_department, time_range, publication_date, exclude_reference_sections
     )
     if metadata_where:
         where.append(metadata_where)
         params.extend(metadata_params)
+    if document_kind:
+        where.append(f"EXISTS (SELECT 1 FROM documents d_kind WHERE d_kind.doc_id={table}.doc_id AND d_kind.document_kind=?)")
+        params.append(document_kind)
     sql = f"SELECT {columns} FROM {table} WHERE " + " AND ".join(where)
     with connect(db_path) as conn:
         rows = conn.execute(sql, params).fetchall()
     return {row[id_field]: row for row in rows}
 
 
-def _doc_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
+def helper_doc_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
     keys = set(row.keys())
 
     def value(name: str, default: Any = "") -> Any:
@@ -111,13 +115,18 @@ def _doc_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
         raw = value(name, False)
         return raw is True or str(raw).strip().lower() in {"1", "true", "yes", "y"}
 
+    department_value = str(row["clinical_department"] or "")
+    departments = [item for item in department_value.split("|") if item] or ["未分类"]
     return {
         "doc_id": row["doc_id"],
         "title": row["title"],
         "abstract": row["abstract"],
         "publication_date": row["publication_date"],
         "source_institution": row["source_institution"],
-        "clinical_department": row["clinical_department"],
+        "clinical_department": departments[0],
+        "clinical_departments": departments,
+        "department_scope": "compositive" if len(departments) > 1 else "single",
+        "document_kind": value("document_kind", "guideline"),
         "cleaning_quality": value("cleaning_quality"),
         "cleaning_flags": value("cleaning_flags"),
         "source_pdf_text_quality": value("source_pdf_text_quality"),
@@ -133,11 +142,13 @@ def _doc_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _chunk_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
+def helper_chunk_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
     try:
         section_path = json.loads(row["section_path"] or "[]")
     except json.JSONDecodeError:
         section_path = []
+    department_value = str(row["clinical_department"] or "")
+    departments = [item for item in department_value.split("|") if item] or ["未分类"]
     item = {
         "chunk_id": row["chunk_id"],
         "doc_id": row["doc_id"],
@@ -145,7 +156,9 @@ def _chunk_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
         "title": row["title"],
         "publication_date": row["publication_date"],
         "source_institution": row["source_institution"],
-        "clinical_department": row["clinical_department"],
+        "clinical_department": departments[0],
+        "clinical_departments": departments,
+        "department_scope": "compositive" if len(departments) > 1 else "single",
         "section_path": section_path,
         "retrieval_text": row["retrieval_text"] if "retrieval_text" in row.keys() else "",
         "chunk_type": row["chunk_type"] if "chunk_type" in row.keys() else "",
@@ -157,10 +170,10 @@ def _chunk_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
         "is_background": bool(row["is_background"]) if "is_background" in row.keys() else False,
         "is_reference_section": bool(row["is_reference_section"]) if "is_reference_section" in row.keys() else False,
     }
-    return _enrich_chunk_metadata(item)
+    return helper_enrich_chunk_metadata(item)
 
 
-def _enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
+def helper_enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
     chunk_type = str(item.get("chunk_type") or "") or classify_chunk(item)
     item["chunk_type"] = chunk_type
     item["token_count"] = int(item.get("token_count") or estimate_tokens(item.get("content", "")))
@@ -174,7 +187,7 @@ def _enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _fuse(
+def helper_fuse(
     id_field: str,
     bm25_results: list[dict[str, Any]],
     vector_results: list[dict[str, Any]],
@@ -204,7 +217,7 @@ def _fuse(
     return output
 
 
-def _query_terms(query: str) -> list[str]:
+def helper_query_terms(query: str) -> list[str]:
     seen: set[str] = set()
     terms: list[str] = []
     for token in TOKEN_RE.findall(query or ""):
@@ -215,31 +228,31 @@ def _query_terms(query: str) -> list[str]:
     return terms
 
 
-def _compact(text: str) -> str:
+def helper_compact(text: str) -> str:
     return re.sub(r"\s+", "", text or "").lower()
 
 
-def _contains_exact_phrase(text: str, query: str) -> bool:
+def helper_contains_exact_phrase(text: str, query: str) -> bool:
     query = (query or "").strip().lower()
     if not query:
         return False
     lowered = (text or "").lower()
     if query in lowered:
         return True
-    compact_query = _compact(query)
-    return bool(compact_query and compact_query in _compact(text))
+    compact_query = helper_compact(query)
+    return bool(compact_query and compact_query in helper_compact(text))
 
 
-def _field_term_hit(text: str, terms: list[str]) -> bool:
+def helper_field_term_hit(text: str, terms: list[str]) -> bool:
     lowered = (text or "").lower()
-    compacted = _compact(text)
+    compacted = helper_compact(text)
     for term in terms:
-        if term in lowered or _compact(term) in compacted:
+        if term in lowered or helper_compact(term) in compacted:
             return True
     return False
 
 
-def _is_journal_header_title(title: str) -> bool:
+def helper_is_journal_header_title(title: str) -> bool:
     normalized = re.sub(r"\s+", " ", title or "").strip()
     if not normalized:
         return True
@@ -253,21 +266,21 @@ def _is_journal_header_title(title: str) -> bool:
     return False
 
 
-def _publication_year(publication_date: str | None) -> int | None:
+def helper_publication_year(publication_date: str | None) -> int | None:
     match = re.search(r"(20\d{2}|19\d{2})", publication_date or "")
     return int(match.group(1)) if match else None
 
 
-def _recency_boost(publication_date: str | None, enabled: bool) -> float:
+def helper_recency_boost(publication_date: str | None, enabled: bool) -> float:
     if not enabled:
         return 0.0
-    year = _publication_year(publication_date)
+    year = helper_publication_year(publication_date)
     if year is None:
         return 0.0
     return max(0.0, min(0.15, (year - 2012) / max(1, 2026 - 2012) * 0.15))
 
 
-def _env_int(name: str, default: int) -> int:
+def helper_env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:
         return default
@@ -277,35 +290,36 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _rerank_documents(
+def helper_rerank_documents(
     items: list[dict[str, Any]],
     query: str,
     source_institution: str | None,
     recency_boost: bool,
     topk: int,
 ) -> list[dict[str, Any]]:
-    terms = _query_terms(query)
+    terms = helper_query_terms(query)
     ranked: list[dict[str, Any]] = []
     for item in items:
         title = item.get("title", "")
         abstract = item.get("abstract", "")
-        if _is_journal_header_title(title):
+        # 期刊页眉常被误识别为标题，直接参与排序会污染高位结果。
+        if helper_is_journal_header_title(title):
             continue
         retrieval_scores = item.get("retrieval_scores", {})
         boosts: dict[str, float] = {}
         matched_fields: list[str] = []
         exact_phrase_fields: list[str] = []
 
-        if _field_term_hit(title, terms):
+        if helper_field_term_hit(title, terms):
             matched_fields.append("title")
             boosts["title"] = 0.35
-        if _field_term_hit(abstract, terms):
+        if helper_field_term_hit(abstract, terms):
             matched_fields.append("abstract")
             boosts["abstract"] = 0.12
-        if _contains_exact_phrase(title, query):
+        if helper_contains_exact_phrase(title, query):
             exact_phrase_fields.append("title")
             boosts["exact_phrase_title"] = 0.45
-        elif _contains_exact_phrase(abstract, query):
+        elif helper_contains_exact_phrase(abstract, query):
             exact_phrase_fields.append("abstract")
             boosts["exact_phrase_abstract"] = 0.2
         if retrieval_scores.get("bm25_rank") is not None:
@@ -318,9 +332,10 @@ def _rerank_documents(
         if GUIDE_RE.search(title):
             matched_fields.append("document_type")
             boosts["guideline_or_consensus"] = 0.18
-        recency = _recency_boost(item.get("publication_date"), recency_boost)
+        recency = helper_recency_boost(item.get("publication_date"), recency_boost)
         if recency:
             boosts["publication_date_recency"] = recency
+        # 关键词和向量同时命中表示不同召回机制达成一致，给予小幅稳定加成。
         if retrieval_scores.get("bm25_rank") is not None and retrieval_scores.get("vector_rank") is not None:
             boosts["bm25_vector_agreement"] = 0.1
 
@@ -328,6 +343,7 @@ def _rerank_documents(
         boost_total = sum(boosts.values())
         quality_multiplier, quality_penalties = quality_score_multiplier(item)
         item = dict(item)
+        # 先叠加匹配加分，再乘质量系数，避免低质量 OCR 文档靠词频占据高位。
         item["score"] = base_score * (1.0 + boost_total) * quality_multiplier
         item["read_key"] = item["doc_id"]
         item["match_reason"] = {
@@ -346,7 +362,7 @@ def _rerank_documents(
             -float(item.get("score", 0.0)),
             item.get("match_reason", {}).get("bm25_rank") is None,
             item.get("match_reason", {}).get("vector_rank") is None,
-            -(_publication_year(item.get("publication_date")) or 0),
+            -(helper_publication_year(item.get("publication_date")) or 0),
             item.get("doc_id", ""),
         )
     )
@@ -381,14 +397,14 @@ def _rerank_documents(
     return standardized
 
 
-def _clip_text(text: str, limit: int) -> str:
+def helper_clip_text(text: str, limit: int) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "..."
 
 
-def _find_chunk_span(markdown_path: str, content: str) -> tuple[int | None, int | None]:
+def helper_find_chunk_span(markdown_path: str, content: str) -> tuple[int | None, int | None]:
     path = Path(markdown_path or "")
     if not path.exists() or not content:
         return None, None
@@ -401,9 +417,11 @@ def _find_chunk_span(markdown_path: str, content: str) -> tuple[int | None, int 
         return None, None
     position = markdown.find(needle)
     if position < 0:
+        # 完整文本可能因清洗产生轻微差异，先用前 300 字做低成本回退定位。
         snippet = needle[:300]
         position = markdown.find(snippet)
         if position < 0:
+            # 最后忽略空白进行匹配，同时保存压缩字符到原文偏移的映射。
             compact_markdown_chars: list[str] = []
             compact_markdown_offsets: list[int] = []
             for index, char in enumerate(markdown):
@@ -423,17 +441,17 @@ def _find_chunk_span(markdown_path: str, content: str) -> tuple[int | None, int 
     return position, position + len(needle)
 
 
-def _source_quote_context(prev_content: str, content: str, next_content: str) -> str:
+def helper_source_quote_context(prev_content: str, content: str, next_content: str) -> str:
     parts = []
     if prev_content:
-        parts.append("[previous] " + _clip_text(prev_content[-500:], 500))
-    parts.append("[current] " + _clip_text(content, 1400))
+        parts.append("[previous] " + helper_clip_text(prev_content[-500:], 500))
+    parts.append("[current] " + helper_clip_text(content, 1400))
     if next_content:
-        parts.append("[next] " + _clip_text(next_content[:500], 500))
+        parts.append("[next] " + helper_clip_text(next_content[:500], 500))
     return "\n".join(parts)
 
 
-def _enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def helper_enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not items:
         return []
     with connect(db_path) as conn:
@@ -445,6 +463,7 @@ def _enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]) -> l
             prev_content = ""
             next_content = ""
             if chunk_index is not None:
+                # 只读取相邻两个 chunk，补充引用上下文而不扩大返回正文。
                 rows = conn.execute(
                     """
                     SELECT chunk_id, chunk_index, content
@@ -475,7 +494,7 @@ def _enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]) -> l
             heading = section["heading"] if section else None
             section_char_start = section["char_start"] if section else None
             section_char_end = section["char_end"] if section else None
-            char_start, char_end = _find_chunk_span(item.get("markdown_clean_path", ""), item.get("content", ""))
+            char_start, char_end = helper_find_chunk_span(item.get("markdown_clean_path", ""), item.get("content", ""))
             if char_start is None:
                 char_start = section_char_start
             if char_end is None:
@@ -483,14 +502,14 @@ def _enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]) -> l
 
             updated = dict(item)
             display_heading = heading or ((item.get("section_path") or [None])[-1])
-            if display_heading and _is_journal_header_title(str(display_heading)):
+            if display_heading and helper_is_journal_header_title(str(display_heading)):
                 display_heading = item.get("title")
             updated["heading"] = display_heading
             updated["prev_chunk_id"] = prev_chunk_id
             updated["next_chunk_id"] = next_chunk_id
             updated["char_start"] = char_start
             updated["char_end"] = char_end
-            updated["source_quote_context"] = _source_quote_context(prev_content, item.get("content", ""), next_content)
+            updated["source_quote_context"] = helper_source_quote_context(prev_content, item.get("content", ""), next_content)
             enriched.append(updated)
     return enriched
 
@@ -504,8 +523,8 @@ def search_documents_hybrid(
     time_range: str | dict[str, str] | None = None,
     publication_date: str | None = None,
     recency_boost: bool = False,
-    topk: int = 10,
-    bm25_top_n: int = 50,
+    topk: int = 20,
+    bm25_top_n: int = 200,
     vector_top_n: int = 50,
 ) -> list[dict[str, Any]]:
     from src.retrieval.document_multiview_search import has_document_representations_sqlite, search_documents_multiview
@@ -529,6 +548,82 @@ def search_documents_hybrid(
     )
 
 
+def helper_route_chunk_candidates(
+    items: list[dict[str, Any]], db_path: str | Path, clinical_department: str | None, top_n: int,
+) -> list[dict[str, Any]]:
+    if not clinical_department:
+        return items[:top_n]
+    doc_ids = list(dict.fromkeys(item["doc_id"] for item in items))
+    scopes: dict[str, str] = {}
+    if doc_ids:
+        placeholders = ",".join("?" for _ in doc_ids)
+        conn = connect(db_path)
+        try:
+            rows = conn.execute(f"SELECT doc_id, clinical_department FROM documents WHERE doc_id IN ({placeholders})", doc_ids).fetchall()
+        finally:
+            conn.close()
+        scopes = {row["doc_id"]: ("compositive" if "|" in str(row["clinical_department"] or "") else "single") for row in rows}
+    single_n = round(top_n * 10 / 11)
+    compositive_n = top_n - single_n
+    single = [item for item in items if scopes.get(item["doc_id"], "single") == "single"][:single_n]
+    compositive = [item for item in items if scopes.get(item["doc_id"]) == "compositive"][:compositive_n]
+    selected_ids = {item["chunk_id"] for item in single + compositive}
+    selected = single + compositive
+    selected.extend(item for item in items if item["chunk_id"] not in selected_ids and len(selected) < top_n)
+    rank = {item["chunk_id"]: index for index, item in enumerate(items)}
+    return sorted(selected, key=lambda item: rank[item["chunk_id"]])[:top_n]
+
+
+def recall_chunks_hybrid(
+    query: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    index_dir: str | Path = DATA_DIR / "index",
+    source_institution: str | None = None,
+    clinical_department: str | None = None,
+    time_range: str | dict[str, str] | None = None,
+    publication_date: str | None = None,
+    topk: int = 100,
+    bm25_top_n: int = 100,
+    vector_top_n: int = 100,
+    exclude_reference_sections: bool = True,
+    document_kind: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fuse BM25 and Dense channels, then return the pre-rerank candidate pool."""
+    channel_n = max(bm25_top_n, vector_top_n, topk)
+    recall_n = channel_n * 10 if clinical_department else channel_n
+    bm25_pool = retrieve_chunks_sqlite(
+        query, db_path, source_institution=source_institution, clinical_department=clinical_department,
+        time_range=time_range, topk=recall_n, exclude_reference_sections=exclude_reference_sections,
+        document_kind=document_kind,
+    )
+    bm25_rows = helper_select_by_ids(
+        db_path, "chunks", "chunk_id", [item["chunk_id"] for item in bm25_pool],
+        "chunk_id, doc_id, content, retrieval_text, chunk_type, token_count, title, publication_date, "
+        "source_institution, clinical_department, section_path, chunk_index, retrieval_key, source_file, "
+        "markdown_clean_path, is_background, is_reference_section",
+        source_institution, clinical_department, time_range, publication_date, exclude_reference_sections, document_kind,
+    )
+    bm25_results = [dict(item) for item in bm25_pool if item["chunk_id"] in bm25_rows][:recall_n]
+
+    index_path = Path(index_dir) / "faiss_chunks.index"
+    mapping_path = Path(index_dir) / "faiss_chunks_mapping.jsonl"
+    vector_ids = vector_search(query, index_path, mapping_path, "chunk_id", top_n=max(recall_n * 4, 200))
+    vector_rows = helper_select_by_ids(
+        db_path, "chunks", "chunk_id", vector_ids,
+        "chunk_id, doc_id, content, retrieval_text, chunk_type, token_count, title, publication_date, "
+        "source_institution, clinical_department, section_path, chunk_index, retrieval_key, source_file, "
+        "markdown_clean_path, is_background, is_reference_section",
+        source_institution, clinical_department, time_range, publication_date, exclude_reference_sections, document_kind,
+    )
+    vector_results = [
+        helper_chunk_row_to_result(vector_rows[chunk_id]) for chunk_id in vector_ids if chunk_id in vector_rows
+    ][:recall_n]
+    fused = helper_fuse("chunk_id", bm25_results, vector_results, max(topk, recall_n * 2))
+    for item in fused:
+        item["document_kind"] = document_kind or item.get("document_kind") or "guideline"
+    return helper_route_chunk_candidates(fused, db_path, clinical_department, topk)
+
+
 def retrieve_chunks_hybrid(
     query: str,
     db_path: str | Path = DEFAULT_DB_PATH,
@@ -537,59 +632,59 @@ def retrieve_chunks_hybrid(
     clinical_department: str | None = None,
     time_range: str | dict[str, str] | None = None,
     publication_date: str | None = None,
-    topk: int = 5,
-    bm25_top_n: int = 50,
-    vector_top_n: int = 50,
+    topk: int = 30,
+    bm25_top_n: int = 100,
+    vector_top_n: int = 100,
     exclude_reference_sections: bool = True,
     reranker: ChunkReranker | None = None,
     rerank_pool_n: int | None = None,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    bm25_pool = retrieve_chunks_sqlite(
-        query,
-        db_path,
-        source_institution=source_institution,
-        clinical_department=clinical_department,
-        time_range=time_range,
-        topk=max(bm25_top_n, topk),
-        exclude_reference_sections=exclude_reference_sections,
+    """BM25+Dense recall top100, optional 10:1 routing, then one rerank to top30."""
+    candidates = recall_chunks_hybrid(
+        query, db_path, index_dir=index_dir, source_institution=source_institution,
+        clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
+        topk=100, bm25_top_n=bm25_top_n, vector_top_n=vector_top_n,
+        exclude_reference_sections=exclude_reference_sections, document_kind=document_kind,
     )
-    bm25_rows = _select_by_ids(
-        db_path,
-        "chunks",
-        "chunk_id",
-        [item["chunk_id"] for item in bm25_pool],
-        "chunk_id, doc_id, content, retrieval_text, chunk_type, token_count, title, publication_date, "
-        "source_institution, clinical_department, section_path, chunk_index, retrieval_key, source_file, "
-        "markdown_clean_path, is_background, is_reference_section",
-        source_institution,
-        clinical_department,
-        time_range,
-        publication_date,
-        exclude_reference_sections,
-    )
-    bm25_results = [dict(item) for item in bm25_pool if item["chunk_id"] in bm25_rows][:bm25_top_n]
-
-    index_path = Path(index_dir) / "faiss_chunks.index"
-    mapping_path = Path(index_dir) / "faiss_chunks_mapping.jsonl"
-    vector_ids = vector_search(query, index_path, mapping_path, "chunk_id", top_n=max(vector_top_n * 4, 200))
-    vector_rows = _select_by_ids(
-        db_path,
-        "chunks",
-        "chunk_id",
-        vector_ids,
-        "chunk_id, doc_id, content, retrieval_text, chunk_type, token_count, title, publication_date, "
-        "source_institution, clinical_department, section_path, chunk_index, retrieval_key, source_file, "
-        "markdown_clean_path, is_background, is_reference_section",
-        source_institution,
-        clinical_department,
-        time_range,
-        publication_date,
-        exclude_reference_sections,
-    )
-    vector_results = [_chunk_row_to_result(vector_rows[chunk_id]) for chunk_id in vector_ids if chunk_id in vector_rows][:vector_top_n]
-    max_pool = max(topk, _env_int("CHUNK_RERANK_POOL_MAX", 120))
-    pool_size = rerank_pool_n or min(max(topk * 8, 50), max_pool)
-    fused = _fuse("chunk_id", bm25_results, vector_results, max(topk, pool_size))
-    enriched = _enrich_chunk_context(db_path, fused)
+    enriched = helper_enrich_chunk_context(db_path, candidates)
     reranker = reranker or default_chunk_reranker()
-    return reranker.rerank(query, enriched, topk)
+    return reranker.rerank(query, enriched, min(topk, 30))
+
+
+def retrieve_chunks_with_consensus_fallback(
+    query: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    index_dir: str | Path = DATA_DIR / "index",
+    source_institution: str | None = None,
+    clinical_department: str | None = None,
+    time_range: str | dict[str, str] | None = None,
+    publication_date: str | None = None,
+    topk: int = 30,
+    exclude_reference_sections: bool = True,
+    reranker: ChunkReranker | None = None,
+) -> list[dict[str, Any]]:
+    """Return guideline chunks first and query consensus only to fill a deficit."""
+    wanted = min(topk, 30)
+    guidelines = retrieve_chunks_hybrid(
+        query, db_path, index_dir=index_dir, source_institution=source_institution,
+        clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
+        topk=wanted, exclude_reference_sections=exclude_reference_sections, reranker=reranker,
+        document_kind="guideline",
+    )
+    output = [{**item, "document_kind": "guideline", "is_fallback": False} for item in guidelines]
+    deficit = wanted - len(output)
+    if deficit <= 0:
+        return output
+    consensus = retrieve_chunks_hybrid(
+        query, db_path, index_dir=index_dir, source_institution=source_institution,
+        clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
+        topk=deficit, exclude_reference_sections=exclude_reference_sections, reranker=reranker,
+        document_kind="consensus",
+    )
+    output.extend(
+        {**item, "document_kind": "consensus", "is_fallback": True,
+         "fallback_reason": "insufficient_guideline_results", "fallback_rank": rank}
+        for rank, item in enumerate(consensus, 1)
+    )
+    return output[:wanted]

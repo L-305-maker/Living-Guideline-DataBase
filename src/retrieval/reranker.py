@@ -44,7 +44,7 @@ class RuleBasedDocumentReranker:
         self.recency_boost = recency_boost
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
-        terms = _query_terms(query)
+        terms = helper_query_terms(query)
         ranked = []
         for candidate in candidates:
             item = dict(candidate)
@@ -55,19 +55,19 @@ class RuleBasedDocumentReranker:
             view_text = "\n".join(str(view.get("text", "")) for view in item.get("matched_views", []))
             chunk_text = "\n".join(str(chunk.get("content", "")) for chunk in item.get("matched_chunks", []))
 
-            if _contains_term(title, terms):
+            if helper_contains_term(title, terms):
                 boosts["title_term"] = 0.20
                 matched_fields.add("title")
-            if _contains_exact_phrase(title, query):
+            if helper_contains_exact_phrase(title, query):
                 boosts["title_exact_phrase"] = 0.35
                 matched_fields.add("title")
-            if _contains_term(card_text, terms):
+            if helper_contains_term(card_text, terms):
                 boosts["document_card_term"] = 0.12
                 matched_fields.add("document_card")
-            if _contains_term(view_text, terms):
+            if helper_contains_term(view_text, terms):
                 boosts["document_view_term"] = 0.12
                 matched_fields.add("document_views")
-            if _contains_term(chunk_text, terms):
+            if helper_contains_term(chunk_text, terms):
                 boosts["chunk_term"] = 0.10
                 matched_fields.add("chunks")
             channel_count = len(item.get("retrieval_scores", {}))
@@ -76,7 +76,7 @@ class RuleBasedDocumentReranker:
             if GUIDE_RE.search(title or ""):
                 boosts["guideline_title"] = 0.08
             if self.recency_boost:
-                boost = _publication_recency_boost(item.get("publication_date"))
+                boost = helper_publication_recency_boost(item.get("publication_date"))
                 if boost:
                     boosts["publication_date_recency"] = boost
 
@@ -96,7 +96,7 @@ class RuleBasedDocumentReranker:
         ranked.sort(
             key=lambda item: (
                 -float(item.get("score", 0.0)),
-                -(_publication_year(item.get("publication_date")) or 0),
+                -(helper_publication_year(item.get("publication_date")) or 0),
                 item.get("doc_id", ""),
             )
         )
@@ -107,7 +107,7 @@ class RuleBasedChunkReranker:
     """Deterministic chunk reranker used as a fast fallback for retrieve."""
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
-        terms = _query_terms(query)
+        terms = helper_query_terms(query)
         ranked: list[dict[str, Any]] = []
         for candidate in candidates:
             item = dict(candidate)
@@ -119,32 +119,32 @@ class RuleBasedChunkReranker:
             boosts: dict[str, float] = {}
             matched_fields = set(item.get("match_reason", {}).get("matched_fields", []))
 
-            if _contains_exact_phrase(content, query):
+            if helper_contains_exact_phrase(content, query):
                 boosts["content_exact_phrase"] = 0.36
                 matched_fields.add("content")
-            if _contains_term(content, terms):
-                overlap = _term_overlap_ratio(content, terms)
+            if helper_contains_term(content, terms):
+                overlap = helper_term_overlap_ratio(content, terms)
                 boosts["content_term_overlap"] = min(0.26, 0.08 + overlap * 0.22)
                 matched_fields.add("content")
-            if _contains_term(section_text, terms):
+            if helper_contains_term(section_text, terms):
                 boosts["section_path_term"] = 0.12
                 matched_fields.add("section_path")
-            if _contains_term(title, terms):
+            if helper_contains_term(title, terms):
                 boosts["title_term"] = 0.08
                 matched_fields.add("title")
-            if source_context and _contains_term(source_context, terms):
+            if source_context and helper_contains_term(source_context, terms):
                 boosts["neighbor_context_term"] = 0.04
                 matched_fields.add("source_quote_context")
 
             chunk_type = str(item.get("chunk_type") or "")
-            type_boost = _chunk_type_boost(chunk_type)
+            type_boost = helper_chunk_type_boost(chunk_type)
             if type_boost:
                 boosts[f"chunk_type_{chunk_type}"] = type_boost
 
             penalty = 0.0
             if item.get("is_reference_section"):
                 penalty += 0.75
-            if _looks_like_reference_section(section_text):
+            if helper_looks_like_reference_section(section_text):
                 penalty += 0.35
 
             base_score = float(item.get("score", 0.0))
@@ -157,7 +157,7 @@ class RuleBasedChunkReranker:
             if penalty:
                 reason["penalty"] = round(penalty, 4)
             item["match_reason"] = reason
-            item["rerank_text_preview"] = _clip_text(searchable_text, 500)
+            item["rerank_text_preview"] = helper_clip_text(searchable_text, 500)
             ranked.append(item)
 
         ranked.sort(
@@ -197,7 +197,7 @@ class BgeM3DocumentReranker:
         self._model: Any | None = None
         self._load_error: str | None = None
 
-    def _load_model(self) -> Any:
+    def helper_load_model(self) -> Any:
         if self._model is not None:
             return self._model
         if self._load_error:
@@ -221,20 +221,23 @@ class BgeM3DocumentReranker:
         if not candidates:
             return []
 
+        # 先执行规则排序，既提供模型不可用时的完整回退，也保留后续融合所需的基础分。
         fallback_ranked = self.fallback.rerank(query, candidates, len(candidates))
         try:
-            model = self._load_model()
-            pairs = [(query, _candidate_rerank_text(candidate, query)) for candidate in fallback_ranked]
+            model = self.helper_load_model()
+            pairs = [(query, helper_candidate_rerank_text(candidate, query)) for candidate in fallback_ranked]
             raw_scores = model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
         except Exception:
-            return self._mark_fallback(fallback_ranked[:topk])
+            return self.helper_mark_fallback(fallback_ranked[:topk])
 
         raw_values = [float(score) for score in raw_scores]
-        model_scores = _normalize_scores(raw_values)
-        base_scores = _normalize_scores([float(item.get("match_reason", {}).get("base_rrf_score", item.get("score", 0.0))) for item in fallback_ranked])
+        # CrossEncoder 原始分数与 RRF 分数范围不同，先分别归一化再做加权融合。
+        model_scores = helper_normalize_scores(raw_values)
+        base_scores = helper_normalize_scores([float(item.get("match_reason", {}).get("base_rrf_score", item.get("score", 0.0))) for item in fallback_ranked])
         output: list[dict[str, Any]] = []
         for item, raw_score, model_score, base_score in zip(fallback_ranked, raw_values, model_scores, base_scores):
             ranked = dict(item)
+            # 清洗质量只作为最终乘数，避免低质量 OCR 文档仅凭语义相似度占据首位。
             quality_multiplier, quality_penalties = quality_score_multiplier(ranked)
             combined = (self.model_weight * model_score) + (self.base_weight * base_score)
             ranked["score"] = combined * quality_multiplier
@@ -253,13 +256,13 @@ class BgeM3DocumentReranker:
         output.sort(
             key=lambda item: (
                 -float(item.get("score", 0.0)),
-                -(_publication_year(item.get("publication_date")) or 0),
+                -(helper_publication_year(item.get("publication_date")) or 0),
                 item.get("doc_id", ""),
             )
         )
         return output[:topk]
 
-    def _mark_fallback(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def helper_mark_fallback(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         output = []
         for item in items:
             updated = dict(item)
@@ -300,7 +303,7 @@ class BgeM3ChunkReranker:
         self._model: Any | None = None
         self._load_error: str | None = None
 
-    def _load_model(self) -> Any:
+    def helper_load_model(self) -> Any:
         if self._model is not None:
             return self._model
         if self._load_error:
@@ -324,20 +327,23 @@ class BgeM3ChunkReranker:
         if not candidates:
             return []
 
+        # 分块重排也先保留规则结果；模型加载或推理失败时可返回可解释的降级排序。
         fallback_ranked = self.fallback.rerank(query, candidates, len(candidates))
         try:
-            model = self._load_model()
-            pairs = [(query, _chunk_rerank_text(candidate)) for candidate in fallback_ranked]
+            model = self.helper_load_model()
+            pairs = [(query, helper_chunk_rerank_text(candidate)) for candidate in fallback_ranked]
             raw_scores = model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
         except Exception:
-            return self._mark_fallback(fallback_ranked[:topk])
+            return self.helper_mark_fallback(fallback_ranked[:topk])
 
         raw_values = [float(score) for score in raw_scores]
-        model_scores = _normalize_scores(raw_values)
-        base_scores = _normalize_scores(
+        # CrossEncoder 原始分数与 RRF 分数范围不同，先分别归一化再做加权融合。
+        model_scores = helper_normalize_scores(raw_values)
+        base_scores = helper_normalize_scores(
             [float(item.get("match_reason", {}).get("base_rrf_score", item.get("score", 0.0))) for item in fallback_ranked]
         )
-        rule_scores = _normalize_scores([float(item.get("score", 0.0)) for item in fallback_ranked])
+        # 规则分与基础 RRF 分承担不同职责，分别归一化后保留为两个独立融合信号。
+        rule_scores = helper_normalize_scores([float(item.get("score", 0.0)) for item in fallback_ranked])
         output: list[dict[str, Any]] = []
         for item, raw_score, model_score, base_score, rule_score in zip(
             fallback_ranked, raw_values, model_scores, base_scores, rule_scores
@@ -367,7 +373,7 @@ class BgeM3ChunkReranker:
         )
         return output[:topk]
 
-    def _mark_fallback(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def helper_mark_fallback(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         output = []
         for item in items:
             updated = dict(item)
@@ -384,57 +390,57 @@ class BgeM3ChunkReranker:
 def default_document_reranker(recency_boost: bool = False) -> DocumentReranker:
     mode = os.getenv("DOCUMENT_RERANKER", "bge_m3").strip().lower()
     if mode in {"none", "noop", "off"}:
-        return _cached_noop_document_reranker()
+        return helper_cached_noop_document_reranker()
     if mode in {"rule", "rules", "rule_based"}:
-        return _cached_rule_document_reranker(recency_boost)
+        return helper_cached_rule_document_reranker(recency_boost)
     local_only = os.getenv("BGE_RERANKER_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
     batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "16"))
     max_length = int(os.getenv("BGE_RERANKER_MAX_LENGTH", "1024"))
-    return _cached_bge_document_reranker(
+    return helper_cached_bge_document_reranker(
         os.getenv("BGE_RERANKER_MODEL", DEFAULT_BGE_RERANKER_MODEL),
         recency_boost,
         batch_size,
         max_length,
         os.getenv("BGE_RERANKER_DEVICE") or "",
         local_only,
-        _env_float("BGE_DOCUMENT_RERANKER_MODEL_WEIGHT", 0.86),
-        _env_float("BGE_DOCUMENT_RERANKER_BASE_WEIGHT", 0.14),
+        helper_env_float("BGE_DOCUMENT_RERANKER_MODEL_WEIGHT", 0.86),
+        helper_env_float("BGE_DOCUMENT_RERANKER_BASE_WEIGHT", 0.14),
     )
 
 
 def default_chunk_reranker() -> ChunkReranker:
     mode = os.getenv("CHUNK_RERANKER", os.getenv("RERANKER", "bge_m3")).strip().lower()
     if mode in {"none", "noop", "off"}:
-        return _cached_noop_chunk_reranker()
+        return helper_cached_noop_chunk_reranker()
     if mode in {"rule", "rules", "rule_based"}:
-        return _cached_rule_chunk_reranker()
+        return helper_cached_rule_chunk_reranker()
     local_only = os.getenv("BGE_RERANKER_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
     batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "16"))
     max_length = int(os.getenv("BGE_RERANKER_MAX_LENGTH", "1024"))
-    return _cached_bge_chunk_reranker(
+    return helper_cached_bge_chunk_reranker(
         os.getenv("BGE_RERANKER_MODEL", DEFAULT_BGE_RERANKER_MODEL),
         batch_size,
         max_length,
         os.getenv("BGE_RERANKER_DEVICE") or "",
         local_only,
-        _env_float("BGE_CHUNK_RERANKER_MODEL_WEIGHT", 0.84),
-        _env_float("BGE_CHUNK_RERANKER_BASE_WEIGHT", 0.10),
-        _env_float("BGE_CHUNK_RERANKER_RULE_WEIGHT", 0.06),
+        helper_env_float("BGE_CHUNK_RERANKER_MODEL_WEIGHT", 0.84),
+        helper_env_float("BGE_CHUNK_RERANKER_BASE_WEIGHT", 0.10),
+        helper_env_float("BGE_CHUNK_RERANKER_RULE_WEIGHT", 0.06),
     )
 
 
 @lru_cache(maxsize=2)
-def _cached_noop_document_reranker() -> NoopDocumentReranker:
+def helper_cached_noop_document_reranker() -> NoopDocumentReranker:
     return NoopDocumentReranker()
 
 
 @lru_cache(maxsize=4)
-def _cached_rule_document_reranker(recency_boost: bool) -> RuleBasedDocumentReranker:
+def helper_cached_rule_document_reranker(recency_boost: bool) -> RuleBasedDocumentReranker:
     return RuleBasedDocumentReranker(recency_boost=recency_boost)
 
 
 @lru_cache(maxsize=8)
-def _cached_bge_document_reranker(
+def helper_cached_bge_document_reranker(
     model_name: str,
     recency_boost: bool,
     batch_size: int,
@@ -457,17 +463,17 @@ def _cached_bge_document_reranker(
 
 
 @lru_cache(maxsize=2)
-def _cached_noop_chunk_reranker() -> NoopChunkReranker:
+def helper_cached_noop_chunk_reranker() -> NoopChunkReranker:
     return NoopChunkReranker()
 
 
 @lru_cache(maxsize=2)
-def _cached_rule_chunk_reranker() -> RuleBasedChunkReranker:
+def helper_cached_rule_chunk_reranker() -> RuleBasedChunkReranker:
     return RuleBasedChunkReranker()
 
 
 @lru_cache(maxsize=8)
-def _cached_bge_chunk_reranker(
+def helper_cached_bge_chunk_reranker(
     model_name: str,
     batch_size: int,
     max_length: int,
@@ -489,7 +495,7 @@ def _cached_bge_chunk_reranker(
     )
 
 
-def _env_float(name: str, default: float) -> float:
+def helper_env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None:
         return default
@@ -499,7 +505,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _query_terms(query: str) -> list[str]:
+def helper_query_terms(query: str) -> list[str]:
     seen: set[str] = set()
     terms = []
     for token in TOKEN_RE.findall(query or ""):
@@ -510,42 +516,42 @@ def _query_terms(query: str) -> list[str]:
     return terms
 
 
-def _clip_text(text: str, limit: int) -> str:
+def helper_clip_text(text: str, limit: int) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "..."
 
 
-def _candidate_rerank_text(candidate: dict[str, Any], query: str = "") -> str:
+def helper_candidate_rerank_text(candidate: dict[str, Any], query: str = "") -> str:
     card = candidate.get("document_card") or {}
     views = candidate.get("matched_views") or []
     chunks = candidate.get("matched_chunks") or []
-    terms = _query_terms(query)
+    terms = helper_query_terms(query)
     parts = [
         f"Title: {candidate.get('title', '')}",
-        f"Abstract: {_clip_text(candidate.get('abstract', ''), 900)}",
+        f"Abstract: {helper_clip_text(candidate.get('abstract', ''), 900)}",
         f"Source: {candidate.get('source_institution', '')}",
         f"Department: {candidate.get('clinical_department', '')}",
         f"Publication date: {candidate.get('publication_date', '')}",
     ]
     card_text = card.get("card_text", "")
     if card_text:
-        parts.append("Document card: " + _clip_text(card_text, 1400))
-    sorted_views = _sort_text_items_by_query(views, terms, "text")
+        parts.append("Document card: " + helper_clip_text(card_text, 1400))
+    sorted_views = helper_sort_text_items_by_query(views, terms, "text")
     view_text = "\n".join(
-        f"{view.get('view_type', 'view')}: {_clip_text(str(view.get('text', '')), 700)}" for view in sorted_views[:4]
+        f"{view.get('view_type', 'view')}: {helper_clip_text(str(view.get('text', '')), 700)}" for view in sorted_views[:4]
     )
     if view_text:
         parts.append("Matched views:\n" + view_text)
-    sorted_chunks = _sort_text_items_by_query(chunks, terms, "content")
-    chunk_text = "\n".join(_clip_text(str(chunk.get("content", "")), 700) for chunk in sorted_chunks[:5])
+    sorted_chunks = helper_sort_text_items_by_query(chunks, terms, "content")
+    chunk_text = "\n".join(helper_clip_text(str(chunk.get("content", "")), 700) for chunk in sorted_chunks[:5])
     if chunk_text:
         parts.append("Matched chunks:\n" + chunk_text)
     return "\n\n".join(part for part in parts if part.strip())
 
 
-def _chunk_rerank_text(candidate: dict[str, Any]) -> str:
+def helper_chunk_rerank_text(candidate: dict[str, Any]) -> str:
     parts = [
         f"Title: {candidate.get('title', '')}",
         f"Source: {candidate.get('source_institution', '')}",
@@ -553,27 +559,27 @@ def _chunk_rerank_text(candidate: dict[str, Any]) -> str:
         f"Publication date: {candidate.get('publication_date', '')}",
         f"Section: {' > '.join(str(part) for part in candidate.get('section_path') or [])}",
         f"Chunk type: {candidate.get('chunk_type', '')}",
-        "Content: " + _clip_text(str(candidate.get("content", "")), 1500),
+        "Content: " + helper_clip_text(str(candidate.get("content", "")), 1500),
     ]
     context = str(candidate.get("source_quote_context") or "")
     if context:
-        parts.append("Neighbor context: " + _clip_text(context, 700))
+        parts.append("Neighbor context: " + helper_clip_text(context, 700))
     return "\n\n".join(part for part in parts if part.strip())
 
 
-def _sort_text_items_by_query(items: list[dict[str, Any]], terms: list[str], text_key: str) -> list[dict[str, Any]]:
+def helper_sort_text_items_by_query(items: list[dict[str, Any]], terms: list[str], text_key: str) -> list[dict[str, Any]]:
     if not terms:
         return items
     return sorted(
         items,
         key=lambda item: (
-            -_term_overlap_ratio(str(item.get(text_key) or ""), terms),
+            -helper_term_overlap_ratio(str(item.get(text_key) or ""), terms),
             -float(item.get("priority") or 0.0),
         ),
     )
 
 
-def _normalize_scores(scores: list[float]) -> list[float]:
+def helper_normalize_scores(scores: list[float]) -> list[float]:
     if not scores:
         return []
     low = min(scores)
@@ -583,33 +589,33 @@ def _normalize_scores(scores: list[float]) -> list[float]:
     return [1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, score)))) for score in scores]
 
 
-def _compact(text: str) -> str:
+def helper_compact(text: str) -> str:
     return re.sub(r"\s+", "", text or "").lower()
 
 
-def _contains_term(text: str, terms: list[str]) -> bool:
+def helper_contains_term(text: str, terms: list[str]) -> bool:
     lowered = (text or "").lower()
-    compacted = _compact(text)
-    return any(term in lowered or _compact(term) in compacted for term in terms)
+    compacted = helper_compact(text)
+    return any(term in lowered or helper_compact(term) in compacted for term in terms)
 
 
-def _term_overlap_ratio(text: str, terms: list[str]) -> float:
+def helper_term_overlap_ratio(text: str, terms: list[str]) -> float:
     if not terms:
         return 0.0
     lowered = (text or "").lower()
-    compacted = _compact(text)
-    hits = sum(1 for term in terms if term in lowered or _compact(term) in compacted)
+    compacted = helper_compact(text)
+    hits = sum(1 for term in terms if term in lowered or helper_compact(term) in compacted)
     return hits / len(terms)
 
 
-def _contains_exact_phrase(text: str, query: str) -> bool:
+def helper_contains_exact_phrase(text: str, query: str) -> bool:
     query = (query or "").strip().lower()
     if not query:
         return False
-    return query in (text or "").lower() or _compact(query) in _compact(text)
+    return query in (text or "").lower() or helper_compact(query) in helper_compact(text)
 
 
-def _chunk_type_boost(chunk_type: str) -> float:
+def helper_chunk_type_boost(chunk_type: str) -> float:
     return {
         "recommendation": 0.18,
         "key_message": 0.14,
@@ -620,27 +626,27 @@ def _chunk_type_boost(chunk_type: str) -> float:
     }.get(chunk_type, 0.0)
 
 
-def _looks_like_reference_section(section_text: str) -> bool:
+def helper_looks_like_reference_section(section_text: str) -> bool:
     return bool(re.search(r"(references?|bibliography|\u53c2\u8003\u6587\u732e)", section_text or "", re.I))
 
 
-def _publication_year(publication_date: str | None) -> int | None:
+def helper_publication_year(publication_date: str | None) -> int | None:
     match = re.search(r"(20\d{2}|19\d{2})", publication_date or "")
     return int(match.group(1)) if match else None
 
 
-def _publication_recency_boost(publication_date: str | None) -> float:
-    year = _publication_year(publication_date)
+def helper_publication_recency_boost(publication_date: str | None) -> float:
+    year = helper_publication_year(publication_date)
     if year is None:
         return 0.0
     return max(0.0, min(0.12, (year - 2012) / max(1, 2026 - 2012) * 0.12))
 
 
-def _truthy(value: Any) -> bool:
+def helper_truthy(value: Any) -> bool:
     return value is True or str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
-def _quality_text(item: dict[str, Any], key: str) -> str:
+def helper_quality_text(item: dict[str, Any], key: str) -> str:
     direct = str(item.get(key) or "").strip().lower()
     if direct:
         return direct
@@ -648,24 +654,24 @@ def _quality_text(item: dict[str, Any], key: str) -> str:
     return str(card.get(key) or "").strip().lower()
 
 
-def _quality_bool(item: dict[str, Any], key: str) -> bool:
+def helper_quality_bool(item: dict[str, Any], key: str) -> bool:
     if key in item:
-        return _truthy(item.get(key))
+        return helper_truthy(item.get(key))
     card = item.get("document_card") or {}
-    return _truthy(card.get(key))
+    return helper_truthy(card.get(key))
 
 
 def quality_score_multiplier(item: dict[str, Any]) -> tuple[float, dict[str, float]]:
     """Return a conservative score multiplier and its explainable penalties."""
 
     penalties: dict[str, float] = {}
-    cleaning_quality = _quality_text(item, "cleaning_quality")
-    pdf_text_quality = _quality_text(item, "pdf_text_quality")
-    source_pdf_text_quality = _quality_text(item, "source_pdf_text_quality")
-    ocr_status = _quality_text(item, "ocr_status")
+    cleaning_quality = helper_quality_text(item, "cleaning_quality")
+    pdf_text_quality = helper_quality_text(item, "pdf_text_quality")
+    source_pdf_text_quality = helper_quality_text(item, "source_pdf_text_quality")
+    ocr_status = helper_quality_text(item, "ocr_status")
     cleaning_flags = {
         flag.strip()
-        for flag in re.split(r"[,;]\s*", _quality_text(item, "cleaning_flags"))
+        for flag in re.split(r"[,;]\s*", helper_quality_text(item, "cleaning_flags"))
         if flag.strip()
     }
 
@@ -677,13 +683,13 @@ def quality_score_multiplier(item: dict[str, Any]) -> tuple[float, dict[str, flo
         penalties["pdf_text_quality_poor"] = 0.24
     elif pdf_text_quality == "warning":
         penalties["pdf_text_quality_warning"] = 0.08
-    if _quality_bool(item, "pdf_needs_ocr"):
+    if helper_quality_bool(item, "pdf_needs_ocr"):
         penalties["pdf_needs_ocr"] = 0.18
     if ocr_status in OCR_UNRESOLVED_STATUSES:
         penalties[f"ocr_status_{ocr_status}"] = 0.24
     elif ocr_status in OCR_REVIEW_STATUSES:
         penalties[f"ocr_status_{ocr_status}"] = 0.14
-    if not ocr_status and source_pdf_text_quality == "poor" and _quality_bool(item, "source_pdf_needs_ocr"):
+    if not ocr_status and source_pdf_text_quality == "poor" and helper_quality_bool(item, "source_pdf_needs_ocr"):
         penalties["source_pdf_needs_ocr_unresolved"] = 0.14
     if HIGH_RISK_CLEANING_FLAGS & cleaning_flags:
         penalties["high_risk_cleaning_flags"] = 0.18

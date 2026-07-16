@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterator
 
+from src.utils.clinical_department import classify_chunk_departments
 from src.utils.io import DATA_DIR, read_jsonl
 
 
@@ -25,7 +26,7 @@ def iter_normalized_chunks(
     path = Path(chunks_path) if chunks_path else data_path / "chunks" / "all_chunks.jsonl"
     per_doc_index: dict[str, int] = {}
     for record in read_jsonl(path):
-        doc_id = _doc_id(record)
+        doc_id = helper_doc_id(record)
         chunk_index = record.get("chunk_index")
         if chunk_index is None:
             chunk_index = per_doc_index.get(doc_id, 0)
@@ -38,14 +39,16 @@ def normalize_chunk_record(
     documents: dict[str, dict[str, Any]] | None = None,
     chunk_index: int = 0,
 ) -> dict[str, Any]:
-    doc_id = _doc_id(record)
+    doc_id = helper_doc_id(record)
     doc = (documents or {}).get(doc_id, {})
-    section_path = _list(record.get("section_path") or record.get("heading_path") or [])
+    section_path = as_list(record.get("section_path") or record.get("heading_path") or [])
     chunk_type = str(record.get("chunk_type") or "other")
     content = str(record.get("content") or record.get("text") or record.get("recommendation") or "")
     title = str(record.get("title") or doc.get("title") or (section_path[0] if section_path else ""))
-    text_for_embedding = str(record.get("text_for_embedding") or _embedding_text(section_path, chunk_type, content))
+    text_for_embedding = str(record.get("text_for_embedding") or helper_embedding_text(section_path, chunk_type, content))
     retrieval = str(record.get("retrieval_text") or text_for_embedding)
+    parent_departments = doc.get("clinical_departments") or [doc.get("clinical_department") or "未分类"]
+    department_result = classify_chunk_departments(section_path, content, parent_departments, chunk_type)
 
     normalized = dict(record)
     normalized.update(
@@ -54,7 +57,10 @@ def normalize_chunk_record(
             "title": title,
             "publication_date": record.get("publication_date") or doc.get("publication_date") or "unknown",
             "source_institution": record.get("source_institution") or doc.get("source_institution") or "Unknown",
-            "clinical_department": record.get("clinical_department") or doc.get("clinical_department") or "未分类",
+            "clinical_department": department_result["clinical_department"],
+            "clinical_departments": department_result["clinical_departments"],
+            "department_scope": department_result["department_scope"],
+            "document_kind": record.get("document_kind") or doc.get("document_kind") or "guideline",
             "section_path": section_path,
             "chunk_index": int(record.get("chunk_index") if record.get("chunk_index") is not None else chunk_index),
             "content": content,
@@ -68,21 +74,21 @@ def normalize_chunk_record(
             "is_reference_section": bool(record.get("is_reference_section")),
             "text_for_embedding": text_for_embedding,
             "recommendation": record.get("recommendation") or "",
-            "evidence": _list(record.get("evidence") or []),
+            "evidence": as_list(record.get("evidence") or []),
             "metadata": record.get("metadata") or {},
         }
     )
     return normalized
 
 
-def _doc_id(record: dict[str, Any]) -> str:
+def helper_doc_id(record: dict[str, Any]) -> str:
     doc_id = record.get("doc_id") or record.get("source_doc_id")
     if not doc_id:
         raise KeyError("chunk record missing doc_id/source_doc_id")
     return str(doc_id)
 
 
-def _list(value: Any) -> list[Any]:
+def as_list(value: Any) -> list[Any]:
     if value is None:
         return []
     if isinstance(value, list):
@@ -90,7 +96,7 @@ def _list(value: Any) -> list[Any]:
     return [value]
 
 
-def _embedding_text(section_path: list[Any], chunk_type: str, content: str) -> str:
+def helper_embedding_text(section_path: list[Any], chunk_type: str, content: str) -> str:
     return "\n".join(
         [
             "[GUIDELINE SECTION]: " + " > ".join(str(item) for item in section_path),

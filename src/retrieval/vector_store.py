@@ -9,17 +9,23 @@ from pathlib import Path
 from functools import lru_cache
 from typing import Any, Iterable, Iterator
 
-from src.retrieval.bm25_store import _card_records, _view_records
+from src.retrieval.bm25_store import helper_card_records, helper_view_records
 from src.retrieval.chunk_normalizer import iter_normalized_chunks
 from src.utils.io import DATA_DIR, ensure_dir, ensure_parent, read_jsonl
 
 
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
+DEFAULT_EMBEDDING_MODEL = os.getenv("BGE_VECTOR_MODEL", "BAAI/bge-m3")
 DEFAULT_LOCAL_FILES_ONLY = os.getenv("BGE_VECTOR_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
 DEFAULT_FP16 = os.getenv("BGE_VECTOR_FP16", "1").strip().lower() not in {"0", "false", "no"}
 
 
-def _load_vector_dependencies():
+def vector_retrieval_required(required: bool | None = None) -> bool:
+    if required is not None:
+        return required
+    return os.getenv("VECTOR_RETRIEVAL_REQUIRED", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def helper_load_vector_dependencies():
     try:
         import faiss  # type: ignore
         import numpy as np  # type: ignore
@@ -30,12 +36,12 @@ def _load_vector_dependencies():
 
 
 @lru_cache(maxsize=4)
-def _cached_model(model_name: str, local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY):
-    _faiss, _np, SentenceTransformer = _load_vector_dependencies()
+def helper_cached_model(model_name: str, local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY):
+    _faiss, _np, SentenceTransformer = helper_load_vector_dependencies()
     return SentenceTransformer(model_name, local_files_only=local_files_only)
 
 
-def _batched(records: Iterable[dict[str, Any]], batch_size: int) -> Iterator[list[dict[str, Any]]]:
+def helper_batched(records: Iterable[dict[str, Any]], batch_size: int) -> Iterator[list[dict[str, Any]]]:
     batch: list[dict[str, Any]] = []
     for record in records:
         batch.append(record)
@@ -46,21 +52,21 @@ def _batched(records: Iterable[dict[str, Any]], batch_size: int) -> Iterator[lis
         yield batch
 
 
-def _limited(records: Iterable[dict[str, Any]], limit: int | None) -> Iterator[dict[str, Any]]:
+def helper_limited(records: Iterable[dict[str, Any]], limit: int | None) -> Iterator[dict[str, Any]]:
     for index, record in enumerate(records):
         if limit is not None and index >= limit:
             break
         yield record
 
 
-def _count_jsonl(path: Path) -> int:
+def helper_count_jsonl(path: Path) -> int:
     if not path.exists():
         return 0
     with path.open("r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
 
 
-def _allowed_doc_ids(documents_path: str | Path | None) -> set[str] | None:
+def helper_allowed_doc_ids(documents_path: str | Path | None) -> set[str] | None:
     if documents_path is None:
         return None
     path = Path(documents_path)
@@ -69,7 +75,7 @@ def _allowed_doc_ids(documents_path: str | Path | None) -> set[str] | None:
     return {str(record["doc_id"]) for record in read_jsonl(path) if record.get("doc_id")}
 
 
-def _encode(model: Any, texts: list[str], normalize_embeddings: bool = True):
+def helper_encode(model: Any, texts: list[str], normalize_embeddings: bool = True):
     return model.encode(
         texts,
         batch_size=len(texts),
@@ -79,7 +85,7 @@ def _encode(model: Any, texts: list[str], normalize_embeddings: bool = True):
     ).astype("float32")
 
 
-def _maybe_half(model: Any, device: str | None, fp16: bool) -> None:
+def helper_maybe_half(model: Any, device: str | None, fp16: bool) -> None:
     if not fp16 or not (device or "").startswith("cuda"):
         return
     try:
@@ -88,11 +94,11 @@ def _maybe_half(model: Any, device: str | None, fp16: bool) -> None:
         return
 
 
-def _record_text(record: dict[str, Any], text_field: str) -> str:
+def helper_record_text(record: dict[str, Any], text_field: str) -> str:
     return str(record.get(text_field) or record.get("content") or "")
 
 
-def _build_index_stream(
+def helper_build_index_stream(
     records: Iterable[dict[str, Any]],
     text_field: str,
     id_field: str,
@@ -107,11 +113,11 @@ def _build_index_stream(
     local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY,
     fp16: bool = DEFAULT_FP16,
 ) -> dict[str, Any]:
-    faiss, _np, SentenceTransformer = _load_vector_dependencies()
+    faiss, _np, SentenceTransformer = helper_load_vector_dependencies()
     model_kwargs = {"device": device} if device else {}
     model_kwargs["local_files_only"] = local_files_only
     model = SentenceTransformer(model_name, **model_kwargs)
-    _maybe_half(model, device, fp16)
+    helper_maybe_half(model, device, fp16)
     if max_seq_length:
         model.max_seq_length = max_seq_length
     ensure_dir(index_path.parent)
@@ -123,9 +129,9 @@ def _build_index_stream(
     count = 0
     dim = None
     with Path(tmp_mapping_path).open("w", encoding="utf-8", newline="\n") as mapping_handle:
-        for batch in _batched(_limited(records, limit), batch_size):
-            texts = [_record_text(record, text_field) for record in batch]
-            vectors = _encode(model, texts)
+        for batch in helper_batched(helper_limited(records, limit), batch_size):
+            texts = [helper_record_text(record, text_field) for record in batch]
+            vectors = helper_encode(model, texts)
             if index is None:
                 dim = int(vectors.shape[1])
                 index = faiss.IndexFlatIP(dim)
@@ -145,7 +151,7 @@ def _build_index_stream(
     return {"count": count, "dim": dim}
 
 
-def _build_index_shards(
+def helper_build_index_shards(
     records: Iterable[dict[str, Any]],
     text_field: str,
     id_field: str,
@@ -161,16 +167,17 @@ def _build_index_shards(
     local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY,
     fp16: bool = DEFAULT_FP16,
 ) -> dict[str, Any]:
-    faiss, _np, SentenceTransformer = _load_vector_dependencies()
+    faiss, _np, SentenceTransformer = helper_load_vector_dependencies()
     model_kwargs = {"device": device} if device else {}
     model_kwargs["local_files_only"] = local_files_only
     model = SentenceTransformer(model_name, **model_kwargs)
-    _maybe_half(model, device, fp16)
+    helper_maybe_half(model, device, fp16)
     if max_seq_length:
         model.max_seq_length = max_seq_length
     ensure_dir(shard_dir)
     ensure_parent(manifest_path)
 
+    # 清单记录模型、字段和分片顺序；检索端只依赖该清单即可遍历全部分片。
     manifest: dict[str, Any] = {
         "model": model_name,
         "id_field": id_field,
@@ -187,7 +194,8 @@ def _build_index_shards(
         index_path = shard_dir / f"shard_{shard_no:05d}.index"
         mapping_path = shard_dir / f"shard_{shard_no:05d}_mapping.jsonl"
         expected = len(shard_records)
-        if index_path.exists() and mapping_path.exists() and _count_jsonl(mapping_path) == expected:
+        if index_path.exists() and mapping_path.exists() and helper_count_jsonl(mapping_path) == expected:
+            # 不能只比较条数：相同数量但顺序不同会让 FAISS 行号指向错误业务 ID。
             expected_ids = [record[id_field] for record in shard_records]
             existing_ids = [record.get(id_field) for record in read_jsonl(mapping_path)]
             if existing_ids == expected_ids:
@@ -199,16 +207,18 @@ def _build_index_shards(
                     "skipped_existing": True,
                 }
 
+        # 索引和映射先写临时文件，再分别原子替换，避免中断时留下半写入文件。
         tmp_index_path = index_path.with_name(index_path.name + ".tmp")
         tmp_mapping_path = mapping_path.with_name(mapping_path.name + ".tmp")
         index = None
         local_count = 0
         dim = None
         with tmp_mapping_path.open("w", encoding="utf-8", newline="\n") as mapping_handle:
-            for batch in _batched(shard_records, batch_size):
-                texts = [_record_text(record, text_field) for record in batch]
-                vectors = _encode(model, texts)
+            for batch in helper_batched(shard_records, batch_size):
+                texts = [helper_record_text(record, text_field) for record in batch]
+                vectors = helper_encode(model, texts)
                 if index is None:
+                    # 向量维度由第一批真实编码结果确定，避免配置值与模型实际输出不一致。
                     dim = int(vectors.shape[1])
                     index = faiss.IndexFlatIP(dim)
                 index.add(vectors)
@@ -235,7 +245,7 @@ def _build_index_shards(
             manifest["dim"] = dim
         return {"index": str(index_path), "mapping": str(mapping_path), "offset": offset, "count": local_count}
 
-    for record in _limited(records, limit):
+    for record in helper_limited(records, limit):
         current_shard.append(record)
         if len(current_shard) >= shard_size:
             shard = flush_shard(current_shard, shard_index, total)
@@ -270,16 +280,18 @@ def build_vector_indexes(
     local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY,
     fp16: bool = DEFAULT_FP16,
 ) -> dict[str, Any]:
+    # target 同时控制数据读取和产物命名；尽早拒绝拼写错误，避免生成不完整索引。
     if target not in {"all", "document_cards", "document_views", "chunks"}:
         raise ValueError("target must be one of: all, document_cards, document_views, chunks")
     out = ensure_dir(output_dir)
-    allowed_doc_ids = _allowed_doc_ids(documents_path)
+    allowed_doc_ids = helper_allowed_doc_ids(documents_path)
     data_dir = Path(output_dir).parent
     needs_cards = target in {"all", "document_cards"}
     needs_views = target in {"all", "document_views"}
-    cards = _card_records(clean_dir, data_dir / "document_cards.jsonl") if needs_cards else []
-    views = _view_records(clean_dir, data_dir / "document_views.jsonl") if needs_views else []
+    cards = helper_card_records(clean_dir, data_dir / "document_cards.jsonl") if needs_cards else []
+    views = helper_view_records(clean_dir, data_dir / "document_views.jsonl") if needs_views else []
     if allowed_doc_ids is not None:
+        # documents.jsonl 是可服务文档的权威集合，孤立卡片或视图不能进入检索索引。
         cards = [record for record in cards if record.get("doc_id") in allowed_doc_ids]
         views = [record for record in views if record.get("doc_id") in allowed_doc_ids]
     chunks_count = 0
@@ -297,7 +309,7 @@ def build_vector_indexes(
     try:
         if target in {"all", "document_cards"} and cards:
             if shard_size:
-                result["document_card_index"] = _build_index_shards(
+                result["document_card_index"] = helper_build_index_shards(
                     cards,
                     "card_text",
                     "doc_id",
@@ -314,7 +326,7 @@ def build_vector_indexes(
                     fp16,
                 )
             else:
-                result["document_card_index"] = _build_index_stream(
+                result["document_card_index"] = helper_build_index_stream(
                     cards,
                     "card_text",
                     "doc_id",
@@ -331,7 +343,7 @@ def build_vector_indexes(
                 )
         if target in {"all", "document_views"} and views:
             if shard_size:
-                result["document_view_index"] = _build_index_shards(
+                result["document_view_index"] = helper_build_index_shards(
                     views,
                     "text",
                     "view_id",
@@ -348,7 +360,7 @@ def build_vector_indexes(
                     fp16,
                 )
             else:
-                result["document_view_index"] = _build_index_stream(
+                result["document_view_index"] = helper_build_index_stream(
                     views,
                     "text",
                     "view_id",
@@ -365,7 +377,7 @@ def build_vector_indexes(
                 )
         if target in {"all", "chunks"} and chunks_count:
             if shard_size:
-                result["chunk_index"] = _build_index_shards(
+                result["chunk_index"] = helper_build_index_shards(
                     (
                         chunk
                         for chunk in iter_normalized_chunks(data_dir, chunks_path)
@@ -386,7 +398,7 @@ def build_vector_indexes(
                     fp16,
                 )
             else:
-                result["chunk_index"] = _build_index_stream(
+                result["chunk_index"] = helper_build_index_stream(
                     (
                         chunk
                         for chunk in iter_normalized_chunks(data_dir, chunks_path)
@@ -407,6 +419,7 @@ def build_vector_indexes(
                 )
         metadata_path = out / "vector_indexes_metadata.json"
         if target != "all" and metadata_path.exists():
+            # 单目标增量构建只覆盖对应条目，保留其他目标上一次成功构建的元数据。
             try:
                 existing = json.loads(metadata_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
@@ -421,30 +434,44 @@ def build_vector_indexes(
     return result
 
 
-def _vector_search_shards(
+def helper_vector_search_shards(
     query: str,
     manifest_path: Path,
     id_field: str,
     top_n: int,
     model_name: str,
     local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY,
+    required: bool = False,
 ) -> list[str]:
     if not manifest_path.exists():
         return []
     try:
-        faiss, _np, _SentenceTransformer = _load_vector_dependencies()
+        faiss, _np, _SentenceTransformer = helper_load_vector_dependencies()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        model = _cached_model(model_name, local_files_only)
+        shards = manifest.get("shards", [])
+        if required and not shards:
+            raise RuntimeError(f"Vector retrieval required but shard manifest is empty: {manifest_path}")
+        model = helper_cached_model(model_name, local_files_only)
         vector = model.encode([query], convert_to_numpy=True).astype("float32")
+        # 建库向量同样做过 L2 归一化，因此内积可直接作为余弦相似度使用。
         faiss.normalize_L2(vector)
         candidates: list[tuple[float, str]] = []
-        for shard in manifest.get("shards", []):
+        for shard in shards:
             index_file = Path(shard["index"])
             mapping_file = Path(shard["mapping"])
             if not index_file.exists() or not mapping_file.exists():
+                if required:
+                    raise RuntimeError(
+                        f"Vector retrieval required but shard artifacts are missing: {index_file}, {mapping_file}"
+                    )
                 continue
             mappings = list(read_jsonl(mapping_file))
             index = faiss.read_index(str(index_file))
+            # FAISS 行号必须与映射文件逐行对应；强制模式下任何数量偏差都应立即失败。
+            if required and int(index.ntotal) != len(mappings):
+                raise RuntimeError(
+                    f"Vector index/mapping size mismatch: {index_file} has {index.ntotal}, {mapping_file} has {len(mappings)}"
+                )
             scores, ids = index.search(vector, min(top_n, len(mappings)))
             for score, item_index in zip(scores[0], ids[0]):
                 if 0 <= int(item_index) < len(mappings):
@@ -460,7 +487,12 @@ def _vector_search_shards(
             if len(results) >= top_n:
                 break
         return results
-    except Exception:
+    except Exception as exc:
+        # 可选模式保持历史兼容并返回空通道；强制模式保留失败原因，禁止静默退化。
+        if required:
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(f"Vector retrieval failed for {manifest_path}: {exc}") from exc
         return []
 
 
@@ -472,24 +504,42 @@ def vector_search(
     top_n: int = 50,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY,
+    required: bool | None = None,
 ) -> list[str]:
     index_path = Path(index_path)
     mapping_path = Path(mapping_path)
+    required = vector_retrieval_required(required)
     manifest_path = index_path.with_name(index_path.stem + "_shards.json")
+    # 同时存在单文件和分片产物时优先分片清单，因为它代表较新的可扩展布局。
     if manifest_path.exists():
-        return _vector_search_shards(query, manifest_path, id_field, top_n, model_name, local_files_only)
+        return helper_vector_search_shards(query, manifest_path, id_field, top_n, model_name, local_files_only, required)
     if not index_path.exists() or not mapping_path.exists():
+        if required:
+            raise RuntimeError(
+                f"Vector retrieval required but index artifacts are missing: {index_path}, {mapping_path}"
+            )
         return []
     try:
-        faiss, _np, _SentenceTransformer = _load_vector_dependencies()
+        faiss, _np, _SentenceTransformer = helper_load_vector_dependencies()
         mappings = list(read_jsonl(mapping_path))
         index = faiss.read_index(str(index_path))
-        model = _cached_model(model_name, local_files_only)
+        # FAISS 行号必须与映射文件逐行对应；强制模式下任何数量偏差都应立即失败。
+        if required and int(index.ntotal) != len(mappings):
+            raise RuntimeError(
+                f"Vector index/mapping size mismatch: {index_path} has {index.ntotal}, {mapping_path} has {len(mappings)}"
+            )
+        model = helper_cached_model(model_name, local_files_only)
         vector = model.encode([query], convert_to_numpy=True).astype("float32")
+        # 建库向量同样做过 L2 归一化，因此内积可直接作为余弦相似度使用。
         faiss.normalize_L2(vector)
         _scores, ids = index.search(vector, min(top_n, len(mappings)))
         return [mappings[int(i)][id_field] for i in ids[0] if 0 <= int(i) < len(mappings)]
-    except Exception:
+    except Exception as exc:
+        # 可选模式保持历史兼容并返回空通道；强制模式保留失败原因，禁止静默退化。
+        if required:
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(f"Vector retrieval failed for {index_path}: {exc}") from exc
         return []
 
 

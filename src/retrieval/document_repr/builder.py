@@ -80,19 +80,19 @@ SPACED_OCR_RE = re.compile(r"(?:[A-Za-zＡ-Ｚａ-ｚ０-９]\s+){12,}")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;。！？；])\s+")
 
 
-def _normalize_space(text: str) -> str:
+def helper_normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def _clip(text: str, limit: int) -> str:
-    text = _normalize_space(text)
+def helper_clip(text: str, limit: int) -> str:
+    text = helper_normalize_space(text)
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "..."
 
 
-def _is_useful_line(line: str, min_chars: int = 8) -> bool:
-    cleaned = _normalize_space(line.strip(" -*\t|"))
+def helper_is_useful_line(line: str, min_chars: int = 8) -> bool:
+    cleaned = helper_normalize_space(line.strip(" -*\t|"))
     if len(cleaned) < min_chars:
         return False
     if LOW_VALUE_LINE_RE.search(cleaned):
@@ -106,19 +106,19 @@ def _is_useful_line(line: str, min_chars: int = 8) -> bool:
     return letters_digits / max(1, len(visible)) >= 0.35
 
 
-def _section_heading(section: Any) -> str:
+def helper_section_heading(section: Any) -> str:
     return str(getattr(section, "heading", "") or ((getattr(section, "section_path", []) or [""])[-1]))
 
 
-def _section_path_text(section: Any) -> str:
+def helper_section_path_text(section: Any) -> str:
     return " > ".join(str(item) for item in (getattr(section, "section_path", []) or []) if item)
 
 
-def _dedupe_lines(lines: Iterable[str], max_items: int) -> list[str]:
+def helper_dedupe_lines(lines: Iterable[str], max_items: int) -> list[str]:
     seen: set[str] = set()
     output: list[str] = []
     for line in lines:
-        cleaned = _normalize_space(line)
+        cleaned = helper_normalize_space(line)
         if not cleaned or cleaned.lower() in seen:
             continue
         seen.add(cleaned.lower())
@@ -128,7 +128,7 @@ def _dedupe_lines(lines: Iterable[str], max_items: int) -> list[str]:
     return output
 
 
-def _candidate_lines(content: str) -> Iterable[str]:
+def helper_candidate_lines(content: str) -> Iterable[str]:
     for raw_line in content.splitlines():
         stripped = raw_line.strip(" -*\t")
         if not stripped:
@@ -140,15 +140,15 @@ def _candidate_lines(content: str) -> Iterable[str]:
             yield part
 
 
-def _matching_lines(content: str, pattern: re.Pattern[str], max_items: int, max_chars: int = 700) -> list[str]:
+def helper_matching_lines(content: str, pattern: re.Pattern[str], max_items: int, max_chars: int = 700) -> list[str]:
     lines = []
-    for line in _candidate_lines(content):
-        if pattern.search(line) and _is_useful_line(line):
-            lines.append(_clip(line, max_chars))
-    return _dedupe_lines(lines, max_items)
+    for line in helper_candidate_lines(content):
+        if pattern.search(line) and helper_is_useful_line(line):
+            lines.append(helper_clip(line, max_chars))
+    return helper_dedupe_lines(lines, max_items)
 
 
-def _matching_lines_from_sections(
+def helper_matching_lines_from_sections(
     sections: Iterable[Any],
     pattern: re.Pattern[str],
     max_items: int,
@@ -156,38 +156,38 @@ def _matching_lines_from_sections(
 ) -> list[str]:
     lines = []
     for section in sections:
-        heading = _section_path_text(section) or _section_heading(section)
-        if heading and pattern.search(heading) and _is_useful_line(heading):
-            lines.append(_clip(heading, max_chars))
-        lines.extend(_matching_lines(getattr(section, "content", ""), pattern, max_items, max_chars))
+        heading = helper_section_path_text(section) or helper_section_heading(section)
+        if heading and pattern.search(heading) and helper_is_useful_line(heading):
+            lines.append(helper_clip(heading, max_chars))
+        lines.extend(helper_matching_lines(getattr(section, "content", ""), pattern, max_items, max_chars))
         if len(lines) >= max_items * 2:
             break
-    return _dedupe_lines(lines, max_items)
+    return helper_dedupe_lines(lines, max_items)
 
 
-def _interesting_lines(content: str, pattern: re.Pattern[str], max_items: int, fallback_chars: int = 600) -> list[str]:
-    lines = _matching_lines(content, pattern, max_items)
+def helper_interesting_lines(content: str, pattern: re.Pattern[str], max_items: int, fallback_chars: int = 600) -> list[str]:
+    lines = helper_matching_lines(content, pattern, max_items)
     if lines:
-        return _dedupe_lines(lines, max_items)
-    fallback = _clip(content, fallback_chars)
+        return helper_dedupe_lines(lines, max_items)
+    fallback = helper_clip(content, fallback_chars)
     return [fallback] if fallback else []
 
 
-def _table_lines(content: str, max_items: int = 16) -> list[str]:
+def helper_table_lines(content: str, max_items: int = 16) -> list[str]:
     captions = []
     fallback_headers = []
     for line in content.splitlines():
         stripped = line.strip()
-        if not _is_useful_line(stripped):
+        if not helper_is_useful_line(stripped):
             continue
         if TABLE_CAPTION_RE.search(stripped):
-            captions.append(_clip(stripped, 500))
+            captions.append(helper_clip(stripped, 500))
         elif TABLE_LINE_RE.search(stripped) and not stripped.startswith("|"):
-            fallback_headers.append(_clip(stripped, 500))
-    return _dedupe_lines(captions or fallback_headers, max_items)
+            fallback_headers.append(helper_clip(stripped, 500))
+    return helper_dedupe_lines(captions or fallback_headers, max_items)
 
 
-def _extract_abstract_text(body: str, max_chars: int = 1500) -> str:
+def helper_extract_abstract_text(body: str, max_chars: int = 1500) -> str:
     anchored: list[str] = []
     collecting = False
     for line in body.splitlines():
@@ -198,7 +198,7 @@ def _extract_abstract_text(body: str, max_chars: int = 1500) -> str:
             break
         if ABSTRACT_START_RE.search(stripped):
             collecting = True
-        if collecting and _is_useful_line(stripped, min_chars=20):
+        if collecting and helper_is_useful_line(stripped, min_chars=20):
             anchored.append(stripped)
         if sum(len(item) for item in anchored) >= max_chars:
             break
@@ -207,17 +207,17 @@ def _extract_abstract_text(body: str, max_chars: int = 1500) -> str:
 
     fallback_lines = []
     for line in extract_abstract(body, max_chars=max_chars * 2).splitlines():
-        if _is_useful_line(line, min_chars=20):
+        if helper_is_useful_line(line, min_chars=20):
             fallback_lines.append(line)
     return " ".join(fallback_lines)[:max_chars]
 
 
-def _infer_scope_population(title_abstract: str, recommendation_lines: Iterable[str], max_items: int = 8) -> list[str]:
+def helper_infer_scope_population(title_abstract: str, recommendation_lines: Iterable[str], max_items: int = 8) -> list[str]:
     haystack = "\n".join([title_abstract, *recommendation_lines])
-    return _matching_lines(haystack, POPULATION_LINE_RE, max_items)
+    return helper_matching_lines(haystack, POPULATION_LINE_RE, max_items)
 
 
-def _collect_document_signals(sections: Iterable[Any]) -> dict[str, list[str]]:
+def helper_collect_document_signals(sections: Iterable[Any]) -> dict[str, list[str]]:
     signals: dict[str, list[str]] = {
         "recommendation": [],
         "question": [],
@@ -238,54 +238,56 @@ def _collect_document_signals(sections: Iterable[Any]) -> dict[str, list[str]]:
 
     core_signal_names = ("recommendation", "question", "scope", "population")
     scanned_lines = 0
+    # 扫描上限防止超长指南在构建 card 时无限消耗时间和内存。
     max_candidate_lines = 3000
     for section in sections:
+        # 核心信号池达到上限后提前结束，不再扫描对 card 无增益的正文。
         if not any(needs(name) for name in core_signal_names):
             break
-        heading = _section_path_text(section) or _section_heading(section)
-        if heading and _is_useful_line(heading):
+        heading = helper_section_path_text(section) or helper_section_heading(section)
+        if heading and helper_is_useful_line(heading):
             if needs("recommendation") and RECOMMENDATION_LINE_RE.search(heading):
-                signals["recommendation"].append(_clip(heading, 800))
+                signals["recommendation"].append(helper_clip(heading, 800))
             if needs("question") and QUESTION_LINE_RE.search(heading):
-                signals["question"].append(_clip(heading, 700))
+                signals["question"].append(helper_clip(heading, 700))
             if needs("scope") and SCOPE_LINE_RE.search(heading):
-                signals["scope"].append(_clip(heading, 700))
+                signals["scope"].append(helper_clip(heading, 700))
             if needs("population") and POPULATION_LINE_RE.search(heading):
-                signals["population"].append(_clip(heading, 650))
+                signals["population"].append(helper_clip(heading, 650))
 
         content = getattr(section, "content", "")
-        for line in _candidate_lines(content):
+        for line in helper_candidate_lines(content):
             if not any(needs(name) for name in core_signal_names) or scanned_lines >= max_candidate_lines:
                 break
             scanned_lines += 1
-            if not _is_useful_line(line):
+            if not helper_is_useful_line(line):
                 continue
             if needs("table") and TABLE_CAPTION_RE.search(line):
-                signals["table"].append(_clip(line, 500))
+                signals["table"].append(helper_clip(line, 500))
             if needs("recommendation") and RECOMMENDATION_LINE_RE.search(line):
-                signals["recommendation"].append(_clip(line, 800))
+                signals["recommendation"].append(helper_clip(line, 800))
             if needs("question") and QUESTION_LINE_RE.search(line):
-                signals["question"].append(_clip(line, 700))
+                signals["question"].append(helper_clip(line, 700))
             if needs("scope") and SCOPE_LINE_RE.search(line):
-                signals["scope"].append(_clip(line, 700))
+                signals["scope"].append(helper_clip(line, 700))
             if needs("population") and POPULATION_LINE_RE.search(line):
-                signals["population"].append(_clip(line, 650))
+                signals["population"].append(helper_clip(line, 650))
         if scanned_lines >= max_candidate_lines:
             break
 
     return {
-        "recommendation": _dedupe_lines(signals["recommendation"], 18),
-        "question": _dedupe_lines(signals["question"], 14),
-        "scope": _dedupe_lines(signals["scope"], 12),
-        "population": _dedupe_lines(signals["population"], 10),
-        "table": _dedupe_lines(signals["table"], 18),
+        "recommendation": helper_dedupe_lines(signals["recommendation"], 18),
+        "question": helper_dedupe_lines(signals["question"], 14),
+        "scope": helper_dedupe_lines(signals["scope"], 12),
+        "population": helper_dedupe_lines(signals["population"], 10),
+        "table": helper_dedupe_lines(signals["table"], 18),
     }
 
 
-def _heading_tree(sections: list[Any], max_items: int = 80) -> str:
+def helper_heading_tree(sections: list[Any], max_items: int = 80) -> str:
     lines = []
     for section in sections:
-        heading = _section_heading(section)
+        heading = helper_section_heading(section)
         if not heading:
             continue
         level = int(getattr(section, "heading_level", 1) or 1)
@@ -293,21 +295,24 @@ def _heading_tree(sections: list[Any], max_items: int = 80) -> str:
         lines.append(f"{indent}- {heading}")
         if len(lines) >= max_items:
             break
-    return "\n".join(_dedupe_lines(lines, max_items))
+    return "\n".join(helper_dedupe_lines(lines, max_items))
 
 
-def _metadata_from_markdown(markdown: str) -> tuple[dict[str, str], str]:
+def helper_metadata_from_markdown(markdown: str) -> tuple[dict[str, str], str]:
     metadata, body = parse_front_matter(markdown)
     return metadata, body
 
 
-def _base_metadata(metadata: dict[str, str], path: str | Path) -> dict[str, Any]:
+def helper_base_metadata(metadata: dict[str, str], path: str | Path) -> dict[str, Any]:
     return {
         "doc_id": metadata.get("id") or Path(path).stem,
         "title": metadata.get("title") or Path(path).stem,
         "publication_date": metadata.get("publication_date") or "unknown",
         "source_institution": metadata.get("source_institution") or "Unknown",
         "clinical_department": metadata.get("clinical_department") or "\u672a\u5206\u7c7b",
+        "clinical_departments": metadata.get("clinical_departments") or [metadata.get("clinical_department") or "未分类"],
+        "department_scope": metadata.get("department_scope") or "single",
+        "document_kind": metadata.get("document_kind") or "guideline",
         "cleaning_quality": metadata.get("cleaning_quality") or "",
         "cleaning_flags": metadata.get("cleaning_flags") or "",
         "source_file": metadata.get("source_file") or "",
@@ -325,11 +330,11 @@ def _base_metadata(metadata: dict[str, str], path: str | Path) -> dict[str, Any]
     }
 
 
-def _section_groups(sections: list[Any]) -> dict[str, list[Any]]:
+def helper_section_groups(sections: list[Any]) -> dict[str, list[Any]]:
     groups: dict[str, list[Any]] = defaultdict(list)
     for section in sections:
         section_type = "reference" if getattr(section, "is_reference_section", False) else classify_section(
-            heading=_section_heading(section),
+            heading=helper_section_heading(section),
             section_path=getattr(section, "section_path", []),
             content=getattr(section, "content", ""),
         )
@@ -337,11 +342,11 @@ def _section_groups(sections: list[Any]) -> dict[str, list[Any]]:
     return groups
 
 
-def _section_snippets(sections: Iterable[Any], max_sections: int, chars_per_section: int) -> str:
+def helper_section_snippets(sections: Iterable[Any], max_sections: int, chars_per_section: int) -> str:
     parts = []
     for section in sections:
-        heading = _section_path_text(section) or _section_heading(section)
-        content = _clip(getattr(section, "content", ""), chars_per_section)
+        heading = helper_section_path_text(section) or helper_section_heading(section)
+        content = helper_clip(getattr(section, "content", ""), chars_per_section)
         if not content:
             continue
         parts.append(f"{heading}: {content}" if heading else content)
@@ -353,32 +358,32 @@ def _section_snippets(sections: Iterable[Any], max_sections: int, chars_per_sect
 def build_document_card(markdown: str, path: str | Path = "") -> dict[str, Any]:
     """Create one high-density document card from a clean Markdown guideline."""
 
-    metadata, body = _metadata_from_markdown(markdown)
-    base = _base_metadata(metadata, path)
+    metadata, body = helper_metadata_from_markdown(markdown)
+    base = helper_base_metadata(metadata, path)
     sections = encode_markdown(markdown)
-    groups = _section_groups(sections)
+    groups = helper_section_groups(sections)
 
-    abstract_text = _extract_abstract_text(body, max_chars=1500)
+    abstract_text = helper_extract_abstract_text(body, max_chars=1500)
     title_abstract = " ".join([base["title"], abstract_text]).strip()
-    signals = _collect_document_signals(sections)
+    signals = helper_collect_document_signals(sections)
     recommendation_lines = signals["recommendation"]
     pico_lines = signals["question"]
     scope_lines = signals["scope"]
     population_lines = signals["population"]
-    population_lines.extend(_infer_scope_population(title_abstract, recommendation_lines, 10))
-    population_lines = _dedupe_lines(population_lines, 10)
+    population_lines.extend(helper_infer_scope_population(title_abstract, recommendation_lines, 10))
+    population_lines = helper_dedupe_lines(population_lines, 10)
     table_titles = signals["table"]
 
     fields = {
-        "title_abstract": _clip(title_abstract, 1800),
-        "scope": _clip("\n".join(scope_lines) or _section_snippets(groups["scope_population"], 4, 700), 2200),
-        "target_population": _clip("\n".join(population_lines), 1400),
+        "title_abstract": helper_clip(title_abstract, 1800),
+        "scope": helper_clip("\n".join(scope_lines) or helper_section_snippets(groups["scope_population"], 4, 700), 2200),
+        "target_population": helper_clip("\n".join(population_lines), 1400),
         "key_recommendations": "\n".join(recommendation_lines),
         "clinical_questions_pico": "\n".join(pico_lines),
-        "evidence_review": _clip(_section_snippets(groups["evidence"], 5, 600), 2600),
-        "heading_tree": _heading_tree(sections),
-        "important_tables": "\n".join(_dedupe_lines(table_titles, 18)),
-        "conclusion": _clip(_section_snippets(groups["conclusion"], 3, 600), 1600),
+        "evidence_review": helper_clip(helper_section_snippets(groups["evidence"], 5, 600), 2600),
+        "heading_tree": helper_heading_tree(sections),
+        "important_tables": "\n".join(helper_dedupe_lines(table_titles, 18)),
+        "conclusion": helper_clip(helper_section_snippets(groups["conclusion"], 3, 600), 1600),
     }
     card_sections = [
         ("Title", base["title"]),
@@ -397,13 +402,13 @@ def build_document_card(markdown: str, path: str | Path = "") -> dict[str, Any]:
     card_text = "\n\n".join(f"[{name}]\n{value}" for name, value in card_sections if value)
     return {
         **base,
-        "card_text": _clip(card_text, 12000),
+        "card_text": helper_clip(card_text, 12000),
         "fields": fields,
     }
 
 
-def _view_record(card: dict[str, Any], view_type: str, text: str) -> dict[str, Any] | None:
-    text = _clip(text, 6000)
+def helper_view_record(card: dict[str, Any], view_type: str, text: str) -> dict[str, Any] | None:
+    text = helper_clip(text, 6000)
     if not text:
         return None
     doc_id = card["doc_id"]
@@ -417,6 +422,9 @@ def _view_record(card: dict[str, Any], view_type: str, text: str) -> dict[str, A
         "publication_date": card.get("publication_date", "unknown"),
         "source_institution": card.get("source_institution", "Unknown"),
         "clinical_department": card.get("clinical_department", "\u672a\u5206\u7c7b"),
+        "clinical_departments": card.get("clinical_departments") or [card.get("clinical_department", "未分类")],
+        "department_scope": card.get("department_scope") or "single",
+        "document_kind": card.get("document_kind") or "guideline",
         "cleaning_quality": card.get("cleaning_quality", ""),
         "cleaning_flags": card.get("cleaning_flags", ""),
         "source_pdf_text_quality": card.get("source_pdf_text_quality", ""),
@@ -446,7 +454,7 @@ def build_document_views(card: dict[str, Any]) -> list[dict[str, Any]]:
         "table_titles": fields.get("important_tables", ""),
         "conclusion": fields.get("conclusion", ""),
     }
-    records = [_view_record(card, view_type, view_texts.get(view_type, "")) for view_type in VIEW_TYPES]
+    records = [helper_view_record(card, view_type, view_texts.get(view_type, "")) for view_type in VIEW_TYPES]
     return [record for record in records if record is not None]
 
 
@@ -462,6 +470,7 @@ def build_document_representations(
         markdown = path.read_text(encoding="utf-8", errors="replace")
         card = build_document_card(markdown, path)
         cards.append(card)
+        # 每个 card 可派生多个检索意图 view，但仍共享同一个 doc_id。
         views.extend(build_document_views(card))
 
     output_path = Path(output_dir)

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src.retrieval.chunk_doc_aggregator import aggregate_chunks_to_documents
-from src.retrieval.hybrid import _doc_row_to_result, _select_by_ids, retrieve_chunks_hybrid
+from src.retrieval.hybrid import helper_doc_row_to_result, helper_select_by_ids, recall_chunks_hybrid
 from src.retrieval.reranker import DocumentReranker, default_document_reranker
 from src.retrieval.rrf import weighted_rrf_fusion
 from src.retrieval.sqlite_store import (
@@ -17,6 +17,7 @@ from src.retrieval.sqlite_store import (
     connect,
     search_document_cards_sqlite,
     search_document_views_sqlite,
+    retrieve_chunks_sqlite,
 )
 from src.retrieval.vector_store import vector_search
 from src.utils.io import DATA_DIR
@@ -44,8 +45,9 @@ class MultiviewSearchConfig:
     clinical_department: str | None = None
     time_range: str | dict[str, str] | None = None
     publication_date: str | None = None
+    document_kind: str = "guideline"
     recency_boost: bool = False
-    topk: int = 10
+    topk: int = 20
     card_bm25_top_n: int = 50
     card_vector_top_n: int = 220
     view_bm25_top_n: int = 70
@@ -79,19 +81,20 @@ def has_document_representations_sqlite(db_path: str | Path = DEFAULT_DB_PATH) -
         return False
 
 
-def _publication_date_matches(item: dict[str, Any], publication_date: str | None) -> bool:
+def helper_publication_date_matches(item: dict[str, Any], publication_date: str | None) -> bool:
     return not publication_date or item.get("publication_date") == publication_date
 
 
-def _load_card_rows(
+def helper_load_card_rows(
     db_path: str | Path,
     doc_ids: list[str],
     source_institution: str | None,
     clinical_department: str | None,
     time_range: str | dict[str, str] | None,
     publication_date: str | None,
+    document_kind: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    rows = _select_by_ids(
+    rows = helper_select_by_ids(
         db_path,
         "document_cards",
         "doc_id",
@@ -101,6 +104,7 @@ def _load_card_rows(
         clinical_department,
         time_range,
         publication_date,
+        document_kind=document_kind,
     )
     cards: dict[str, dict[str, Any]] = {}
     for doc_id, row in rows.items():
@@ -132,15 +136,16 @@ def _load_card_rows(
     return cards
 
 
-def _load_view_rows(
+def helper_load_view_rows(
     db_path: str | Path,
     view_ids: list[str],
     source_institution: str | None,
     clinical_department: str | None,
     time_range: str | dict[str, str] | None,
     publication_date: str | None,
+    document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    rows = _select_by_ids(
+    rows = helper_select_by_ids(
         db_path,
         "document_views",
         "view_id",
@@ -150,6 +155,7 @@ def _load_view_rows(
         clinical_department,
         time_range,
         publication_date,
+        document_kind=document_kind,
     )
     output = []
     for view_id in view_ids:
@@ -184,7 +190,7 @@ def _load_view_rows(
     return output
 
 
-def _rank_docs_from_views(views: list[dict[str, Any]], max_views_per_doc: int = 5) -> tuple[list[str], dict[str, list[dict[str, Any]]]]:
+def helper_rank_docs_from_views(views: list[dict[str, Any]], max_views_per_doc: int = 5) -> tuple[list[str], dict[str, list[dict[str, Any]]]]:
     scores: dict[str, float] = {}
     matched: dict[str, list[dict[str, Any]]] = {}
     for rank, view in enumerate(views, start=1):
@@ -198,14 +204,14 @@ def _rank_docs_from_views(views: list[dict[str, Any]], max_views_per_doc: int = 
     return [doc_id for doc_id, _score in ranked], matched
 
 
-def _rank_dict(ids: list[str]) -> dict[str, int]:
+def helper_rank_dict(ids: list[str]) -> dict[str, int]:
     ranks = {}
     for rank, item_id in enumerate(ids, start=1):
         ranks.setdefault(item_id, rank)
     return ranks
 
 
-def _merge_matched_views(*view_maps: dict[str, list[dict[str, Any]]], max_views_per_doc: int = 5) -> dict[str, list[dict[str, Any]]]:
+def helper_merge_matched_views(*view_maps: dict[str, list[dict[str, Any]]], max_views_per_doc: int = 5) -> dict[str, list[dict[str, Any]]]:
     merged: dict[str, list[dict[str, Any]]] = {}
     seen: dict[str, set[str]] = {}
     for view_map in view_maps:
@@ -221,116 +227,93 @@ def _merge_matched_views(*view_maps: dict[str, list[dict[str, Any]]], max_views_
     return merged
 
 
-def _document_rows(
+def helper_document_rows(
     db_path: str | Path,
     doc_ids: list[str],
     source_institution: str | None,
     clinical_department: str | None,
     time_range: str | dict[str, str] | None,
     publication_date: str | None,
+    document_kind: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    rows = _select_by_ids(
+    rows = helper_select_by_ids(
         db_path,
         "documents",
         "doc_id",
         doc_ids,
-        f"doc_id, title, abstract, publication_date, source_institution, clinical_department, {QUALITY_SELECT_COLUMNS}",
+        f"doc_id, title, abstract, publication_date, source_institution, clinical_department, document_kind, {QUALITY_SELECT_COLUMNS}",
         source_institution,
         clinical_department,
         time_range,
         publication_date,
+        document_kind=document_kind,
     )
-    return {doc_id: _doc_row_to_result(row) for doc_id, row in rows.items()}
+    return {doc_id: helper_doc_row_to_result(row) for doc_id, row in rows.items()}
 
 
-def _card_recall(query: str, config: MultiviewSearchConfig) -> tuple[list[str], list[str], dict[str, dict[str, Any]]]:
+def helper_card_recall(query: str, config: MultiviewSearchConfig) -> tuple[list[str], list[str], dict[str, dict[str, Any]]]:
     card_bm25 = [
-        item
-        for item in search_document_cards_sqlite(
-            query,
-            config.db_path,
-            source_institution=config.source_institution,
-            clinical_department=config.clinical_department,
-            time_range=config.time_range,
-            topk=config.card_bm25_top_n,
-        )
-        if _publication_date_matches(item, config.publication_date)
+        item for item in search_document_cards_sqlite(
+            query, config.db_path, source_institution=config.source_institution,
+            clinical_department=config.clinical_department, time_range=config.time_range,
+            topk=config.card_bm25_top_n, document_kind=config.document_kind,
+        ) if helper_publication_date_matches(item, config.publication_date)
     ]
     card_bm25_ids = [item["doc_id"] for item in card_bm25]
+    # 向量通道先扩大召回池，随后用数据库元数据过滤并截断到目标数量。
     card_dense_ids = vector_search(
-        query,
-        config.index_path / "faiss_document_cards.index",
-        config.index_path / "faiss_document_cards_mapping.jsonl",
-        "doc_id",
+        query, config.index_path / "faiss_document_cards.index",
+        config.index_path / "faiss_document_cards_mapping.jsonl", "doc_id",
         top_n=max(config.card_vector_top_n * 4, 200),
     )
-    card_dense_rows = _load_card_rows(
-        config.db_path,
-        card_dense_ids,
-        config.source_institution,
-        config.clinical_department,
-        config.time_range,
-        config.publication_date,
+    card_dense_rows = helper_load_card_rows(
+        config.db_path, card_dense_ids, config.source_institution, config.clinical_department,
+        config.time_range, config.publication_date, config.document_kind,
     )
-    card_dense_ids = [doc_id for doc_id in card_dense_ids if doc_id in card_dense_rows][: config.card_vector_top_n]
+    card_dense_ids = [doc_id for doc_id in card_dense_ids if doc_id in card_dense_rows][:config.card_vector_top_n]
     card_records = {item["doc_id"]: item for item in card_bm25}
     card_records.update(card_dense_rows)
     return card_bm25_ids, card_dense_ids, card_records
 
 
-def _view_recall(
-    query: str,
-    config: MultiviewSearchConfig,
+def helper_view_recall(
+    query: str, config: MultiviewSearchConfig,
 ) -> tuple[list[str], list[str], dict[str, list[dict[str, Any]]]]:
     view_bm25 = [
-        item
-        for item in search_document_views_sqlite(
-            query,
-            config.db_path,
-            source_institution=config.source_institution,
-            clinical_department=config.clinical_department,
-            time_range=config.time_range,
-            topk=config.view_bm25_top_n,
-        )
-        if _publication_date_matches(item, config.publication_date)
+        item for item in search_document_views_sqlite(
+            query, config.db_path, source_institution=config.source_institution,
+            clinical_department=config.clinical_department, time_range=config.time_range,
+            topk=config.view_bm25_top_n, document_kind=config.document_kind,
+        ) if helper_publication_date_matches(item, config.publication_date)
     ]
-    view_bm25_doc_ids, view_bm25_matches = _rank_docs_from_views(view_bm25)
+    view_bm25_doc_ids, view_bm25_matches = helper_rank_docs_from_views(view_bm25)
     view_dense_ids = vector_search(
-        query,
-        config.index_path / "faiss_document_views.index",
-        config.index_path / "faiss_document_views_mapping.jsonl",
-        "view_id",
+        query, config.index_path / "faiss_document_views.index",
+        config.index_path / "faiss_document_views_mapping.jsonl", "view_id",
         top_n=max(config.view_vector_top_n * 4, 240),
     )
-    view_dense = _load_view_rows(
-        config.db_path,
-        view_dense_ids,
-        config.source_institution,
-        config.clinical_department,
-        config.time_range,
-        config.publication_date,
-    )[: config.view_vector_top_n]
-    view_dense_doc_ids, view_dense_matches = _rank_docs_from_views(view_dense)
-    return view_bm25_doc_ids, view_dense_doc_ids, _merge_matched_views(view_bm25_matches, view_dense_matches)
+    view_dense = helper_load_view_rows(
+        config.db_path, view_dense_ids, config.source_institution, config.clinical_department,
+        config.time_range, config.publication_date, config.document_kind,
+    )[:config.view_vector_top_n]
+    # view_id 召回需要聚合回 doc_id，同一文档的多个命中 view 作为解释信息保留。
+    view_dense_doc_ids, view_dense_matches = helper_rank_docs_from_views(view_dense)
+    return view_bm25_doc_ids, view_dense_doc_ids, helper_merge_matched_views(view_bm25_matches, view_dense_matches)
 
 
-def _chunk_doc_recall(query: str, config: MultiviewSearchConfig) -> tuple[list[str], dict[str, dict[str, Any]]]:
-    chunk_results = retrieve_chunks_hybrid(
-        query,
-        config.db_path,
-        index_dir=config.index_path,
-        source_institution=config.source_institution,
-        clinical_department=config.clinical_department,
-        time_range=config.time_range,
-        publication_date=config.publication_date,
-        topk=config.chunk_top_n,
-        exclude_reference_sections=True,
+def helper_chunk_doc_recall(query: str, config: MultiviewSearchConfig) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    chunk_results = recall_chunks_hybrid(
+        query, config.db_path, index_dir=config.index_path, source_institution=config.source_institution,
+        clinical_department=config.clinical_department, time_range=config.time_range,
+        publication_date=config.publication_date, topk=config.chunk_top_n,
+        bm25_top_n=config.chunk_top_n, vector_top_n=config.chunk_top_n,
+        exclude_reference_sections=True, document_kind=config.document_kind,
     )
-    chunk_doc_results = aggregate_chunks_to_documents(chunk_results, topk=max(config.topk * 8, 80))
+    chunk_doc_results = aggregate_chunks_to_documents(chunk_results, topk=max(config.chunk_top_n, 80))
     return [item["doc_id"] for item in chunk_doc_results], {item["doc_id"]: item for item in chunk_doc_results}
 
 
-def _fuse_doc_ids(
+def helper_fuse_doc_ids(
     card_bm25_ids: list[str],
     card_dense_ids: list[str],
     view_bm25_doc_ids: list[str],
@@ -345,10 +328,10 @@ def _fuse_doc_ids(
         (view_dense_doc_ids, CHANNEL_WEIGHTS["view_dense"]),
         (chunk_doc_ids, CHANNEL_WEIGHTS["chunk_doc"]),
     ]
-    return weighted_rrf_fusion([(ids, weight) for ids, weight in rank_lists if ids], k=60)[: max(topk * 8, 80)]
+    return weighted_rrf_fusion([(ids, weight) for ids, weight in rank_lists if ids], k=60)[:topk]
 
 
-def _channel_ranks(
+def helper_channel_ranks(
     card_bm25_ids: list[str],
     card_dense_ids: list[str],
     view_bm25_doc_ids: list[str],
@@ -356,15 +339,15 @@ def _channel_ranks(
     chunk_doc_ids: list[str],
 ) -> dict[str, dict[str, int]]:
     return {
-        "card_bm25_rank": _rank_dict(card_bm25_ids),
-        "card_dense_rank": _rank_dict(card_dense_ids),
-        "view_bm25_rank": _rank_dict(view_bm25_doc_ids),
-        "view_dense_rank": _rank_dict(view_dense_doc_ids),
-        "chunk_doc_rank": _rank_dict(chunk_doc_ids),
+        "card_bm25_rank": helper_rank_dict(card_bm25_ids),
+        "card_dense_rank": helper_rank_dict(card_dense_ids),
+        "view_bm25_rank": helper_rank_dict(view_bm25_doc_ids),
+        "view_dense_rank": helper_rank_dict(view_dense_doc_ids),
+        "chunk_doc_rank": helper_rank_dict(chunk_doc_ids),
     }
 
 
-def _complete_card_records(
+def helper_complete_card_records(
     candidate_ids: list[str],
     card_records: dict[str, dict[str, Any]],
     config: MultiviewSearchConfig,
@@ -374,19 +357,20 @@ def _complete_card_records(
         return card_records
     completed = dict(card_records)
     completed.update(
-        _load_card_rows(
+        helper_load_card_rows(
             config.db_path,
             missing_ids,
             config.source_institution,
             config.clinical_department,
             config.time_range,
             config.publication_date,
+            config.document_kind,
         )
     )
     return completed
 
 
-def _build_candidates(
+def helper_build_candidates(
     candidate_ids: list[str],
     fused_scores: dict[str, float],
     card_records: dict[str, dict[str, Any]],
@@ -395,19 +379,21 @@ def _build_candidates(
     ranks: dict[str, dict[str, int]],
     config: MultiviewSearchConfig,
 ) -> list[dict[str, Any]]:
-    docs = _document_rows(
+    docs = helper_document_rows(
         config.db_path,
         candidate_ids,
         config.source_institution,
         config.clinical_department,
         config.time_range,
         config.publication_date,
+        config.document_kind,
     )
     candidates = []
     for doc_id in candidate_ids:
         doc = docs.get(doc_id)
         if not doc:
             continue
+        # 保存每个渠道的原始名次，后续重排和结果解释都依赖这份证据。
         retrieval_scores = {name: channel[doc_id] for name, channel in ranks.items() if doc_id in channel}
         channels = sorted(name.removesuffix("_rank") for name in retrieval_scores)
         chunk_info = chunk_by_doc.get(doc_id, {})
@@ -434,6 +420,18 @@ def _build_candidates(
     return candidates
 
 
+def helper_route_document_ids(candidate_ids: list[str], docs: dict[str, dict[str, Any]], clinical_department: str | None) -> list[str]:
+    if not clinical_department:
+        return candidate_ids[:50]
+    single = [doc_id for doc_id in candidate_ids if docs.get(doc_id, {}).get("department_scope") == "single"][:45]
+    compositive = [doc_id for doc_id in candidate_ids if docs.get(doc_id, {}).get("department_scope") == "compositive"][:5]
+    selected = single + compositive
+    seen = set(selected)
+    selected.extend(doc_id for doc_id in candidate_ids if doc_id not in seen and len(selected) < 50)
+    rank = {doc_id: index for index, doc_id in enumerate(candidate_ids)}
+    return sorted(selected, key=rank.get)[:50]
+
+
 def search_documents_multiview(
     query: str,
     db_path: str | Path = DEFAULT_DB_PATH,
@@ -443,15 +441,16 @@ def search_documents_multiview(
     time_range: str | dict[str, str] | None = None,
     publication_date: str | None = None,
     recency_boost: bool = False,
-    topk: int = 10,
-    card_bm25_top_n: int = 50,
-    card_vector_top_n: int = 220,
-    view_bm25_top_n: int = 70,
-    view_vector_top_n: int = 280,
-    chunk_top_n: int = 90,
+    topk: int = 20,
+    card_bm25_top_n: int = 100,
+    card_vector_top_n: int = 100,
+    view_bm25_top_n: int = 100,
+    view_vector_top_n: int = 100,
+    chunk_top_n: int = 100,
     reranker: DocumentReranker | None = None,
+    document_kind: str = "guideline",
 ) -> list[dict[str, Any]]:
-    """Search document cards, document views, and chunks, then fuse by doc_id."""
+    """Fuse BM25 and Dense card/view/chunk channels, then rerank documents."""
 
     config = MultiviewSearchConfig(
         db_path=db_path,
@@ -460,6 +459,7 @@ def search_documents_multiview(
         clinical_department=clinical_department,
         time_range=time_range,
         publication_date=publication_date,
+        document_kind=document_kind,
         recency_boost=recency_boost,
         topk=topk,
         card_bm25_top_n=card_bm25_top_n,
@@ -468,14 +468,54 @@ def search_documents_multiview(
         view_vector_top_n=view_vector_top_n,
         chunk_top_n=chunk_top_n,
     )
-    card_bm25_ids, card_dense_ids, card_records = _card_recall(query, config)
-    view_bm25_doc_ids, view_dense_doc_ids, matched_views = _view_recall(query, config)
-    chunk_doc_ids, chunk_by_doc = _chunk_doc_recall(query, config)
-    fused = _fuse_doc_ids(card_bm25_ids, card_dense_ids, view_bm25_doc_ids, view_dense_doc_ids, chunk_doc_ids, topk)
-    candidate_ids = [doc_id for doc_id, _score in fused]
+    card_bm25_ids, card_dense_ids, card_records = helper_card_recall(query, config)
+    view_bm25_doc_ids, view_dense_doc_ids, matched_views = helper_view_recall(query, config)
+    chunk_doc_ids, chunk_by_doc = helper_chunk_doc_recall(query, config)
+    # 科室检索扩大候选池，给单科室和综合科室路由留下足够选择空间。
+    fused = helper_fuse_doc_ids(card_bm25_ids, card_dense_ids, view_bm25_doc_ids, view_dense_doc_ids, chunk_doc_ids, 500 if clinical_department else 50)
+    all_candidate_ids = [doc_id for doc_id, _score in fused]
+    route_docs = helper_document_rows(db_path, all_candidate_ids, source_institution, clinical_department, time_range, publication_date, document_kind)
+    # 路由只改变候选配额，不改写各渠道分数，最终排序仍由统一重排器完成。
+    candidate_ids = helper_route_document_ids(all_candidate_ids, route_docs, clinical_department)
     fused_scores = dict(fused)
-    ranks = _channel_ranks(card_bm25_ids, card_dense_ids, view_bm25_doc_ids, view_dense_doc_ids, chunk_doc_ids)
-    card_records = _complete_card_records(candidate_ids, card_records, config)
-    candidates = _build_candidates(candidate_ids, fused_scores, card_records, matched_views, chunk_by_doc, ranks, config)
+    ranks = helper_channel_ranks(card_bm25_ids, card_dense_ids, view_bm25_doc_ids, view_dense_doc_ids, chunk_doc_ids)
+    card_records = helper_complete_card_records(candidate_ids, card_records, config)
+    candidates = helper_build_candidates(candidate_ids, fused_scores, card_records, matched_views, chunk_by_doc, ranks, config)
     reranker = reranker or default_document_reranker(recency_boost=config.recency_boost)
-    return reranker.rerank(query, candidates, topk)
+    return reranker.rerank(query, candidates, min(topk, 20))
+
+
+def search_documents_with_consensus_fallback(
+    query: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    index_dir: str | Path = DATA_DIR / "index",
+    source_institution: str | None = None,
+    clinical_department: str | None = None,
+    time_range: str | dict[str, str] | None = None,
+    publication_date: str | None = None,
+    recency_boost: bool = False,
+    topk: int = 20,
+    reranker: DocumentReranker | None = None,
+) -> list[dict[str, Any]]:
+    """Return guidelines first and query consensus only to fill a result deficit."""
+    wanted = min(topk, 20)
+    guidelines = search_documents_multiview(
+        query, db_path, index_dir=index_dir, source_institution=source_institution,
+        clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
+        recency_boost=recency_boost, topk=wanted, reranker=reranker, document_kind="guideline",
+    )
+    output = [{**item, "document_kind": "guideline", "is_fallback": False} for item in guidelines]
+    deficit = wanted - len(output)
+    if deficit <= 0:
+        return output
+    consensus = search_documents_multiview(
+        query, db_path, index_dir=index_dir, source_institution=source_institution,
+        clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
+        recency_boost=recency_boost, topk=deficit, reranker=reranker, document_kind="consensus",
+    )
+    output.extend(
+        {**item, "document_kind": "consensus", "is_fallback": True,
+         "fallback_reason": "insufficient_guideline_results", "fallback_rank": rank}
+        for rank, item in enumerate(consensus, 1)
+    )
+    return output[:wanted]
