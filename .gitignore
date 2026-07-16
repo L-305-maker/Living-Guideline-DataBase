@@ -13,3 +13,4 @@ __pycache__/
 .codex/
 tests/
 tmp/
+deploy/pdf-markdown-rag-mcp.service

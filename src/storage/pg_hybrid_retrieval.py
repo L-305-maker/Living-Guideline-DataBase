@@ -468,6 +468,32 @@ def retrieve_chunks_hybrid_pg(
     return reranker.rerank(query, candidates, min(topk, 30))
 
 
+def helper_attach_document_views_pg(
+    items: list[dict[str, Any]], dsn: str | None = None,
+) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    doc_ids = list(dict.fromkeys(item["doc_id"] for item in items))
+    views_by_doc: dict[str, dict[str, str]] = {doc_id: {} for doc_id in doc_ids}
+    with connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT doc_id, view_type, text
+                FROM document_views
+                WHERE doc_id = ANY(%s)
+                ORDER BY doc_id, priority DESC, view_type
+                """,
+                (doc_ids,),
+            )
+            for doc_id, view_type, text in cur.fetchall():
+                views_by_doc[doc_id].setdefault(view_type, text or "")
+    return [
+        {**item, "document_views": views_by_doc.get(item["doc_id"], {})}
+        for item in items
+    ]
+
+
 def search_documents_with_consensus_fallback_pg(
     query: str, dsn: str | None = None, source_institution: str | None = None,
     clinical_department: str | None = None, time_range: str | dict[str, str] | None = None,
@@ -480,18 +506,17 @@ def search_documents_with_consensus_fallback_pg(
     )
     output = [{**item, "document_kind": "guideline", "is_fallback": False} for item in guidelines]
     deficit = wanted - len(output)
-    if deficit <= 0:
-        return output
-    consensus = search_documents_hybrid_pg(
-        query, dsn, source_institution, clinical_department, time_range, publication_date,
-        topk=deficit, reranker=reranker, document_kind="consensus",
-    )
-    output.extend(
-        {**item, "document_kind": "consensus", "is_fallback": True,
-         "fallback_reason": "insufficient_guideline_results", "fallback_rank": rank}
-        for rank, item in enumerate(consensus, 1)
-    )
-    return output[:wanted]
+    if deficit > 0:
+        consensus = search_documents_hybrid_pg(
+            query, dsn, source_institution, clinical_department, time_range, publication_date,
+            topk=deficit, reranker=reranker, document_kind="consensus",
+        )
+        output.extend(
+            {**item, "document_kind": "consensus", "is_fallback": True,
+             "fallback_reason": "insufficient_guideline_results", "fallback_rank": rank}
+            for rank, item in enumerate(consensus, 1)
+        )
+    return helper_attach_document_views_pg(output[:wanted], dsn)
 
 
 def retrieve_chunks_with_consensus_fallback_pg(
