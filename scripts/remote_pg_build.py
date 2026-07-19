@@ -1,4 +1,4 @@
-﻿"""Run PostgreSQL ingestion and BGE-M3 vectorization on a remote host over SSH."""
+"""Run PostgreSQL ingestion and BGE-M3 vectorization on a remote host over SSH."""
 
 from __future__ import annotations
 
@@ -111,7 +111,8 @@ def main() -> None:
     if args.dry_run:
         print(shlex.join(command))
         return
-    subprocess.run(command, input=REMOTE_SCRIPT, text=True, check=True)
+    remote_script = REMOTE_SCRIPT.replace("\r\n", "\n").replace("\r", "\n")
+    subprocess.run(command, input=remote_script, text=True, check=True)
 
 
 if __name__ == "__main__":

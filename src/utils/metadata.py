@@ -30,6 +30,45 @@ PATH_HINTS = {
     "vadod_pdf": "VA/DOD",
     "who_pdf": "WHO",
 }
+TEXT_SOURCE_PATTERNS = [
+    ("WHO", ("world health organization", "\u4e16\u754c\u536b\u751f\u7ec4\u7ec7")),
+    ("NICE", ("national institute for health and care excellence", "nice guideline", "nice guidelines")),
+    ("CDC", ("centers for disease control", "centers for disease control and prevention")),
+    ("VA/DOD", ("va/dod", "department of veterans affairs")),
+    ("AAN", ("american academy of neurology",)),
+    ("AHA", ("american heart association",)),
+    ("ATS", ("american thoracic society",)),
+    ("GINA", ("global initiative for asthma",)),
+    ("USPSTF", ("u.s. preventive services task force", "us preventive services task force")),
+    ("AASLD", ("american association for the study of liver diseases",)),
+]
+CMA_TEXT_PATTERNS = (
+    "\u4e2d\u534e\u533b\u5b66\u4f1a",
+    "\u4e2d\u56fd\u533b\u5e08\u534f\u4f1a",
+    "\u4e2d\u534e\u9884\u9632\u533b\u5b66\u4f1a",
+    "\u4e2d\u56fd\u533b\u836f\u6559\u80b2\u534f\u4f1a",
+    "\u4e2d\u56fd\u6297\u764c\u534f\u4f1a",
+    "\u4e2d\u56fd\u533b\u9662\u534f\u4f1a",
+    "\u4e2d\u56fd\u7814\u7a76\u578b\u533b\u9662\u5b66\u4f1a",
+    "\u4e2d\u56fd\u8001\u5e74\u533b\u5b66\u5b66\u4f1a",
+    "\u4e2d\u56fd\u5eb7\u590d\u533b\u5b66\u4f1a",
+    "\u4e2d\u56fd\u4e2d\u897f\u533b\u7ed3\u5408\u5b66\u4f1a",
+    "\u4e2d\u56fd\u8425\u517b\u5b66\u4f1a",
+    "\u4e2d\u56fd\u5352\u4e2d\u5b66\u4f1a",
+    "\u4e2d\u56fd\u836f\u5b66\u4f1a",
+    "\u4e2d\u56fd\u533b\u7597\u4fdd\u5065\u56fd\u9645\u4ea4\u6d41\u4fc3\u8fdb\u4f1a",
+    "\u56fd\u5bb6\u611f\u67d3\u6027\u75be\u75c5\u4e34\u5e8a\u533b\u5b66\u7814\u7a76\u4e2d\u5fc3",
+    "\u56fd\u5bb6\u4f20\u67d3\u75c5\u533b\u5b66\u4e2d\u5fc3",
+    "\u56fd\u5bb6\u536b\u751f\u5065\u5eb7\u59d4",
+    "\u75be\u75c5\u9884\u9632\u63a7\u5236\u4e2d\u5fc3",
+    "\u9884\u9632\u533b\u5b66\u4f1a",
+    "cma.j.",
+    "Chinese Medical Association",
+    "Chinese Medical Doctor Association",
+    "Chinese Preventive Medicine Association",
+)
+CMA_GENERIC_ORG_RE = re.compile(r"(?:\u4e2d\u534e|\u4e2d\u56fd)[\u4e00-\u9fff]{0,30}(?:\u533b\u5b66\u4f1a|\u533b\u5e08\u534f\u4f1a|\u534f\u4f1a|\u5b66\u4f1a|\u8054\u76df|\u59d4\u5458\u4f1a|\u4e13\u5bb6\u7ec4)")
+ABSTRACT_BOUNDARY_RE = re.compile(r"(\u3010\s*(?:\u6458\u8981|\u63d0\u8981)\s*\u3011|(?:\u6458\u8981|\u63d0\u8981|Abstract)\s*[:\uff1a])", re.I)
 YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
 HEADING_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
 FULLWIDTH_RE = re.compile(r"[\uff01-\uff5e]")
@@ -47,33 +86,53 @@ def clean_title_from_filename(path: str | Path) -> str:
     return stem if re.search(r"[\u4e00-\u9fff]", stem) else stem.title()
 
 
-def extract_source_institution(pdf_path: str | Path, text: str = "") -> str:
-    path = Path(pdf_path)
+def helper_source_from_path(path: Path) -> str | None:
     for part in path.parts:
         hint = PATH_HINTS.get(part.lower())
         if hint:
             return hint
-    lower = f"{path.name}\n{text[:4000]}".lower()
-    if "world health organization" in lower or re.search(r"\bwho\b", lower):
-        return "WHO"
-    if "nice" in lower or "national institute for health and care excellence" in lower:
-        return "NICE"
-    if "centers for disease control" in lower or re.search(r"\bcdc\b", lower):
-        return "CDC"
-    if "va/dod" in lower or "department of veterans affairs" in lower:
-        return "VA/DOD"
-    if "american academy of neurology" in lower or re.search(r"\baan\b", lower):
-        return "AAN"
-    if "american heart association" in lower or re.search(r"\baha\b", lower):
-        return "AHA"
-    if "american thoracic society" in lower or re.search(r"\bats\b", lower):
-        return "ATS"
-    if "global initiative for asthma" in lower or re.search(r"\bgina\b", lower):
-        return "GINA"
-    if "u.s. preventive services task force" in lower or "us preventive services task force" in lower:
-        return "USPSTF"
-    if "american association for the study of liver diseases" in lower or re.search(r"\baasld\b", lower):
-        return "AASLD"
+        lowered = part.lower()
+        if lowered.endswith("_pdf") and len(lowered) > 4:
+            return lowered[:-4]
+    return None
+
+
+def helper_source_header(text: str, max_chars: int = 3000) -> str:
+    head = (text or "")[:max_chars]
+    match = ABSTRACT_BOUNDARY_RE.search(head)
+    return head[: match.start()] if match else head
+
+
+def helper_is_consensus_path(path: Path) -> bool:
+    return any(part.lower() == "consensus" for part in path.parts)
+
+
+def helper_has_cma_signal(text: str) -> bool:
+    if any(pattern in text for pattern in CMA_TEXT_PATTERNS):
+        return True
+    return bool(CMA_GENERIC_ORG_RE.search(text))
+
+
+def extract_source_institution(pdf_path: str | Path, text: str = "", title: str = "", document_kind: str = "") -> str:
+    path = Path(pdf_path)
+    path_hint = helper_source_from_path(path)
+    if path_hint:
+        return path_hint
+
+    # Only use title, file name, and pre-abstract author/header area for source
+    # inference. Full-body acronym scanning causes false positives when a
+    # consensus cites another organization's methodology handbook.
+    header = helper_source_header(text)
+    source_haystack = f"{path.name}\n{title}\n{header}"
+    if helper_has_cma_signal(source_haystack):
+        return "CMA"
+    if helper_is_consensus_path(path):
+        return "Unknown"
+
+    lower = source_haystack.lower()
+    for source, patterns in TEXT_SOURCE_PATTERNS:
+        if any(pattern.lower() in lower for pattern in patterns):
+            return source
     return "Unknown"
 
 

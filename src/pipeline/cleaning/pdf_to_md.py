@@ -432,7 +432,7 @@ def convert_pdf(
     conversion_report = helper_inspect_pdf_for_ingestion(conversion_pdf) if ocr_result.applied else pdf_report
     raw = helper_with_pymupdf4llm(conversion_pdf) or helper_with_pymupdf(conversion_pdf)
     title = extract_title(raw, pdf)
-    source_institution = extract_source_institution(pdf, raw)
+    source_institution = extract_source_institution(pdf, raw, title=title, document_kind=document_kind)
     publication_date = extract_publication_date(pdf, raw)
     file_sha = sha256_file(pdf)
     doc_id = make_doc_id(source_institution, publication_date, file_sha)

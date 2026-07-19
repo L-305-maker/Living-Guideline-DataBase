@@ -72,8 +72,62 @@ def split_section_content(
     )
 
 
+def helper_fallback_chunk_content(metadata: dict[str, Any], body: str) -> str:
+    title = str(metadata.get("title") or "").strip()
+    lines: list[str] = []
+    char_count = 0
+    for raw_line in body.splitlines():
+        line = raw_line.strip(" #*	")
+        if not line or line.startswith("<!--"):
+            continue
+        lines.append(line)
+        char_count += len(line)
+        if char_count >= 1200:
+            break
+    content = " ".join(lines).strip() or title
+    if title and title not in content[: max(80, len(title) + 20)]:
+        content = f"{title} {content}".strip()
+    return content[:2000]
+
+
+def helper_fallback_chunk(metadata: dict[str, Any], body: str, sections: list[Any], clean_path: str) -> ChunkRecord | None:
+    content = helper_fallback_chunk_content(metadata, body)
+    if not content:
+        return None
+    section = sections[0] if sections else None
+    doc_id = str(metadata.get("id") or getattr(section, "doc_id", ""))
+    if not doc_id:
+        return None
+    title = str(metadata.get("title") or getattr(section, "title", "") or doc_id)
+    section_path = [title]
+    parent_departments = metadata.get("clinical_departments") or getattr(section, "clinical_departments", []) or [metadata.get("clinical_department") or "\u672a\u5206\u7c7b"]
+    department_result = classify_chunk_departments(section_path, content, parent_departments, "summary")
+    return ChunkRecord(
+        chunk_id=make_chunk_id(doc_id, 0),
+        doc_id=doc_id,
+        title=title,
+        publication_date=str(metadata.get("publication_date") or getattr(section, "publication_date", "") or "unknown"),
+        source_institution=str(metadata.get("source_institution") or getattr(section, "source_institution", "") or "Unknown"),
+        clinical_department=department_result["clinical_department"],
+        clinical_departments=department_result["clinical_departments"],
+        department_scope=department_result["department_scope"],
+        document_kind=metadata.get("document_kind") or "guideline",
+        section_path=section_path,
+        chunk_index=0,
+        content=content,
+        retrieval_text=retrieval_text(title, section_path, "summary", content),
+        chunk_type="summary",
+        token_count=estimate_tokens(content),
+        retrieval_key=f"{doc_id}#0",
+        source_file=metadata.get("source_file", ""),
+        markdown_clean_path=clean_path,
+        is_background=False,
+        is_reference_section=False,
+    )
+
+
 def chunk_markdown(markdown: str, clean_path: str = "") -> list[ChunkRecord]:
-    metadata, _body = parse_front_matter(markdown)
+    metadata, body = parse_front_matter(markdown)
     sections = encode_markdown(markdown)
     chunks: list[ChunkRecord] = []
     chunk_index = 0
@@ -118,8 +172,11 @@ def chunk_markdown(markdown: str, clean_path: str = "") -> list[ChunkRecord]:
                 )
             )
             chunk_index += 1
+    if not chunks:
+        fallback = helper_fallback_chunk(metadata, body, sections, clean_path)
+        if fallback is not None:
+            chunks.append(fallback)
     return chunks
-
 
 def chunk_file(clean_path: str | Path, output_dir: str | Path = DATA_DIR / "chunks") -> list[ChunkRecord]:
     path = Path(clean_path)
