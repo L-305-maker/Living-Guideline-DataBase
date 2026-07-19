@@ -475,29 +475,6 @@ def helper_enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]
     with closing(connect(db_path)) as conn:
         enriched: list[dict[str, Any]] = []
         for item in items:
-            chunk_index = item.get("chunk_index")
-            prev_chunk_id = None
-            next_chunk_id = None
-            prev_content = ""
-            next_content = ""
-            if chunk_index is not None:
-                # 只读取相邻两个 chunk，补充引用上下文而不扩大返回正文。
-                rows = conn.execute(
-                    """
-                    SELECT chunk_id, chunk_index, content
-                    FROM chunks
-                    WHERE doc_id=? AND chunk_index IN (?, ?)
-                    """,
-                    (item["doc_id"], int(chunk_index) - 1, int(chunk_index) + 1),
-                ).fetchall()
-                for row in rows:
-                    if row["chunk_index"] == int(chunk_index) - 1:
-                        prev_chunk_id = row["chunk_id"]
-                        prev_content = row["content"] or ""
-                    elif row["chunk_index"] == int(chunk_index) + 1:
-                        next_chunk_id = row["chunk_id"]
-                        next_content = row["content"] or ""
-
             section_path_json = json.dumps(item.get("section_path") or [], ensure_ascii=False, separators=(",", ":"))
             section = conn.execute(
                 """
@@ -523,11 +500,11 @@ def helper_enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]
             if display_heading and helper_is_journal_header_title(str(display_heading)):
                 display_heading = item.get("title")
             updated["heading"] = display_heading
-            updated["prev_chunk_id"] = prev_chunk_id
-            updated["next_chunk_id"] = next_chunk_id
+            updated["prev_chunk_id"] = None
+            updated["next_chunk_id"] = None
             updated["char_start"] = char_start
             updated["char_end"] = char_end
-            updated["source_quote_context"] = helper_source_quote_context(prev_content, item.get("content", ""), next_content)
+            updated["source_quote_context"] = helper_source_quote_context("", item.get("content", ""), "")
             enriched.append(updated)
     return enriched
 
@@ -608,7 +585,7 @@ def recall_chunks_hybrid(
 ) -> list[dict[str, Any]]:
     """Fuse BM25 and Dense channels, then return the pre-rerank candidate pool."""
     channel_n = max(bm25_top_n, vector_top_n, topk)
-    recall_n = channel_n * 10 if clinical_department else channel_n
+    recall_n = channel_n
     bm25_pool = retrieve_chunks_sqlite(
         query, db_path, source_institution=source_institution, clinical_department=clinical_department,
         time_range=time_range, topk=recall_n, exclude_reference_sections=exclude_reference_sections,

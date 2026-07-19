@@ -285,28 +285,6 @@ def helper_enrich_chunk_context_pg(dsn: str | None, items: list[dict[str, Any]])
     with connect(dsn) as conn:
         with conn.cursor() as cur:
             for item in items:
-                chunk_index = item.get("chunk_index")
-                prev_chunk_id = None
-                next_chunk_id = None
-                prev_content = ""
-                next_content = ""
-                if chunk_index is not None:
-                    cur.execute(
-                        """
-                        SELECT chunk_id, chunk_index, content
-                        FROM chunks
-                        WHERE doc_id=%s AND chunk_index IN (%s, %s)
-                        """,
-                        (item["doc_id"], int(chunk_index) - 1, int(chunk_index) + 1),
-                    )
-                    for row in cur.fetchall():
-                        if row[1] == int(chunk_index) - 1:
-                            prev_chunk_id = row[0]
-                            prev_content = row[2] or ""
-                        elif row[1] == int(chunk_index) + 1:
-                            next_chunk_id = row[0]
-                            next_content = row[2] or ""
-
                 heading = None
                 section_char_start = None
                 section_char_end = None
@@ -330,12 +308,12 @@ def helper_enrich_chunk_context_pg(dsn: str | None, items: list[dict[str, Any]])
                 section_path_items = helper_section_path_items(item.get("section_path"))
                 updated = dict(item)
                 updated["heading"] = heading or ((section_path_items or [None])[-1])
-                updated["prev_chunk_id"] = prev_chunk_id
-                updated["next_chunk_id"] = next_chunk_id
+                updated["prev_chunk_id"] = None
+                updated["next_chunk_id"] = None
                 updated["char_start"] = section_char_start
                 updated["char_end"] = section_char_end
                 updated["char_span_kind"] = "section" if section_char_start is not None or section_char_end is not None else None
-                updated["source_quote_context"] = helper_source_quote_context(prev_content, item.get("content", ""), next_content)
+                updated["source_quote_context"] = helper_source_quote_context("", item.get("content", ""), "")
                 enriched.append(updated)
     return enriched
 
@@ -388,7 +366,7 @@ def search_documents_hybrid_pg(
     require_vector = pg_vector_retrieval_required()
     if require_vector:
         helper_assert_pg_vectors_ready(dsn, model_name)
-    recall_n = 500 if clinical_department else 100
+    recall_n = 100
     card_text = search_document_cards_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
     view_text = search_document_views_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
     try:
@@ -439,7 +417,7 @@ def retrieve_chunks_hybrid_pg(
     require_vector = pg_vector_retrieval_required()
     if require_vector:
         helper_assert_pg_vectors_ready(dsn, model_name)
-    recall_n = 1000 if clinical_department else 100
+    recall_n = 100
     text_ranked = retrieve_chunks_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
     try:
         vector_ranked = vector_retrieve_chunks_pg(

@@ -475,8 +475,7 @@ def search_documents_multiview(
     card_bm25_ids, card_dense_ids, card_records = helper_card_recall(query, config)
     view_bm25_doc_ids, view_dense_doc_ids, matched_views = helper_view_recall(query, config)
     chunk_doc_ids, chunk_by_doc = helper_chunk_doc_recall(query, config)
-    # 科室检索扩大候选池，给单科室和综合科室路由留下足够选择空间。
-    fused = helper_fuse_doc_ids(card_bm25_ids, card_dense_ids, view_bm25_doc_ids, view_dense_doc_ids, chunk_doc_ids, 500 if clinical_department else 50)
+    fused = helper_fuse_doc_ids(card_bm25_ids, card_dense_ids, view_bm25_doc_ids, view_dense_doc_ids, chunk_doc_ids, 50)
     all_candidate_ids = [doc_id for doc_id, _score in fused]
     route_docs = helper_document_rows(db_path, all_candidate_ids, source_institution, clinical_department, time_range, publication_date, document_kind)
     # 路由只改变候选配额，不改写各渠道分数，最终排序仍由统一重排器完成。
