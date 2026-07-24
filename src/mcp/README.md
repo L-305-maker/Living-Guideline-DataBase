@@ -9,6 +9,8 @@
 | `api_search.py`、`api_retrieve.py`、`api_read.py` | 本地后端的搜索、证据检索和全文读取接口 |
 | `api_pg.py` | PostgreSQL 后端 JSON API |
 | `call_logger.py` | 记录工具名、参数、实际结果摘要、耗时和错误 |
+| `response_projection.py` | 将内部检索结果投影为稳定、紧凑的 MCP 返回结构 |
+| `server_common.py` | 统一环境变量解析、工具请求载荷和服务启动校验 |
 | `smoke_test.py` | 基础服务冒烟检查 |
 | `__main__.py` | 包命令行入口 |
 

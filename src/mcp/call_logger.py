@@ -9,6 +9,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
+from src.mcp.server_common import (
+    env_bool as helper_env_bool,
+    env_int as helper_env_int,
+)
 
 
 ResultT = TypeVar("ResultT")
@@ -20,21 +24,6 @@ DEFAULT_MAX_LIST_ITEMS = 20
 DEFAULT_MAX_RESULT_LIST_ITEMS = 50
 
 
-def helper_env_bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def helper_env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
 
 
 def helper_env_int_from(names: list[str], default: int) -> int:
@@ -118,12 +107,13 @@ def helper_write_record(record: dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError:
-        # Logging should never break the MCP tool call path.
+        # 审计日志写入失败不能中断 MCP 工具的主调用链路。
         return
 
 
 def log_mcp_call(tool_name: str, backend: str, payload: dict[str, Any], call: Callable[[], ResultT]) -> ResultT:
     """Execute an MCP tool call and append one JSONL audit record."""
+    # 参数与结果分别脱敏和截断；业务异常写入审计记录后必须原样重新抛出。
 
     payload_max_string_chars = helper_env_int_from(
         ["MCP_CALL_LOG_MAX_PAYLOAD_STRING_CHARS", "MCP_CALL_LOG_MAX_STRING_CHARS"],

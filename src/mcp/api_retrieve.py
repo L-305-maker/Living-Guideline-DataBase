@@ -30,6 +30,7 @@ def helper_matches(record: dict[str, Any], request: RetrieveInput) -> bool:
 
 
 def retrieve(payload: dict[str, Any] | RetrieveInput, data_dir: str | Path = DATA_DIR) -> list[dict[str, Any]]:
+    # 先规范化请求与后端配置，再执行指南优先、共识补位的检索契约。
     request = helper_validate(payload)
     index_dir = Path(data_dir) / "index"
     sqlite_path = index_dir / DEFAULT_DB_PATH.name

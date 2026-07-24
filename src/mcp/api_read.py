@@ -16,6 +16,7 @@ def helper_validate(payload: dict[str, Any] | ReadInput) -> ReadInput:
 
 
 def read(payload: dict[str, Any] | ReadInput, data_dir: str | Path = DATA_DIR) -> dict[str, Any]:
+    # 读取优先使用稳定 doc_id；标题仅作为兼容入口，且最终必须收敛到唯一文档。
     request = helper_validate(payload)
     sqlite_path = Path(data_dir) / "index" / DEFAULT_DB_PATH.name
     if sqlite_path.exists():

@@ -6,13 +6,24 @@ import os
 from pathlib import Path
 from typing import Any
 
+from src.mcp.server_common import (
+    env_bool as helper_env_bool,
+    env_int as helper_env_int,
+    read_payload,
+    retrieve_payload,
+    run_server,
+    search_payload,
+)
 from src.mcp.call_logger import log_mcp_call
 from src.utils.io import DATA_DIR as DEFAULT_DATA_DIR
 
 BACKEND = os.environ.get("RAG_BACKEND", "local").strip().lower()
+IS_POSTGRES_BACKEND = BACKEND in {"postgres", "postgresql", "pg"}
+SEARCH_DEFAULT_TOPK = 10 if IS_POSTGRES_BACKEND else 20
+RETRIEVE_DEFAULT_TOPK = 5 if IS_POSTGRES_BACKEND else 30
 DATA_DIR = Path(os.environ.get("RAG_DATA_DIR", str(DEFAULT_DATA_DIR)))
 
-if BACKEND in {"postgres", "postgresql", "pg"}:
+if IS_POSTGRES_BACKEND:
     from src.mcp.api_pg import read_pg as read_api
     from src.mcp.api_pg import retrieve_pg as retrieve_api
     from src.mcp.api_pg import search_pg as search_api
@@ -27,18 +38,6 @@ except ImportError:  # pragma: no cover
     FastMCP = None  # type: ignore[assignment]
 
 
-def helper_env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def helper_env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return int(value)
 
 
 mcp = (
@@ -59,7 +58,7 @@ mcp = (
 
 def helper_call_api(tool_name: str, api: Any, payload: dict[str, Any]) -> Any:
     def call() -> Any:
-        if BACKEND in {"postgres", "postgresql", "pg"}:
+        if IS_POSTGRES_BACKEND:
             return api(payload)
         return api(payload, data_dir=DATA_DIR)
 
@@ -76,29 +75,29 @@ if mcp is not None:
         time_range: str | None = None,
         publication_date: str | None = None,
         recency_boost: bool = False,
-        topk: int = 20,
+        topk: int = SEARCH_DEFAULT_TOPK,
     ) -> list[dict[str, Any]]:
         """Search candidate guideline documents by keywords, source institution, and time range."""
 
         return helper_call_api(
             "search",
             search_api,
-            {
-                "query": query,
-                "source_institution": source_institution,
-                "clinical_department": clinical_department,
-                "time_range": time_range,
-                "publication_date": publication_date,
-                "recency_boost": recency_boost,
-                "topk": topk,
-            },
+            search_payload(
+                query,
+                source_institution,
+                clinical_department,
+                time_range,
+                publication_date,
+                recency_boost,
+                topk,
+            ),
         )
 
     @mcp.tool()
     def read(doc_id: str | None = None, title: str | None = None, max_chars: int | None = None) -> dict[str, Any]:
         """Read a full clean Markdown document by doc_id or title."""
 
-        return helper_call_api("read", read_api, {"doc_id": doc_id, "title": title, "max_chars": max_chars})
+        return helper_call_api("read", read_api, read_payload(doc_id, title, max_chars))
 
     @mcp.tool()
     def retrieve(
@@ -107,31 +106,26 @@ if mcp is not None:
         clinical_department: str | None = None,
         time_range: str | None = None,
         publication_date: str | None = None,
-        topk: int = 30,
+        topk: int = RETRIEVE_DEFAULT_TOPK,
     ) -> list[dict[str, Any]]:
         """Retrieve traceable chunks with BM25+Dense recall followed by one reranker pass."""
 
         return helper_call_api(
             "retrieve",
             retrieve_api,
-            {
-                "query": query,
-                "source_institution": source_institution,
-                "clinical_department": clinical_department,
-                "time_range": time_range,
-                "publication_date": publication_date,
-                "topk": topk,
-            },
+            retrieve_payload(
+                query,
+                source_institution,
+                clinical_department,
+                time_range,
+                publication_date,
+                topk,
+            ),
         )
 
 
 def main() -> None:
-    if mcp is None:
-        raise RuntimeError("Install mcp>=1.9 to run the MCP server: python -m pip install mcp>=1.9")
-    transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
-    if transport not in {"stdio", "sse", "streamable-http"}:
-        raise ValueError("MCP_TRANSPORT must be one of: stdio, sse, streamable-http")
-    mcp.run(transport=transport, mount_path=os.environ.get("MCP_MOUNT_PATH"))
+    run_server(mcp)
 
 
 if __name__ == "__main__":
