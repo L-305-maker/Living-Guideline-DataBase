@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import re
@@ -115,7 +114,7 @@ def metadata_for(row: dict[str, Any], raw: str, report: Any) -> dict[str, Any]:
     source = Path(row["source_file"])
     title = preferred_title(row, raw, source)
     publication_date = extract_publication_date(source, raw)
-    institution = extract_source_institution(source, raw, title=title, document_kind=row["document_kind"])
+    institution = extract_source_institution(source, raw, title=title)
     doc_id = make_doc_id(institution, publication_date, row["sha256"])
     body = helper_ensure_title_heading(raw, title)
     abstract = extract_abstract(body)
