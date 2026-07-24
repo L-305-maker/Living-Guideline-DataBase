@@ -9,6 +9,8 @@
 | `front_matter.py` | 解析和输出 Markdown front matter |
 | `metadata.py` | 标题、摘要、日期和机构等元数据提取与清洗 |
 | `clinical_department.py` | 基于标题、摘要和正文信号进行临床科室分类 |
+| `text.py` | 提供跨切分与检索阶段一致的分词、token 粗估和空白规范化 |
+| `records.py` | 统一年份、布尔值、科室字段和旧版检索文本的记录规范化 |
 
 ## 使用约束
 

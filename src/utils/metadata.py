@@ -113,15 +113,13 @@ def helper_has_cma_signal(text: str) -> bool:
     return bool(CMA_GENERIC_ORG_RE.search(text))
 
 
-def extract_source_institution(pdf_path: str | Path, text: str = "", title: str = "", document_kind: str = "") -> str:
+def extract_source_institution(pdf_path: str | Path, text: str = "", title: str = "") -> str:
     path = Path(pdf_path)
     path_hint = helper_source_from_path(path)
     if path_hint:
         return path_hint
 
-    # Only use title, file name, and pre-abstract author/header area for source
-    # inference. Full-body acronym scanning causes false positives when a
-    # consensus cites another organization's methodology handbook.
+    # 仅使用标题、文件名和摘要前的作者区推断来源；扫描全文会把正文引用的机构误判为发布方。
     header = helper_source_header(text)
     source_haystack = f"{path.name}\n{title}\n{header}"
     if helper_has_cma_signal(source_haystack):
@@ -147,7 +145,7 @@ def helper_candidate_years(text: str) -> list[int]:
 
 
 def extract_publication_date(pdf_path: str | Path, text: str = "") -> str:
-    # Prefer file names because journal headers often contain unrelated historical years.
+    # 优先使用文件名中的年份，期刊页眉可能包含与发布日期无关的历史年份。
     file_years = helper_candidate_years(str(pdf_path))
     if file_years:
         return f"{file_years[0]}-01-01"
