@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from functools import lru_cache
+from collections.abc import Callable
 from typing import Any
 
 from src.retrieval.reranker import ChunkReranker, DocumentReranker, default_chunk_reranker, default_document_reranker
+from src.retrieval.common import (
+    fill_consensus_fallback as helper_fill_consensus_fallback,
+    source_quote_context as helper_source_quote_context,
+)
 from src.retrieval.rrf import rrf_fusion
 from src.storage.query_embedding import DEFAULT_MODEL, query_vector_literal
 from src.storage.postgres_store import (
@@ -18,6 +24,9 @@ from src.storage.postgres_store import (
     search_document_views_pg,
 )
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 def helper_query_vector(query: str, model_name: str) -> str:
     return query_vector_literal(query, model_name)
@@ -190,6 +199,7 @@ def vector_retrieve_chunks_pg(
     model_name: str = DEFAULT_MODEL,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
+    # 查询向量、向量表记录和过滤条件必须使用同一模型标识，避免混用历史向量。
     vector = helper_query_vector(query, model_name)
     params: list[Any] = [vector, model_name]
     where = ["e.model = %s", "c.is_reference_section = false"]
@@ -245,21 +255,6 @@ def vector_retrieve_chunks_pg(
     ]
 
 
-def helper_clip_text(text: str, limit: int) -> str:
-    text = " ".join((text or "").split())
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
-
-
-def helper_source_quote_context(prev_content: str, content: str, next_content: str) -> str:
-    parts = []
-    if prev_content:
-        parts.append("[previous] " + helper_clip_text(prev_content[-500:], 500))
-    parts.append("[current] " + helper_clip_text(content, 1400))
-    if next_content:
-        parts.append("[next] " + helper_clip_text(next_content[:500], 500))
-    return "\n".join(parts)
 
 
 def helper_section_path_items(section_path: Any) -> list[Any]:
@@ -356,6 +351,23 @@ def helper_route_chunks_pg(items: list[dict[str, Any]], dsn: str | None, clinica
     return sorted(selected, key=lambda item: rank[item["chunk_id"]])[:100]
 
 
+def helper_optional_vector_channel(
+    channel: str,
+    required: bool,
+    search: Callable[..., list[dict[str, Any]]],
+    *args: Any,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """执行可选向量通道；仅在明确允许降级时返回空结果。"""
+
+    try:
+        return search(*args, **kwargs)
+    except Exception:
+        if required:
+            raise
+        # PostgreSQL 驱动异常类型是可选依赖，统一在此边界记录后降级，避免三处重复捕获。
+        LOGGER.warning("向量检索通道 %s 不可用，已降级为文本检索", channel, exc_info=True)
+        return []
 def search_documents_hybrid_pg(
     query: str, dsn: str | None = None, source_institution: str | None = None,
     clinical_department: str | None = None, time_range: str | dict[str, str] | None = None,
@@ -366,25 +378,25 @@ def search_documents_hybrid_pg(
     require_vector = pg_vector_retrieval_required()
     if require_vector:
         helper_assert_pg_vectors_ready(dsn, model_name)
-    recall_n = 100
+    if pool_size < 1:
+        raise ValueError("pool_size must be positive")
+    recall_n = max(pool_size, topk)
     card_text = search_document_cards_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
     view_text = search_document_views_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
-    try:
-        card_dense = vector_search_document_cards_pg(
-            query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, model_name, document_kind=document_kind
-        )
-    except Exception:
-        if require_vector:
-            raise
-        card_dense = []
-    try:
-        view_dense = vector_search_document_views_pg(
-            query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, model_name, document_kind=document_kind
-        )
-    except Exception:
-        if require_vector:
-            raise
-        view_dense = []
+    card_dense = helper_optional_vector_channel(
+        "document_cards",
+        require_vector,
+        vector_search_document_cards_pg,
+        query, dsn, source_institution, clinical_department, time_range, publication_date,
+        recall_n, model_name, document_kind=document_kind,
+    )
+    view_dense = helper_optional_vector_channel(
+        "document_views",
+        require_vector,
+        vector_search_document_views_pg,
+        query, dsn, source_institution, clinical_department, time_range, publication_date,
+        recall_n, model_name, document_kind=document_kind,
+    )
     # RRF 只接收非空通道；空通道不应占用名次权重或改变融合分母。
     channels = [ranked for ranked in (card_text, view_text, card_dense, view_dense) if ranked]
     if not channels:
@@ -417,16 +429,17 @@ def retrieve_chunks_hybrid_pg(
     require_vector = pg_vector_retrieval_required()
     if require_vector:
         helper_assert_pg_vectors_ready(dsn, model_name)
-    recall_n = 100
+    if pool_size < 1:
+        raise ValueError("pool_size must be positive")
+    recall_n = max(pool_size, topk)
     text_ranked = retrieve_chunks_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
-    try:
-        vector_ranked = vector_retrieve_chunks_pg(
-            query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, model_name, document_kind=document_kind
-        )
-    except Exception:
-        if require_vector:
-            raise
-        vector_ranked = []
+    vector_ranked = helper_optional_vector_channel(
+        "chunks",
+        require_vector,
+        vector_retrieve_chunks_pg,
+        query, dsn, source_institution, clinical_department, time_range, publication_date,
+        recall_n, model_name, document_kind=document_kind,
+    )
     # 分块阶段同样融合词法与向量名次，而不是直接比较量纲不同的原始分数。
     channels = [ranked for ranked in (text_ranked, vector_ranked) if ranked]
     if not channels:
@@ -482,19 +495,15 @@ def search_documents_with_consensus_fallback_pg(
         query, dsn, source_institution, clinical_department, time_range, publication_date,
         topk=wanted, reranker=reranker, document_kind="guideline",
     )
-    output = [{**item, "document_kind": "guideline", "is_fallback": False} for item in guidelines]
-    deficit = wanted - len(output)
-    if deficit > 0:
-        consensus = search_documents_hybrid_pg(
+    output = helper_fill_consensus_fallback(
+        guidelines,
+        wanted,
+        lambda deficit: search_documents_hybrid_pg(
             query, dsn, source_institution, clinical_department, time_range, publication_date,
             topk=deficit, reranker=reranker, document_kind="consensus",
-        )
-        output.extend(
-            {**item, "document_kind": "consensus", "is_fallback": True,
-             "fallback_reason": "insufficient_guideline_results", "fallback_rank": rank}
-            for rank, item in enumerate(consensus, 1)
-        )
-    return helper_attach_document_views_pg(output[:wanted], dsn)
+        ),
+    )
+    return helper_attach_document_views_pg(output, dsn)
 
 
 def retrieve_chunks_with_consensus_fallback_pg(
@@ -507,17 +516,11 @@ def retrieve_chunks_with_consensus_fallback_pg(
         query, dsn, source_institution, clinical_department, time_range, publication_date,
         topk=wanted, reranker=reranker, document_kind="guideline",
     )
-    output = [{**item, "document_kind": "guideline", "is_fallback": False} for item in guidelines]
-    deficit = wanted - len(output)
-    if deficit <= 0:
-        return output
-    consensus = retrieve_chunks_hybrid_pg(
-        query, dsn, source_institution, clinical_department, time_range, publication_date,
-        topk=deficit, reranker=reranker, document_kind="consensus",
+    return helper_fill_consensus_fallback(
+        guidelines,
+        wanted,
+        lambda deficit: retrieve_chunks_hybrid_pg(
+            query, dsn, source_institution, clinical_department, time_range, publication_date,
+            topk=deficit, reranker=reranker, document_kind="consensus",
+        ),
     )
-    output.extend(
-        {**item, "document_kind": "consensus", "is_fallback": True,
-         "fallback_reason": "insufficient_guideline_results", "fallback_rank": rank}
-        for rank, item in enumerate(consensus, 1)
-    )
-    return output[:wanted]

@@ -11,6 +11,11 @@ from typing import Any, Iterable, Iterator
 
 from src.retrieval.chunk_normalizer import iter_normalized_chunks
 from src.utils.io import DATA_DIR, read_jsonl
+from src.utils.records import (
+    department_text as helper_department_text,
+    publication_year as helper_year,
+    truthy as helper_truthy,
+)
 
 
 SCHEMA_SQL = """
@@ -217,7 +222,7 @@ CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_cosine
 def get_dsn(cli_dsn: str | None = None) -> str:
     if cli_dsn:
         return cli_dsn
-    for name in ["POSTGRES_DSN", "DATABASE_URL", "PostgreSQL"]:
+    for name in ["POSTGRES_DSN", "DATABASE_URL"]:
         value = os.environ.get(name)
         if value:
             return value
@@ -240,17 +245,12 @@ def connect(dsn: str | None = None):
     return psycopg.connect(get_dsn(dsn))
 
 
-def helper_year(publication_date: str | None) -> int | None:
-    match = re.search(r"(19\d{2}|20\d{2})", publication_date or "")
-    return int(match.group(1)) if match else None
 
 
 def serialize_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def helper_truthy(value: Any) -> bool:
-    return value is True or str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
 def init_schema(dsn: str | None = None, with_vector: bool = False) -> dict[str, Any]:
@@ -291,9 +291,6 @@ def reset_schema(dsn: str | None = None, with_vector: bool = False) -> dict[str,
     return init_schema(dsn, with_vector)
 
 
-def helper_department_text(record: dict[str, Any]) -> str:
-    labels = record.get("clinical_departments") or [record.get("clinical_department") or "未分类"]
-    return "|".join(dict.fromkeys(str(label) for label in labels if label)) or "未分类"
 
 
 def helper_data_artifact_path(data_dir: Path, stored_path: str | None, folder: str, doc_id: str) -> Path:
@@ -304,9 +301,13 @@ def helper_data_artifact_path(data_dir: Path, stored_path: str | None, folder: s
     return data_dir / folder / f"{doc_id}.md"
 
 
-def iter_document_rows(data_dir: Path) -> Iterator[tuple[Any, ...]]:
+def iter_document_rows(
+    data_dir: Path, allowed_doc_ids: set[str] | None = None
+) -> Iterator[tuple[Any, ...]]:
     for rec in read_jsonl(data_dir / "documents.jsonl"):
         doc_id = rec["doc_id"]
+        if allowed_doc_ids is not None and doc_id not in allowed_doc_ids:
+            continue
         clean_path = helper_data_artifact_path(data_dir, rec.get("markdown_clean_path"), "markdown_clean", doc_id)
         raw_path = helper_data_artifact_path(data_dir, rec.get("markdown_raw_path"), "markdown_raw", doc_id)
         if not clean_path.is_file():
@@ -331,7 +332,9 @@ def iter_document_rows(data_dir: Path) -> Iterator[tuple[Any, ...]]:
 def helper_document_rows(data_dir: Path) -> list[tuple[Any, ...]]:
     return list(iter_document_rows(data_dir))
 
+
 def iter_document_card_rows(data_dir: Path, allowed_doc_ids: set[str] | None = None) -> Iterator[tuple[Any, ...]]:
+    # 只为允许服务的文档生成卡片行，并在写库前统一日期、质量和 JSON 字段。
     path = data_dir / "document_cards.jsonl"
     if not path.exists():
         return
@@ -365,6 +368,7 @@ def iter_document_card_rows(data_dir: Path, allowed_doc_ids: set[str] | None = N
 
 
 def iter_document_view_rows(data_dir: Path, allowed_doc_ids: set[str] | None = None) -> Iterator[tuple[Any, ...]]:
+    # 视图行继承文档级质量信息，但保留独立 view_id、类型和优先级。
     path = data_dir / "document_views.jsonl"
     if not path.exists():
         return
@@ -399,9 +403,13 @@ def iter_document_view_rows(data_dir: Path, allowed_doc_ids: set[str] | None = N
         )
 
 
-def iter_section_rows(data_dir: Path) -> Iterator[tuple[Any, ...]]:
+def iter_section_rows(
+    data_dir: Path, allowed_doc_ids: set[str] | None = None
+) -> Iterator[tuple[Any, ...]]:
     for path in sorted((data_dir / "sections").glob("*.jsonl")):
         for index, rec in enumerate(read_jsonl(path)):
+            if allowed_doc_ids is not None and rec["doc_id"] not in allowed_doc_ids:
+                continue
             yield (
                 rec["doc_id"],
                 index,
@@ -420,8 +428,13 @@ def iter_section_rows(data_dir: Path) -> Iterator[tuple[Any, ...]]:
             )
 
 
-def iter_chunk_rows(data_dir: Path) -> Iterator[tuple[Any, ...]]:
+def iter_chunk_rows(
+    data_dir: Path, allowed_doc_ids: set[str] | None = None
+) -> Iterator[tuple[Any, ...]]:
+    # 分块入库前统一兼容字段和 JSON 结构，且只接受当前权威文档集合中的记录。
     for rec in iter_normalized_chunks(data_dir):
+        if allowed_doc_ids is not None and rec["doc_id"] not in allowed_doc_ids:
+            continue
         yield (
             rec["chunk_id"],
             rec["doc_id"],
@@ -463,7 +476,13 @@ def helper_chunk_rows(data_dir: Path) -> list[tuple[Any, ...]]:
     return list(iter_chunk_rows(data_dir))
 
 
-def helper_insert_batches(conn: Any, sql: str, rows: Iterable[tuple[Any, ...]], batch_size: int) -> int:
+def helper_insert_batches(
+    conn: Any,
+    sql: str,
+    rows: Iterable[tuple[Any, ...]],
+    batch_size: int,
+    commit_each_batch: bool = True,
+) -> int:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     count = 0
@@ -474,43 +493,69 @@ def helper_insert_batches(conn: Any, sql: str, rows: Iterable[tuple[Any, ...]], 
             if len(batch) < batch_size:
                 continue
             cur.executemany(sql, batch)
-            conn.commit()
-            count += len(batch)
+            if commit_each_batch:
+                conn.commit()
+            count += cur.rowcount if cur.rowcount >= 0 else len(batch)
             batch.clear()
         if batch:
             cur.executemany(sql, batch)
-            conn.commit()
-            count += len(batch)
+            if commit_each_batch:
+                conn.commit()
+            count += cur.rowcount if cur.rowcount >= 0 else len(batch)
     return count
 
 
-def ingest_data(dsn: str | None = None, data_dir: str | Path = DATA_DIR, batch_size: int = 500) -> dict[str, Any]:
+def ingest_data(
+    dsn: str | None = None,
+    data_dir: str | Path = DATA_DIR,
+    batch_size: int = 500,
+    incremental: bool = False,
+) -> dict[str, Any]:
+    # 全量模式先清空依赖表；增量模式锁定目标并仅追加新 doc_id，整批完成后再提交。
     data_path = Path(data_dir)
-    allowed_doc_ids = {rec["doc_id"] for rec in read_jsonl(data_path / "documents.jsonl")}
-    with connect(dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM chunks")
-            cur.execute("DELETE FROM sections")
-            cur.execute("DELETE FROM document_views")
-            cur.execute("DELETE FROM document_cards")
-            cur.execute("DELETE FROM documents")
-        conn.commit()
+    input_doc_ids = [rec["doc_id"] for rec in read_jsonl(data_path / "documents.jsonl")]
+    allowed_doc_ids = set(input_doc_ids)
+    if len(allowed_doc_ids) != len(input_doc_ids):
+        raise ValueError("documents.jsonl contains duplicate doc_id values")
 
+    with connect(dsn) as conn:
+        existing_doc_ids: set[str] = set()
+        if incremental:
+            if allowed_doc_ids:
+                with conn.cursor() as cur:
+                    cur.execute("LOCK TABLE documents IN SHARE ROW EXCLUSIVE MODE")
+                    cur.execute("SELECT doc_id FROM documents WHERE doc_id = ANY(%s)", (sorted(allowed_doc_ids),))
+                    existing_doc_ids = {row[0] for row in cur.fetchall()}
+            target_doc_ids = allowed_doc_ids - existing_doc_ids
+        else:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM chunks")
+                cur.execute("DELETE FROM sections")
+                cur.execute("DELETE FROM document_views")
+                cur.execute("DELETE FROM document_cards")
+                cur.execute("DELETE FROM documents")
+            conn.commit()
+            target_doc_ids = allowed_doc_ids
+
+        conflict_clause = " ON CONFLICT DO NOTHING" if incremental else ""
+        commit_each_batch = not incremental
         counts = {
             "documents": helper_insert_batches(
                 conn,
-                """
+                f"""
                 INSERT INTO documents
                 (doc_id, title, abstract, publication_date, publication_year, source_institution, clinical_department, document_kind, source_file,
                  markdown_raw_path, markdown_clean_path, content_sha256, content_md)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                {conflict_clause}
                 """,
-                iter_document_rows(data_path),
+                iter_document_rows(data_path, target_doc_ids),
                 batch_size,
+                commit_each_batch,
             ),
             "document_cards": helper_insert_batches(
                 conn,
-                """
+                f"""
                 INSERT INTO document_cards
                 (doc_id, title, publication_date, publication_year, source_institution, clinical_department,
                  markdown_clean_path, cleaning_quality, cleaning_flags,
@@ -518,13 +563,15 @@ def ingest_data(dsn: str | None = None, data_dir: str | Path = DATA_DIR, batch_s
                  pdf_text_quality, pdf_needs_ocr, pdf_is_scanned, ocr_engine, ocr_applied, ocr_status, ocr_error,
                  card_text, fields_json)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                {conflict_clause}
                 """,
-                iter_document_card_rows(data_path, allowed_doc_ids),
+                iter_document_card_rows(data_path, target_doc_ids),
                 batch_size,
+                commit_each_batch,
             ),
             "document_views": helper_insert_batches(
                 conn,
-                """
+                f"""
                 INSERT INTO document_views
                 (view_id, doc_id, view_type, priority, title, publication_date, publication_year,
                  source_institution, clinical_department, markdown_clean_path, cleaning_quality, cleaning_flags,
@@ -532,35 +579,78 @@ def ingest_data(dsn: str | None = None, data_dir: str | Path = DATA_DIR, batch_s
                  pdf_text_quality, pdf_needs_ocr, pdf_is_scanned, ocr_engine, ocr_applied, ocr_status, ocr_error,
                  text)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                {conflict_clause}
                 """,
-                iter_document_view_rows(data_path, allowed_doc_ids),
+                iter_document_view_rows(data_path, target_doc_ids),
                 batch_size,
+                commit_each_batch,
             ),
             "sections": helper_insert_batches(
                 conn,
-                """
+                f"""
                 INSERT INTO sections
                 (doc_id, section_index, title, publication_date, publication_year, source_institution, clinical_department, section_path,
                  heading, heading_level, char_start, char_end, is_reference_section, content)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s)
+                {conflict_clause}
                 """,
-                iter_section_rows(data_path),
+                iter_section_rows(data_path, target_doc_ids),
                 batch_size,
+                commit_each_batch,
             ),
             "chunks": helper_insert_batches(
                 conn,
-                """
+                f"""
                 INSERT INTO chunks
                 (chunk_id, doc_id, title, publication_date, publication_year, source_institution, clinical_department, section_path,
                  section_path_text, chunk_index, content, retrieval_text, chunk_type, text_for_embedding, recommendation, evidence,
                  chunk_metadata, retrieval_key, source_file, markdown_clean_path, is_reference_section)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s)
+                {conflict_clause}
                 """,
-                iter_chunk_rows(data_path),
+                iter_chunk_rows(data_path, target_doc_ids),
                 batch_size,
+                commit_each_batch,
             ),
         }
+        if incremental:
+            conn.commit()
+            counts["skipped_existing_documents"] = len(existing_doc_ids)
     return counts
+
+
+def ingest_sections(
+    dsn: str | None = None,
+    data_dir: str | Path = DATA_DIR,
+    batch_size: int = 500,
+) -> dict[str, int]:
+    data_path = Path(data_dir)
+    input_doc_ids = [rec["doc_id"] for rec in read_jsonl(data_path / "documents.jsonl")]
+    allowed_doc_ids = set(input_doc_ids)
+    if len(allowed_doc_ids) != len(input_doc_ids):
+        raise ValueError("documents.jsonl contains duplicate doc_id values")
+
+    with connect(dsn) as conn:
+        existing_doc_ids: set[str] = set()
+        if allowed_doc_ids:
+            with conn.cursor() as cur:
+                cur.execute("SELECT doc_id FROM documents WHERE doc_id = ANY(%s)", (sorted(allowed_doc_ids),))
+                existing_doc_ids = {row[0] for row in cur.fetchall()}
+        inserted = helper_insert_batches(
+            conn,
+            """
+            INSERT INTO sections
+            (doc_id, section_index, title, publication_date, publication_year, source_institution, clinical_department, section_path,
+             heading, heading_level, char_start, char_end, is_reference_section, content)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT DO NOTHING
+            """,
+            iter_section_rows(data_path, existing_doc_ids),
+            batch_size,
+            commit_each_batch=False,
+        )
+        conn.commit()
+    return {"matched_documents": len(existing_doc_ids), "sections_inserted": inserted}
 
 def helper_kind_counts(cur: Any, table: str) -> dict[str, int]:
     if table == "documents":
@@ -692,6 +782,7 @@ def search_document_cards_pg(
     topk: int = 50,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
+    # PostgreSQL 全文检索先应用文档类型和元数据过滤，再按 ts_rank 返回稳定候选。
     params: list[Any] = [query, query]
     where = ["websearch_to_tsquery('simple', %s) @@ dc.content_tsv"]
     if source_institution:
@@ -826,6 +917,7 @@ def retrieve_chunks_pg(
     topk: int = 5,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
+    # 分块词法检索在 SQL 层排除不合格文档和参考文献，返回时保留完整追踪字段。
     params: list[Any] = [query, query]
     where = ["websearch_to_tsquery('simple', %s) @@ c.content_tsv", "c.is_reference_section = false"]
     if source_institution:
@@ -885,6 +977,7 @@ def read_document_pg(
     title: str | None = None,
     max_chars: int | None = None,
 ) -> dict[str, Any]:
+    # 读取只允许 doc_id 或标题定位，命中后再按 max_chars 截断展示内容。
     if not doc_id and not title:
         raise ValueError("read_document_pg requires either doc_id or title")
     with connect(dsn) as conn:
@@ -933,11 +1026,16 @@ def read_document_pg(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["init", "reset", "ingest", "index-vectors", "stats", "verify"])
+    parser.add_argument("command", choices=["init", "reset", "ingest", "ingest-sections", "index-vectors", "stats", "verify"])
     parser.add_argument("--dsn")
     parser.add_argument("--data-dir", default=str(DATA_DIR))
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--with-vector", action="store_true")
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="For ingest, append only new doc_ids and leave existing documents unchanged.",
+    )
     parser.add_argument("--model", default=os.getenv("PG_VECTOR_MODEL", "BAAI/bge-m3"))
     args = parser.parse_args()
     if args.command == "init":
@@ -945,7 +1043,9 @@ def main() -> None:
     elif args.command == "reset":
         payload = reset_schema(args.dsn, args.with_vector)
     elif args.command == "ingest":
-        payload = ingest_data(args.dsn, args.data_dir, args.batch_size)
+        payload = ingest_data(args.dsn, args.data_dir, args.batch_size, args.incremental)
+    elif args.command == "ingest-sections":
+        payload = ingest_sections(args.dsn, args.data_dir, args.batch_size)
     elif args.command == "index-vectors":
         payload = create_vector_indexes(args.dsn)
     elif args.command == "verify":
