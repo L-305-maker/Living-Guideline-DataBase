@@ -51,6 +51,7 @@ POPULATION_RE = re.compile(r"\b(target population|population|intended audience)\
 
 
 def classify_block_type(block_text: str, heading_path: list[str]) -> str:
+    # 分类规则按强信号优先级依次判定，默认类型只能在所有专用规则均未命中后使用。
     text = block_text or ""
     heading_text = " > ".join(heading_path or [])
     combined = f"{heading_text}\n{text}".strip()

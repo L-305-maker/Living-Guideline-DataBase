@@ -18,6 +18,7 @@
 | `evaluation.py` | 检查召回和结构保持效果 |
 | `models.py` | 块、章节和链接数据结构 |
 | `text_templates.py` | 不同块类型的检索文本模板 |
+| `io_utils.py` | 复用公共 JSONL 读写，并提供结构化切分专用的元数据、追加写和分组辅助 |
 
 ## 关键约束
 

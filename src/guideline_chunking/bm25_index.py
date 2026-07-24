@@ -4,19 +4,14 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from src.guideline_chunking.io_utils import read_jsonl, write_jsonl
+from src.utils.text import tokenize_search_text as tokenize
 
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|[\u4e00-\u9fff]")
-
-
-def tokenize(text: str) -> list[str]:
-    return [token.lower() for token in TOKEN_RE.findall(text or "")]
 
 
 def build_chunk_index(

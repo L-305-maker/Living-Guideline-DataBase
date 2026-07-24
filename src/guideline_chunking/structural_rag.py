@@ -670,6 +670,7 @@ def helper_sentence_candidates(text: str) -> list[str]:
 
 
 def helper_next_evidence_paragraphs(block: ParsedBlock, blocks: list[ParsedBlock], limit: int = 2) -> list[str]:
+    # 证据扩展只沿当前章节向后进行，遇到新标题或新的推荐块必须停止，避免跨主题拼接。
     evidence: list[str] = []
     for candidate in sorted(blocks, key=lambda item: item.order_index):
         if candidate.order_index <= block.order_index:

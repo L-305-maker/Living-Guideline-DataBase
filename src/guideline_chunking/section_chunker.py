@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import re
 
 from src.guideline_chunking.models import DocumentMeta, ParsedBlock, SectionChunk
+from src.utils.text import estimate_tokens
 
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|[\u4e00-\u9fff]")
 MAX_SECTION_TOKENS = 3000
 
 
@@ -85,8 +84,6 @@ def helper_section_parts(blocks: list[ParsedBlock], meta: DocumentMeta) -> list[
     return section_chunks
 
 
-def estimate_tokens(text: str) -> int:
-    return len(TOKEN_RE.findall(text or ""))
 
 
 def helper_section_id(doc_id: str, path: list[str], order_index: int, part_index: int) -> str:
