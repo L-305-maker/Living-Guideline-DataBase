@@ -11,11 +11,18 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-from src.pipeline.cleaning.semantic_chunker import estimate_tokens, retrieval_text
+from src.retrieval.common import (
+    enrich_chunk_metadata as helper_enrich_chunk_metadata,
+    parse_time_range as helper_time_range,
+)
 from src.retrieval.chunk_normalizer import iter_normalized_chunks
-from src.retrieval.document_repr.section_classifier import classify_chunk
 from src.retrieval.rrf import rrf_fusion
 from src.utils.io import DATA_DIR, ensure_parent, read_jsonl
+from src.utils.records import (
+    department_text as helper_department_text,
+    publication_year as helper_year,
+    truthy as helper_truthy,
+)
 
 
 DEFAULT_DB_PATH = DATA_DIR / "index" / "rag.sqlite"
@@ -259,38 +266,22 @@ def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def helper_year(publication_date: str | None) -> int | None:
-    match = re.search(r"(19\d{2}|20\d{2})", publication_date or "")
-    return int(match.group(1)) if match else None
 
 
 def serialize_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def helper_truthy(value: Any) -> bool:
-    return value is True or str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
 def helper_section_path_text(section_path: Iterable[Any]) -> str:
     return " ".join(str(item) for item in section_path if item is not None)
 
 
-def helper_enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
-    chunk_type = str(item.get("chunk_type") or "") or classify_chunk(item)
-    item["chunk_type"] = chunk_type
-    item["token_count"] = int(item.get("token_count") or estimate_tokens(item.get("content", "")))
-    item["retrieval_text"] = item.get("retrieval_text") or retrieval_text(
-        item.get("title", ""),
-        item.get("section_path") or [],
-        chunk_type,
-        item.get("content", ""),
-    )
-    item["is_background"] = bool(item.get("is_background") or chunk_type == "background")
-    return item
 
 
 def helper_zh_token_text(text: str, max_chars: int | None = None) -> str:
+    # 中文检索同时保留医学词和有限二三元组；去重与长度上限用于控制索引膨胀。
     if max_chars is not None:
         text = (text or "")[:max_chars]
     tokens: list[str] = []
@@ -326,6 +317,7 @@ def helper_fts_query(query: str) -> str:
 
 
 def helper_zh_fts_query(query: str) -> str:
+    # 查询词按医学词和有限 n-gram 展开，最终数量受限以避免生成过大的 FTS 表达式。
     tokens: list[str] = []
     seen: set[str] = set()
 
@@ -353,15 +345,6 @@ def helper_zh_fts_query(query: str) -> str:
     return " OR ".join(f'"{token}"' for token in tokens[:16])
 
 
-def helper_time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
-    if not time_range:
-        return None, None
-    if isinstance(time_range, dict):
-        return time_range.get("start") or time_range.get("start_date"), time_range.get("end") or time_range.get("end_date")
-    match = re.match(r"^\s*(\d{4})(?:-\d{2}-\d{2})?\s*[-~:]\s*(\d{4})(?:-\d{2}-\d{2})?\s*$", str(time_range))
-    if match:
-        return f"{match.group(1)}-01-01", f"{match.group(2)}-12-31"
-    return str(time_range), None
 
 
 def init_schema(db_path: str | Path = DEFAULT_DB_PATH, reset: bool = False) -> dict[str, Any]:
@@ -401,9 +384,6 @@ def helper_clear(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM documents")
 
 
-def helper_department_text(record: dict[str, Any]) -> str:
-    labels = record.get("clinical_departments") or [record.get("clinical_department") or "未分类"]
-    return "|".join(dict.fromkeys(str(label) for label in labels if label)) or "未分类"
 
 
 def helper_department_metadata(value: str) -> dict[str, Any]:
@@ -416,6 +396,7 @@ def helper_department_metadata(value: str) -> dict[str, Any]:
 
 
 def helper_insert_documents(conn: sqlite3.Connection, data_dir: Path) -> int:
+    # 主表与 FTS 派生字段必须在同一批次保持一致，任何字段规范化都在写入前完成。
     rows = []
     for rec in read_jsonl(data_dir / "documents.jsonl"):
         clean_path = Path(rec.get("markdown_clean_path") or "")
@@ -472,6 +453,7 @@ def helper_document_ids(data_dir: Path) -> set[str]:
 
 
 def helper_insert_sections(conn: sqlite3.Connection, data_dir: Path, batch_size: int, allowed_doc_ids: set[str]) -> int:
+    # 章节顺序和字符区间来自编码阶段，写库时只做类型规范化，不重新推断结构。
     count = 0
     batch = []
     for path in sorted((data_dir / "sections").glob("*.jsonl")):
@@ -531,6 +513,7 @@ def helper_insert_sections(conn: sqlite3.Connection, data_dir: Path, batch_size:
 
 
 def helper_insert_chunks(conn: sqlite3.Connection, data_dir: Path, batch_size: int) -> int:
+    # 分块正文、检索文本和中文分词文本必须逐条对应，避免 FTS 行与主表错位。
     count = 0
     rows = []
     for rec in iter_normalized_chunks(data_dir):
@@ -630,6 +613,7 @@ def helper_insert_document_cards(conn: sqlite3.Connection, data_dir: Path, allow
     return len(rows)
 
 def helper_insert_document_views(conn: sqlite3.Connection, data_dir: Path, allowed_doc_ids: set[str], batch_size: int) -> int:
+    # 多视图按 view_id 独立写入，同一文档的不同视图不能在入库时互相覆盖。
     path = data_dir / "document_views.jsonl"
     if not path.exists():
         return 0
@@ -784,6 +768,7 @@ def helper_search_document_cards_fts(
     zh: bool = False,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
+    # 先由 FTS 产生候选和名次，再补充主表元数据，避免在全文检索前扫描全部文档。
     table = "document_cards_zh_fts" if zh else "document_cards_fts"
     weights = "5.0, 3.0" if zh else "5.0, 1.0, 3.0"
     fts = helper_zh_fts_query(query) if zh else helper_fts_query(query)
@@ -842,6 +827,7 @@ def helper_search_document_views_fts(
     zh: bool = False,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
+    # 视图命中按 doc_id 聚合前保留视图类型和原始名次，供后续融合解释使用。
     table = "document_views_zh_fts" if zh else "document_views_fts"
     weights = "1.5, 4.0, 3.0" if zh else "1.5, 4.0, 1.0, 3.0"
     fts = helper_zh_fts_query(query) if zh else helper_fts_query(query)
@@ -1025,6 +1011,7 @@ def helper_retrieve_chunks_fts(
     zh: bool = False,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
+    # FTS 只召回分块候选，参考文献与文档类型过滤必须在返回前完成。
     table = "chunks_zh_fts" if zh else "chunks_fts"
     weights = "4.0, 2.0, 1.0" if zh else "4.0, 2.0, 2.0, 1.0"
     fts = helper_zh_fts_query(query) if zh else helper_fts_query(query)
@@ -1122,6 +1109,7 @@ def read_document_sqlite(
     title: str | None = None,
     max_chars: int | None = None,
 ) -> dict[str, Any]:
+    # doc_id 与标题是互斥定位方式，读取路径必须经过存在性检查后才返回正文。
     if not doc_id and not title:
         raise ValueError("read_document_sqlite requires either doc_id or title")
     if doc_id:

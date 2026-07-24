@@ -39,6 +39,7 @@ def normalize_chunk_record(
     documents: dict[str, dict[str, Any]] | None = None,
     chunk_index: int = 0,
 ) -> dict[str, Any]:
+    # 旧版与新版字段在此收敛为唯一契约，缺省值必须保持可检索且可追踪。
     doc_id = helper_doc_id(record)
     doc = (documents or {}).get(doc_id, {})
     section_path = as_list(record.get("section_path") or record.get("heading_path") or [])

@@ -15,6 +15,7 @@ def aggregate_chunks_to_documents(
     max_chunks_per_doc: int = 5,
 ) -> list[dict[str, Any]]:
     """Return document candidates ranked by weighted chunk evidence."""
+    # 聚合以文档为边界，保留高排名分块作为证据摘要，不能把不同文档的分数直接混合。
 
     scores: dict[str, float] = {}
     matched: dict[str, list[dict[str, Any]]] = {}

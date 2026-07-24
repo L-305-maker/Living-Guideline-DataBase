@@ -12,6 +12,7 @@ from typing import Any, Iterable, Iterator
 from src.retrieval.bm25_store import helper_card_records, helper_view_records
 from src.retrieval.chunk_normalizer import iter_normalized_chunks
 from src.utils.io import DATA_DIR, ensure_dir, ensure_parent, read_jsonl
+from src.utils.records import record_text as helper_record_text
 
 
 DEFAULT_EMBEDDING_MODEL = os.getenv("BGE_VECTOR_MODEL", "BAAI/bge-m3")
@@ -90,12 +91,10 @@ def helper_maybe_half(model: Any, device: str | None, fp16: bool) -> None:
         return
     try:
         model.half()
-    except Exception:
+    except (AttributeError, RuntimeError):
         return
 
 
-def helper_record_text(record: dict[str, Any], text_field: str) -> str:
-    return str(record.get(text_field) or record.get("content") or "")
 
 
 def helper_build_index_stream(
@@ -113,6 +112,7 @@ def helper_build_index_stream(
     local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY,
     fp16: bool = DEFAULT_FP16,
 ) -> dict[str, Any]:
+    # 向量和 mapping 必须按同一批次、同一顺序追加，异常时不能留下数量不一致的产物。
     faiss, _np, SentenceTransformer = helper_load_vector_dependencies()
     model_kwargs = {"device": device} if device else {}
     model_kwargs["local_files_only"] = local_files_only
@@ -487,7 +487,7 @@ def helper_vector_search_shards(
             if len(results) >= top_n:
                 break
         return results
-    except Exception as exc:
+    except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
         # 可选模式保持历史兼容并返回空通道；强制模式保留失败原因，禁止静默退化。
         if required:
             if isinstance(exc, RuntimeError):
@@ -534,7 +534,7 @@ def vector_search(
         faiss.normalize_L2(vector)
         _scores, ids = index.search(vector, min(top_n, len(mappings)))
         return [mappings[int(i)][id_field] for i in ids[0] if 0 <= int(i) < len(mappings)]
-    except Exception as exc:
+    except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
         # 可选模式保持历史兼容并返回空通道；强制模式保留失败原因，禁止静默退化。
         if required:
             if isinstance(exc, RuntimeError):

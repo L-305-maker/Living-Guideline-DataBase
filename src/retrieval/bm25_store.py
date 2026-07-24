@@ -5,32 +5,20 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from src.retrieval.chunk_normalizer import iter_normalized_chunks
+from src.retrieval.common import parse_time_range as helper_parse_time_range
 from src.retrieval.document_repr.builder import build_document_card, build_document_views
+from src.utils.records import record_text as helper_record_text
+from src.utils.text import tokenize_search_text as tokenize
 from src.utils.io import DATA_DIR, ensure_dir, iter_markdown_files, read_jsonl
 
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|[\u4e00-\u9fff]")
 
 
-def tokenize(text: str) -> list[str]:
-    return [token.lower() for token in TOKEN_RE.findall(text or "")]
-
-
-def helper_parse_time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
-    if not time_range:
-        return None, None
-    if isinstance(time_range, dict):
-        return time_range.get("start") or time_range.get("start_date"), time_range.get("end") or time_range.get("end_date")
-    match = re.match(r"^\s*(\d{4})(?:-\d{2}-\d{2})?\s*[-~:]\s*(\d{4})(?:-\d{2}-\d{2})?\s*$", str(time_range))
-    if match:
-        return f"{match.group(1)}-01-01", f"{match.group(2)}-12-31"
-    return str(time_range), None
 
 
 def helper_in_time_range(publication_date: str, time_range: str | dict[str, str] | None) -> bool:
@@ -67,6 +55,7 @@ class BM25Store:
         time_range: str | dict[str, str] | None = None,
         exclude_reference_sections: bool = False,
     ) -> list[tuple[str, float]]:
+        # 元数据条件先过滤候选，BM25 只对合格记录计分，并用稳定标识打破同分排序。
         query_tokens = tokenize(query)
         if not query_tokens:
             return []
@@ -96,8 +85,6 @@ class BM25Store:
         return results[:top_n]
 
 
-def helper_record_text(record: dict[str, Any], text_field: str) -> str:
-    return str(record.get(text_field) or record.get("content") or "")
 
 
 def helper_card_records(clean_dir: str | Path, cards_path: str | Path | None = None) -> list[dict[str, Any]]:

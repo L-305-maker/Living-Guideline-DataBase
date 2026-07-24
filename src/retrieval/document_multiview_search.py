@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from src.retrieval.chunk_doc_aggregator import aggregate_chunks_to_documents
+from src.retrieval.common import fill_consensus_fallback as helper_fill_consensus_fallback
 from src.retrieval.hybrid import helper_doc_row_to_result, helper_select_by_ids, recall_chunks_hybrid
 from src.retrieval.reranker import DocumentReranker, default_document_reranker
 from src.retrieval.rrf import weighted_rrf_fusion
@@ -18,7 +19,6 @@ from src.retrieval.sqlite_store import (
     connect,
     search_document_cards_sqlite,
     search_document_views_sqlite,
-    retrieve_chunks_sqlite,
 )
 from src.retrieval.vector_store import vector_search
 from src.utils.io import DATA_DIR
@@ -97,6 +97,7 @@ def helper_load_card_rows(
     publication_date: str | None,
     document_kind: str | None = None,
 ) -> dict[str, dict[str, Any]]:
+    # documents.jsonl 存在时以其 doc_id 集合作为服务边界，防止孤立卡片进入召回。
     rows = helper_select_by_ids(
         db_path,
         "document_cards",
@@ -146,6 +147,7 @@ def helper_load_view_rows(
     publication_date: str | None,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
+    # 优先读取持久化视图；需要现场构建时仍按权威文档集合过滤。
     rows = helper_select_by_ids(
         db_path,
         "document_views",
@@ -507,18 +509,12 @@ def search_documents_with_consensus_fallback(
         clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
         recency_boost=recency_boost, topk=wanted, reranker=reranker, document_kind="guideline",
     )
-    output = [{**item, "document_kind": "guideline", "is_fallback": False} for item in guidelines]
-    deficit = wanted - len(output)
-    if deficit <= 0:
-        return output
-    consensus = search_documents_multiview(
-        query, db_path, index_dir=index_dir, source_institution=source_institution,
-        clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
-        recency_boost=recency_boost, topk=deficit, reranker=reranker, document_kind="consensus",
+    return helper_fill_consensus_fallback(
+        guidelines,
+        wanted,
+        lambda deficit: search_documents_multiview(
+            query, db_path, index_dir=index_dir, source_institution=source_institution,
+            clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
+            recency_boost=recency_boost, topk=deficit, reranker=reranker, document_kind="consensus",
+        ),
     )
-    output.extend(
-        {**item, "document_kind": "consensus", "is_fallback": True,
-         "fallback_reason": "insufficient_guideline_results", "fallback_rank": rank}
-        for rank, item in enumerate(consensus, 1)
-    )
-    return output[:wanted]

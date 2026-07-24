@@ -14,6 +14,7 @@ from src.retrieval.document_repr.section_classifier import classify_section
 from src.utils.front_matter import parse_front_matter
 from src.utils.io import DATA_DIR, iter_markdown_files, write_jsonl
 from src.utils.metadata import extract_abstract
+from src.utils.text import normalize_space as helper_normalize_space
 
 
 VIEW_TYPES = [
@@ -123,8 +124,6 @@ def compact_document_view(view: dict[str, Any]) -> dict[str, Any]:
     values["clinical_departments"] = helper_departments(view)
     return {field: values.get(field, "") for field in VIEW_OUTPUT_FIELDS}
 
-def helper_normalize_space(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
 
 
 def helper_clip(text: str, limit: int) -> str:
@@ -347,6 +346,7 @@ def helper_metadata_from_markdown(markdown: str) -> tuple[dict[str, str], str]:
 
 
 def helper_base_metadata(metadata: dict[str, str], path: str | Path) -> dict[str, Any]:
+    # 元数据按显式记录、front matter、派生默认值的优先级合并，禁止低可信值覆盖高可信值。
     return {
         "doc_id": metadata.get("id") or Path(path).stem,
         "title": metadata.get("title") or Path(path).stem,
@@ -400,6 +400,7 @@ def helper_section_snippets(sections: Iterable[Any], max_sections: int, chars_pe
 
 def build_document_card(markdown: str, path: str | Path = "") -> dict[str, Any]:
     """Create one high-density document card from a clean Markdown guideline."""
+    # 文档卡片只汇总可解释的文档级信号，正文细节通过视图和分块提供。
 
     metadata, body = helper_metadata_from_markdown(markdown)
     base = helper_base_metadata(metadata, path)

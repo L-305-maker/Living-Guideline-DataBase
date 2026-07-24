@@ -7,11 +7,20 @@ import os
 import re
 from functools import lru_cache
 from typing import Any, Protocol
+from src.retrieval.common import (
+    clip_text as helper_clip_text,
+    compact_text as helper_compact,
+    contains_exact_phrase as helper_contains_exact_phrase,
+    query_terms as helper_query_terms,
+)
+from src.utils.records import (
+    publication_year as helper_publication_year,
+    truthy as helper_truthy,
+)
 
 
 DEFAULT_BGE_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 GUIDE_RE = re.compile(r"(guideline|guidelines|consensus|recommendations?|\u6307\u5357|\u5171\u8bc6)", re.I)
-TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|[\u4e00-\u9fff]+")
 OCR_UNRESOLVED_STATUSES = {"needed_unavailable", "needed_not_applied", "needed_but_disabled", "failed"}
 OCR_REVIEW_STATUSES = {"applied_needs_review"}
 HIGH_RISK_CLEANING_FLAGS = {"likely_ocr_failure", "low_text_signal", "noisy_ocr_lines", "pdf_text_mojibake"}
@@ -27,14 +36,19 @@ class ChunkReranker(Protocol):
         """Reorder already-recalled chunk candidates."""
 
 
-class NoopDocumentReranker:
+class NoopReranker:
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
+        # 无操作实现保留统一接口，但明确忽略查询内容，只执行数量裁剪。
+        _ = query
         return candidates[:topk]
 
 
-class NoopChunkReranker:
-    def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
-        return candidates[:topk]
+class NoopDocumentReranker(NoopReranker):
+    pass
+
+
+class NoopChunkReranker(NoopReranker):
+    pass
 
 
 class RuleBasedDocumentReranker:
@@ -44,6 +58,7 @@ class RuleBasedDocumentReranker:
         self.recency_boost = recency_boost
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
+        # 文档重排同时考虑匹配信号与质量惩罚，最后按稳定标识处理同分候选。
         terms = helper_query_terms(query)
         ranked = []
         for candidate in candidates:
@@ -107,6 +122,7 @@ class RuleBasedChunkReranker:
     """Deterministic chunk reranker used as a fast fallback for retrieve."""
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
+        # 分块重排优先完整短语和关键字段命中，并对参考文献、OCR 风险等低质量信号降权。
         terms = helper_query_terms(query)
         ranked: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -170,6 +186,29 @@ class RuleBasedChunkReranker:
         return ranked[:topk]
 
 
+def helper_load_cross_encoder(owner: Any) -> Any:
+    """按实例配置延迟加载 CrossEncoder，并缓存成功模型或失败原因。"""
+
+    if owner._model is not None:
+        return owner._model
+    if owner._load_error:
+        raise RuntimeError(owner._load_error)
+    try:
+        from sentence_transformers import CrossEncoder  # type: ignore
+
+        owner._model = CrossEncoder(
+            owner.model_name,
+            device=owner.device,
+            local_files_only=owner.local_files_only,
+            max_length=owner.max_length,
+            trust_remote_code=True,
+        )
+        return owner._model
+    except Exception as exc:  # pragma: no cover - 依赖本地模型缓存
+        owner._load_error = str(exc)
+        raise RuntimeError(owner._load_error) from exc
+
+
 class BgeM3DocumentReranker:
     """Embedding-first cross-encoder reranker backed by BGE reranker v2 m3."""
 
@@ -197,25 +236,6 @@ class BgeM3DocumentReranker:
         self._model: Any | None = None
         self._load_error: str | None = None
 
-    def helper_load_model(self) -> Any:
-        if self._model is not None:
-            return self._model
-        if self._load_error:
-            raise RuntimeError(self._load_error)
-        try:
-            from sentence_transformers import CrossEncoder  # type: ignore
-
-            self._model = CrossEncoder(
-                self.model_name,
-                device=self.device,
-                local_files_only=self.local_files_only,
-                max_length=self.max_length,
-                trust_remote_code=True,
-            )
-            return self._model
-        except Exception as exc:  # pragma: no cover - depends on local model cache
-            self._load_error = str(exc)
-            raise RuntimeError(self._load_error) from exc
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
         if not candidates:
@@ -224,7 +244,7 @@ class BgeM3DocumentReranker:
         # 先执行规则排序，既提供模型不可用时的完整回退，也保留后续融合所需的基础分。
         fallback_ranked = self.fallback.rerank(query, candidates, len(candidates))
         try:
-            model = self.helper_load_model()
+            model = helper_load_cross_encoder(self)
             pairs = [(query, helper_candidate_rerank_text(candidate, query)) for candidate in fallback_ranked]
             raw_scores = model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
         except Exception:
@@ -303,25 +323,6 @@ class BgeM3ChunkReranker:
         self._model: Any | None = None
         self._load_error: str | None = None
 
-    def helper_load_model(self) -> Any:
-        if self._model is not None:
-            return self._model
-        if self._load_error:
-            raise RuntimeError(self._load_error)
-        try:
-            from sentence_transformers import CrossEncoder  # type: ignore
-
-            self._model = CrossEncoder(
-                self.model_name,
-                device=self.device,
-                local_files_only=self.local_files_only,
-                max_length=self.max_length,
-                trust_remote_code=True,
-            )
-            return self._model
-        except Exception as exc:  # pragma: no cover - depends on local model cache
-            self._load_error = str(exc)
-            raise RuntimeError(self._load_error) from exc
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
         if not candidates:
@@ -330,7 +331,7 @@ class BgeM3ChunkReranker:
         # 分块重排也先保留规则结果；模型加载或推理失败时可返回可解释的降级排序。
         fallback_ranked = self.fallback.rerank(query, candidates, len(candidates))
         try:
-            model = self.helper_load_model()
+            model = helper_load_cross_encoder(self)
             pairs = [(query, helper_chunk_rerank_text(candidate)) for candidate in fallback_ranked]
             raw_scores = model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
         except Exception:
@@ -505,22 +506,8 @@ def helper_env_float(name: str, default: float) -> float:
         return default
 
 
-def helper_query_terms(query: str) -> list[str]:
-    seen: set[str] = set()
-    terms = []
-    for token in TOKEN_RE.findall(query or ""):
-        token = token.lower().strip()
-        if token and token not in seen:
-            seen.add(token)
-            terms.append(token)
-    return terms
 
 
-def helper_clip_text(text: str, limit: int) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
 
 
 def helper_candidate_rerank_text(candidate: dict[str, Any], query: str = "") -> str:
@@ -589,8 +576,6 @@ def helper_normalize_scores(scores: list[float]) -> list[float]:
     return [1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, score)))) for score in scores]
 
 
-def helper_compact(text: str) -> str:
-    return re.sub(r"\s+", "", text or "").lower()
 
 
 def helper_contains_term(text: str, terms: list[str]) -> bool:
@@ -608,11 +593,6 @@ def helper_term_overlap_ratio(text: str, terms: list[str]) -> float:
     return hits / len(terms)
 
 
-def helper_contains_exact_phrase(text: str, query: str) -> bool:
-    query = (query or "").strip().lower()
-    if not query:
-        return False
-    return query in (text or "").lower() or helper_compact(query) in helper_compact(text)
 
 
 def helper_chunk_type_boost(chunk_type: str) -> float:
@@ -630,9 +610,6 @@ def helper_looks_like_reference_section(section_text: str) -> bool:
     return bool(re.search(r"(references?|bibliography|\u53c2\u8003\u6587\u732e)", section_text or "", re.I))
 
 
-def helper_publication_year(publication_date: str | None) -> int | None:
-    match = re.search(r"(20\d{2}|19\d{2})", publication_date or "")
-    return int(match.group(1)) if match else None
 
 
 def helper_publication_recency_boost(publication_date: str | None) -> float:
@@ -642,8 +619,6 @@ def helper_publication_recency_boost(publication_date: str | None) -> float:
     return max(0.0, min(0.12, (year - 2012) / max(1, 2026 - 2012) * 0.12))
 
 
-def helper_truthy(value: Any) -> bool:
-    return value is True or str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
 def helper_quality_text(item: dict[str, Any], key: str) -> str:

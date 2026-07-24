@@ -11,13 +11,21 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from src.pipeline.cleaning.semantic_chunker import estimate_tokens, retrieval_text
-from src.retrieval.document_repr.section_classifier import classify_chunk
+from src.retrieval.common import (
+    compact_text as helper_compact,
+    contains_exact_phrase as helper_contains_exact_phrase,
+    enrich_chunk_metadata as helper_enrich_chunk_metadata,
+    fill_consensus_fallback as helper_fill_consensus_fallback,
+    parse_time_range as helper_time_range,
+    query_terms as helper_query_terms,
+    source_quote_context as helper_source_quote_context,
+)
 from src.retrieval.reranker import ChunkReranker, default_chunk_reranker, quality_score_multiplier
 from src.retrieval.rrf import rrf_fusion
-from src.retrieval.sqlite_store import DEFAULT_DB_PATH, TOKEN_RE, connect, retrieve_chunks_sqlite
+from src.retrieval.sqlite_store import DEFAULT_DB_PATH, connect, retrieve_chunks_sqlite
 from src.retrieval.vector_store import vector_search
 from src.utils.io import DATA_DIR
+from src.utils.records import publication_year as helper_publication_year
 
 
 GUIDE_RE = re.compile(r"(指南|共识|guideline|guidelines|consensus|practice parameters?|recommendations?)", re.I)
@@ -33,15 +41,6 @@ DOCUMENT_QUALITY_COLUMNS = (
 )
 
 
-def helper_time_range(time_range: str | dict[str, str] | None) -> tuple[str | None, str | None]:
-    if not time_range:
-        return None, None
-    if isinstance(time_range, dict):
-        return time_range.get("start") or time_range.get("start_date"), time_range.get("end") or time_range.get("end_date")
-    match = re.match(r"^\s*(\d{4})(?:-\d{2}-\d{2})?\s*[-~:]\s*(\d{4})(?:-\d{2}-\d{2})?\s*$", str(time_range))
-    if match:
-        return f"{match.group(1)}-01-01", f"{match.group(2)}-12-31"
-    return str(time_range), None
 
 
 def helper_metadata_sql(
@@ -90,6 +89,7 @@ def helper_select_by_ids(
     document_kind: str | None = None,
     join_documents: bool = False,
 ) -> dict[str, sqlite3.Row]:
+    # SQL 负责元数据过滤，返回结果再按召回 ID 顺序恢复名次，不能依赖数据库自然顺序。
     if not ids:
         return {}
     alias = "t" if join_documents else None
@@ -191,18 +191,6 @@ def helper_chunk_row_to_result(row: sqlite3.Row) -> dict[str, Any]:
     return helper_enrich_chunk_metadata(item)
 
 
-def helper_enrich_chunk_metadata(item: dict[str, Any]) -> dict[str, Any]:
-    chunk_type = str(item.get("chunk_type") or "") or classify_chunk(item)
-    item["chunk_type"] = chunk_type
-    item["token_count"] = int(item.get("token_count") or estimate_tokens(item.get("content", "")))
-    item["retrieval_text"] = item.get("retrieval_text") or retrieval_text(
-        item.get("title", ""),
-        item.get("section_path") or [],
-        chunk_type,
-        item.get("content", ""),
-    )
-    item["is_background"] = bool(item.get("is_background") or chunk_type == "background")
-    return item
 
 
 def helper_fuse(
@@ -235,30 +223,6 @@ def helper_fuse(
     return output
 
 
-def helper_query_terms(query: str) -> list[str]:
-    seen: set[str] = set()
-    terms: list[str] = []
-    for token in TOKEN_RE.findall(query or ""):
-        token = token.strip().lower()
-        if token and token not in seen:
-            seen.add(token)
-            terms.append(token)
-    return terms
-
-
-def helper_compact(text: str) -> str:
-    return re.sub(r"\s+", "", text or "").lower()
-
-
-def helper_contains_exact_phrase(text: str, query: str) -> bool:
-    query = (query or "").strip().lower()
-    if not query:
-        return False
-    lowered = (text or "").lower()
-    if query in lowered:
-        return True
-    compact_query = helper_compact(query)
-    return bool(compact_query and compact_query in helper_compact(text))
 
 
 def helper_field_term_hit(text: str, terms: list[str]) -> bool:
@@ -284,9 +248,6 @@ def helper_is_journal_header_title(title: str) -> bool:
     return False
 
 
-def helper_publication_year(publication_date: str | None) -> int | None:
-    match = re.search(r"(20\d{2}|19\d{2})", publication_date or "")
-    return int(match.group(1)) if match else None
 
 
 def helper_recency_boost(publication_date: str | None, enabled: bool) -> float:
@@ -415,12 +376,6 @@ def helper_rerank_documents(
     return standardized
 
 
-def helper_clip_text(text: str, limit: int) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
-
 
 def helper_find_chunk_span(markdown_path: str, content: str) -> tuple[int | None, int | None]:
     path = Path(markdown_path or "")
@@ -459,14 +414,6 @@ def helper_find_chunk_span(markdown_path: str, content: str) -> tuple[int | None
     return position, position + len(needle)
 
 
-def helper_source_quote_context(prev_content: str, content: str, next_content: str) -> str:
-    parts = []
-    if prev_content:
-        parts.append("[previous] " + helper_clip_text(prev_content[-500:], 500))
-    parts.append("[current] " + helper_clip_text(content, 1400))
-    if next_content:
-        parts.append("[next] " + helper_clip_text(next_content[:500], 500))
-    return "\n".join(parts)
 
 
 def helper_enrich_chunk_context(db_path: str | Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -584,6 +531,7 @@ def recall_chunks_hybrid(
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse BM25 and Dense channels, then return the pre-rerank candidate pool."""
+    # 词法与向量通道独立召回后再做 RRF；任何通道的原始分数都不能直接跨通道比较。
     channel_n = max(bm25_top_n, vector_top_n, topk)
     recall_n = channel_n
     bm25_pool = retrieve_chunks_sqlite(
@@ -643,11 +591,16 @@ def retrieve_chunks_hybrid(
     rerank_pool_n: int | None = None,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """BM25+Dense recall top100, optional 10:1 routing, then one rerank to top30."""
+    """BM25+Dense 召回指定候选池，经路由后执行一次重排。"""
+
+    pool_n = 100 if rerank_pool_n is None else rerank_pool_n
+    if pool_n < 1:
+        raise ValueError("rerank_pool_n must be positive")
+    # 候选池大小只控制重排前召回量，最终返回量仍受 topk 和系统上限约束。
     candidates = recall_chunks_hybrid(
         query, db_path, index_dir=index_dir, source_institution=source_institution,
         clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
-        topk=100, bm25_top_n=bm25_top_n, vector_top_n=vector_top_n,
+        topk=pool_n, bm25_top_n=bm25_top_n, vector_top_n=vector_top_n,
         exclude_reference_sections=exclude_reference_sections, document_kind=document_kind,
     )
     enriched = helper_enrich_chunk_context(db_path, candidates)
@@ -675,19 +628,13 @@ def retrieve_chunks_with_consensus_fallback(
         topk=wanted, exclude_reference_sections=exclude_reference_sections, reranker=reranker,
         document_kind="guideline",
     )
-    output = [{**item, "document_kind": "guideline", "is_fallback": False} for item in guidelines]
-    deficit = wanted - len(output)
-    if deficit <= 0:
-        return output
-    consensus = retrieve_chunks_hybrid(
-        query, db_path, index_dir=index_dir, source_institution=source_institution,
-        clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
-        topk=deficit, exclude_reference_sections=exclude_reference_sections, reranker=reranker,
-        document_kind="consensus",
+    return helper_fill_consensus_fallback(
+        guidelines,
+        wanted,
+        lambda deficit: retrieve_chunks_hybrid(
+            query, db_path, index_dir=index_dir, source_institution=source_institution,
+            clinical_department=clinical_department, time_range=time_range, publication_date=publication_date,
+            topk=deficit, exclude_reference_sections=exclude_reference_sections, reranker=reranker,
+            document_kind="consensus",
+        ),
     )
-    output.extend(
-        {**item, "document_kind": "consensus", "is_fallback": True,
-         "fallback_reason": "insufficient_guideline_results", "fallback_rank": rank}
-        for rank, item in enumerate(consensus, 1)
-    )
-    return output[:wanted]

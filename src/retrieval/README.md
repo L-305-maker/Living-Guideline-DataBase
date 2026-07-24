@@ -13,6 +13,7 @@
 | `chunk_normalizer.py` | 统一不同切分产物的字段形状 |
 | `chunk_doc_aggregator.py` | 把 chunk 命中聚合为文档级信号 |
 | `bm25_store.py` | 轻量 BM25 数据持久化辅助逻辑 |
+| `common.py` | 统一时间范围解析、旧 chunk 字段补齐、文本截断和来源上下文拼接 |
 | `document_repr/` | 构建文档卡片和多视图表示 |
 
 ## 混合检索流程
