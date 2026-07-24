@@ -68,7 +68,9 @@ ARTIFACT_TITLE = re.compile(
 )
 
 
-def identify_departments(title: str, abstract: str = "") -> tuple[list[str], str]:
+def identify_departments(title: str) -> tuple[list[str], str]:
+    """仅依据标题中的高精度信号重新分类，避免摘要中的跨科室描述扩大标签。"""
+
     normalized_title = unicodedata.normalize("NFKC", title or "").strip()
     if not normalized_title or ARTIFACT_TITLE.fullmatch(normalized_title):
         return [], "artifact_or_generic_title"
@@ -123,6 +125,7 @@ def rewrite_markdown(paths: set[Path], updates: dict[str, list[str]]) -> int:
 
 
 def reclassify_unknown(data_dir: str | Path = DATA_DIR, apply: bool = False) -> dict[str, Any]:
+    # 默认只生成审查报告；仅在 apply 明确开启时同步改写文档和派生产物。
     data_path = Path(data_dir)
     documents_path = data_path / "documents.jsonl"
     unknown: list[dict[str, Any]] = []
@@ -131,7 +134,7 @@ def reclassify_unknown(data_dir: str | Path = DATA_DIR, apply: bool = False) -> 
         labels = record.get("clinical_departments") or [record.get("clinical_department")]
         if labels != [UNKNOWN_DEPARTMENT]:
             continue
-        identified, reason = identify_departments(str(record.get("title") or ""), str(record.get("abstract") or ""))
+        identified, reason = identify_departments(str(record.get("title") or ""))
         unknown.append({
             "doc_id": str(record["doc_id"]),
             "title": str(record.get("title") or ""),

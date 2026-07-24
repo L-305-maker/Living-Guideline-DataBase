@@ -540,6 +540,7 @@ def clean_all(
     manifest_path: str | Path = DATA_DIR / "documents.jsonl",
     progress_every: int = 0,
 ) -> dict[str, Any]:
+    # 批量清洗逐文档隔离失败，并在完成后删除不再对应输入文档的陈旧产物。
     manifest = Path(manifest_path)
     ensure_dir(manifest.parent)
     clean_dir = ensure_dir(output_dir)

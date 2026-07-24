@@ -98,6 +98,7 @@ def ocr_image_payload(
     session: requests.Session | None = None,
     retries: int = 3,
 ) -> dict[str, Any]:
+    # 凭据、网络请求和响应校验集中在单页边界，错误必须附带可定位的服务信息。
     client = session or requests.Session()
     data = {
         "image": base64.b64encode(image_bytes),
@@ -273,9 +274,11 @@ def ocr_pdf_to_markdown(
     doc_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     cache_dir: str | Path | None = None,
+    cache_doc_id: str | None = None,
     access_token: str | None = None,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
+    # 页面缓存优先于远程请求；缓存未命中时按页识别并保持原页顺序组装 Markdown。
     pdf = Path(pdf_path)
     if not pdf.is_file():
         raise FileNotFoundError(f"OCR source PDF does not exist: {pdf}")
@@ -293,7 +296,7 @@ def ocr_pdf_to_markdown(
     cached_pages = 0
     for page_index in range(pages):
         page_no = page_index + 1
-        cache_path = cache_root / identifier / f"{page_no:04d}.json"
+        cache_path = cache_root / (cache_doc_id or identifier) / f"{page_no:04d}.json"
         if cache_path.is_file():
             page_result = json.loads(cache_path.read_text(encoding="utf-8"))
             if page_result.get("words_result"):
@@ -413,6 +416,7 @@ def ocr_from_audit_report(
     max_pages: int | None = None,
     max_total_pages: int | None = None,
 ) -> dict[str, Any]:
+    # 批处理同时受文档、单篇页数和总页数预算约束，配额耗尽后只延期而不丢弃任务。
     data_path = Path(data_dir)
     report_path = Path(audit_report)
     out_dir = Path(output_dir)
@@ -518,6 +522,7 @@ def ocr_from_audit_report(
 
 
 def main() -> None:
+    # 命令行仅负责参数校验和调度，凭据必须来自环境变量而不是参数回显。
     parser = argparse.ArgumentParser(description="Convert OCR-required PDFs to Markdown with Baidu accurate OCR and positions.")
     parser.add_argument("--pdf")
     parser.add_argument("--output")

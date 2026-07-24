@@ -18,6 +18,7 @@ from src.utils.metadata import clean_title, extract_abstract, extract_publicatio
 VALID_DATE_RE = re.compile(r"^(20[1-2]\d)-\d{2}-\d{2}$")
 READABLE_CHAR_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff，。；：、“”‘’（）《》—\-.,;:!?()/%\s]")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+SECTION_METADATA_KEYS = ('title', 'publication_date', 'source_institution', 'clinical_department')
 
 
 def helper_year(value: str | None) -> int | None:
@@ -41,6 +42,63 @@ def helper_reference_like(content: str, section_path: list[Any] | None = None) -
         or REFERENCE_MARKER_RE.search(content or "")
         or REFERENCE_LIST_RE.search(content or "")
     )
+
+
+def helper_sync_section_record(
+    row: dict[str, Any],
+    doc: dict[str, Any],
+    *,
+    clear_missing_fields: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    new_row = dict(row)
+    changed = False
+    for key in SECTION_METADATA_KEYS:
+        if clear_missing_fields:
+            if new_row.get(key) != doc.get(key):
+                new_row[key] = doc.get(key, '')
+                changed = True
+            continue
+        value = doc.get(key)
+        if value is not None and new_row.get(key) != value:
+            new_row[key] = value
+            changed = True
+    reference = helper_reference_like(new_row.get('content', ''), new_row.get('section_path') or [])
+    if bool(new_row.get('is_reference_section')) != reference:
+        new_row['is_reference_section'] = reference
+        changed = True
+    return new_row, changed
+
+
+def helper_sync_sections_from_documents(
+    data_dir: Path,
+    documents: dict[str, dict[str, Any]],
+    *,
+    clear_missing_fields: bool = False,
+) -> dict[str, int]:
+    changed_files = 0
+    changed_rows = 0
+    for path in sorted((data_dir / 'sections').glob('*.jsonl')):
+        rows = list(read_jsonl(path))
+        new_rows: list[dict[str, Any]] = []
+        file_changed = False
+        for row in rows:
+            doc = documents.get(row.get('doc_id', ''))
+            if not doc:
+                file_changed = True
+                continue
+            new_row, row_changed = helper_sync_section_record(
+                row,
+                doc,
+                clear_missing_fields=clear_missing_fields,
+            )
+            if row_changed:
+                changed_rows += 1
+                file_changed = True
+            new_rows.append(new_row)
+        if file_changed:
+            write_jsonl(path, new_rows)
+            changed_files += 1
+    return {'section_files_changed': changed_files, 'section_rows_changed': changed_rows}
 
 
 def helper_fallback_abstract(body: str, max_chars: int = 800) -> str:
@@ -87,6 +145,7 @@ def helper_load_markdown(record: dict[str, Any]) -> tuple[Path | None, dict[str,
 
 
 def helper_repair_document(record: dict[str, Any], year_start: int, year_end: int) -> tuple[dict[str, Any], bool]:
+    # 修复策略按问题类型选择最小改动，修复后必须重新计算质量而不是沿用旧结论。
     path, metadata, body, markdown = helper_load_markdown(record)
     changed = False
     repaired = dict(record)
@@ -136,34 +195,7 @@ def helper_repair_document(record: dict[str, Any], year_start: int, year_end: in
 
 
 def helper_repair_sections(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict[str, int]:
-    changed_files = 0
-    changed_rows = 0
-    for path in sorted((data_dir / "sections").glob("*.jsonl")):
-        rows = list(read_jsonl(path))
-        new_rows: list[dict[str, Any]] = []
-        file_changed = False
-        for row in rows:
-            new_row = dict(row)
-            doc = documents.get(new_row.get("doc_id", ""))
-            if not doc:
-                file_changed = True
-                continue
-            for key in ("title", "publication_date", "source_institution", "clinical_department"):
-                value = doc.get(key)
-                if value is not None and new_row.get(key) != value:
-                    new_row[key] = value
-                    file_changed = True
-            reference = helper_reference_like(new_row.get("content", ""), new_row.get("section_path") or [])
-            if bool(new_row.get("is_reference_section")) != reference:
-                new_row["is_reference_section"] = reference
-                file_changed = True
-            if new_row != row:
-                changed_rows += 1
-            new_rows.append(new_row)
-        if file_changed:
-            write_jsonl(path, new_rows)
-            changed_files += 1
-    return {"section_files_changed": changed_files, "section_rows_changed": changed_rows}
+    return helper_sync_sections_from_documents(data_dir, documents)
 
 
 def helper_repair_chunks(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict[str, int]:

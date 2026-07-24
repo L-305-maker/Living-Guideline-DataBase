@@ -12,6 +12,9 @@
 | `encoder.py` | 文本向量编码的通用封装 |
 | `evidence_pipeline.py` | 串联转换、清洗、派生产物和索引前准备 |
 | `add_clinical_departments.py` | 为文档和派生记录补充分科标签 |
+| `compact_retrieval_artifacts.py` | 原子压缩 JSONL 检索产物，并在失败时清理临时文件 |
+| `reclassify_unknown_departments.py` | 用高精度标题规则重新识别未分类文档，并可同步回写派生产物 |
+| `relabel_chunk_departments.py` | 按文档标签和分块内容重新计算 chunk 科室标签 |
 
 ## 输入与输出
 

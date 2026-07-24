@@ -28,6 +28,7 @@ def run_ocrmypdf(
     timeout_seconds: int = 900,
 ) -> OcrResult:
     """Run OCRmyPDF if it is installed and return a structured result."""
+    # 外部命令调用集中在此边界，返回值同时记录是否执行、输出路径和可诊断错误。
 
     executable = which("ocrmypdf")
     source = Path(input_pdf)

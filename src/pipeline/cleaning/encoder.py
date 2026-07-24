@@ -29,6 +29,7 @@ def helper_is_reference_section(content: str, section_path: list[str]) -> bool:
 
 
 def encode_markdown(markdown: str) -> list[SectionRecord]:
+    # front matter 提供文档级元数据，标题栈只负责章节路径，二者不能在段落循环中混淆。
     metadata, body = parse_front_matter(markdown)
     matches = list(HEADING_RE.finditer(body))
     doc_id = metadata.get("id", "")

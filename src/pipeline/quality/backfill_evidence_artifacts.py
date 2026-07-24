@@ -12,7 +12,11 @@ from typing import Any, Iterable
 from src.models.schemas import DocumentRecord, dump_model
 from src.pipeline.cleaning.cleaner import assess_cleaned_body
 from src.pipeline.cleaning.semantic_chunker import retrieval_text
-from src.pipeline.quality.repair_quality import helper_reference_like, helper_repair_vector_metadata
+from src.pipeline.quality.repair_quality import (
+    helper_reference_like,
+    helper_repair_vector_metadata,
+    helper_sync_sections_from_documents,
+)
 from src.retrieval.document_repr.builder import (
     POPULATION_LINE_RE,
     SCOPE_LINE_RE,
@@ -181,6 +185,7 @@ def helper_join_title_lines(lines: list[str]) -> str:
 
 
 def helper_candidate_title_blocks(body: str) -> list[tuple[str, int]]:
+    # 候选标题只从文首有限区域提取，并过滤页眉、目录和正文句子等高风险噪声。
     raw_lines = body.splitlines()[:600]
     candidates: list[tuple[str, int]] = []
     seen_early_title = False
@@ -231,6 +236,7 @@ def helper_candidate_title_blocks(body: str) -> list[tuple[str, int]]:
 
 
 def helper_title_candidate_score(title: str, index: int) -> float:
+    # 标题评分组合位置、长度和结构信号，任何单一弱特征都不能独立决定结果。
     if not title or helper_is_generic_title(title) or TITLE_NOISE_RE.search(title):
         return -1000.0
     if SHORT_PUBLISHER_SUBTITLE_RE.search(title) and len(title) < 110:
@@ -384,6 +390,7 @@ def helper_content_before_references(body: str) -> str:
 
 
 def helper_collect_full_text_signals(body: str) -> dict[str, list[str]]:
+    # 全文信号用于补充文档级元数据，但不得覆盖来源文件和显式 front matter。
     signals: dict[str, list[str]] = {"recommendation": [], "question": [], "scope": [], "population": []}
     limits = {"recommendation": 28, "question": 18, "scope": 16, "population": 14}
     text = helper_content_before_references(body)
@@ -426,6 +433,7 @@ def helper_rebuild_card_text(card: dict[str, Any]) -> None:
 
 
 def helper_backfill_card_fields(card: dict[str, Any], body: str) -> set[str]:
+    # 只回填缺失或确定错误的卡片字段，并保持已有高可信信息不变。
     flags = set(helper_split_flags(card.get("cleaning_flags", "")))
     if card.get("cleaning_quality") == "poor" or "likely_text_encoding_failure" in flags:
         return set()
@@ -510,33 +518,7 @@ def helper_note_example(examples: dict[str, list[dict[str, str]]], key: str, doc
 
 
 def helper_sync_sections(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> dict[str, int]:
-    changed_files = 0
-    changed_rows = 0
-    for path in sorted((data_dir / "sections").glob("*.jsonl")):
-        rows = list(read_jsonl(path))
-        output: list[dict[str, Any]] = []
-        file_changed = False
-        for row in rows:
-            new_row = dict(row)
-            doc = documents_by_id.get(new_row.get("doc_id", ""))
-            if not doc:
-                file_changed = True
-                continue
-            for key in ("title", "publication_date", "source_institution", "clinical_department"):
-                if new_row.get(key) != doc.get(key):
-                    new_row[key] = doc.get(key, "")
-                    file_changed = True
-            reference = helper_reference_like(new_row.get("content", ""), new_row.get("section_path") or [])
-            if bool(new_row.get("is_reference_section")) != reference:
-                new_row["is_reference_section"] = reference
-                file_changed = True
-            if new_row != row:
-                changed_rows += 1
-            output.append(new_row)
-        if file_changed:
-            write_jsonl(path, output)
-            changed_files += 1
-    return {"section_files_changed": changed_files, "section_rows_changed": changed_rows}
+    return helper_sync_sections_from_documents(data_dir, documents_by_id, clear_missing_fields=True)
 
 
 def helper_iter_jsonl_rows(paths: Iterable[Path]) -> Iterable[dict[str, Any]]:
@@ -563,8 +545,7 @@ def helper_sync_chunks(data_dir: Path, documents_by_id: dict[str, dict[str, Any]
                 if new_row.get(key) != doc.get(key):
                     new_row[key] = doc.get(key, "")
                     file_changed = True
-            # Chunk-level reference flags are inherited from the encoded section.
-            # Re-detecting them from an isolated chunk loses many reference chunks.
+            # 分块的参考文献标记继承自完整章节；仅用孤立分块重新判断会漏掉大量参考文献内容。
             section_path = new_row.get("section_path") or []
             expected_retrieval = retrieval_text(
                 new_row.get("title", ""),

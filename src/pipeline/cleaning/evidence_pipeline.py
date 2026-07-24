@@ -20,7 +20,7 @@ from typing import Any
 from src.retrieval.bm25_store import build_bm25_indexes
 from src.retrieval.document_repr import build_document_representations
 from src.retrieval.sqlite_store import build_sqlite_store
-from src.retrieval.vector_store import build_vector_indexes
+from src.retrieval.vector_store import DEFAULT_EMBEDDING_MODEL, build_vector_indexes
 
 from src.pipeline.cleaning.block_chunker import chunk_blocks
 from src.pipeline.cleaning.block_encoder import encode_blocks
@@ -86,7 +86,7 @@ def run_evidence_pipeline(
     skip_pdf_to_markdown: bool = False,
     skip_vector: bool = False,
     legacy_json_bm25: bool = False,
-    embedding_model: str = "BAAI/bge-m3",
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ocr_mode: str = "auto",
     ocr_languages: str = "chi_sim+eng",
 ) -> dict[str, Any]:

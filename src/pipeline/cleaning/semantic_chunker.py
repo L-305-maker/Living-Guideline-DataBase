@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from src.retrieval.document_repr.section_classifier import classify_section
+from src.utils.text import (
+    estimate_tokens,
+    normalize_space as helper_normalize,
+)
 
 
 TARGET_TOKENS = 300
@@ -19,7 +23,6 @@ MIN_TOKENS = 120
 MAX_TOKENS = 420
 OVERLAP_TOKENS = 40
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|[\u4e00-\u9fff]")
 WORD_OR_CHAR_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|\S")
 LEADING_HEADING_RE = re.compile(r"^\s*#{1,6}\s+.+?(?:\n+|$)")
 BULLET_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)]|\([a-zA-Z0-9]+\))\s+")
@@ -71,8 +74,6 @@ class SemanticUnit:
     token_count: int
 
 
-def estimate_tokens(text: str) -> int:
-    return len(TOKEN_RE.findall(text or ""))
 
 
 def retrieval_text(title: str, section_path: Iterable[str], chunk_type: str, content: str) -> str:
@@ -146,8 +147,6 @@ def helper_strip_leading_heading(content: str) -> str:
     return LEADING_HEADING_RE.sub("", content or "", count=1).strip()
 
 
-def helper_normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
 
 
 def helper_is_table_text(text: str) -> bool:

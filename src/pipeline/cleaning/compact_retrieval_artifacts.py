@@ -35,6 +35,7 @@ def helper_rewrite(path: Path, projector: Callable[[dict[str, Any]], dict[str, A
 
 
 def compact_artifacts(data_dir: str | Path = DATA_DIR) -> dict[str, Any]:
+    # 所有 JSONL 先写临时文件再原子替换，任一步失败都要清理临时产物并保留原文件。
     root = Path(data_dir)
     card_count, card_before, card_after = helper_rewrite(root / "document_cards.jsonl", compact_document_card)
     view_count, view_before, view_after = helper_rewrite(root / "document_views.jsonl", compact_document_view)

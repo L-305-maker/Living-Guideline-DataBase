@@ -51,6 +51,7 @@ def assess_pdf_text_layer(
     scanned_page_ratio_threshold: float = 0.60,
 ) -> PdfTextLayerReport:
     """Classify whether a PDF text layer is usable or likely needs OCR."""
+    # 扫描件判断综合页级字符密度和可读文本比例，单页异常不能直接代表整篇文档。
 
     page_stats = list(pages)
     page_count = len(page_stats)

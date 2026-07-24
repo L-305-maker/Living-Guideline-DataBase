@@ -22,6 +22,7 @@ def load_document_departments(path: str | Path) -> dict[str, list[str]]:
 
 
 def relabel_chunk(record: dict[str, Any], parent: list[str], force: bool = False) -> tuple[dict[str, Any], bool, bool]:
+    # 分块标签以文档标签为先验，再结合章节路径和内容收窄，避免无依据扩大科室范围。
     current = [str(item).strip() for item in record.get("clinical_departments") or [] if str(item).strip()]
     fallback = current == [UNKNOWN_DEPARTMENT] and UNKNOWN_DEPARTMENT not in parent
     if force:
@@ -57,6 +58,7 @@ def relabel_all(
     chunks_dir: str | Path = DATA_DIR / "chunks",
     force_documents: set[str] | None = None,
 ) -> dict[str, int | str]:
+    # 逐文件重标后统一重建聚合文件，临时写入保证失败时不破坏原始分块。
     documents = load_document_departments(document_manifest)
     directory = Path(chunks_dir)
     chunk_files = sorted(path for path in directory.glob("*.jsonl") if path.name != "all_chunks.jsonl")

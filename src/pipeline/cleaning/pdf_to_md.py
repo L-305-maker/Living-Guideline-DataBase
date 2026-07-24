@@ -236,6 +236,7 @@ def helper_reading_order(lines: list[PdfTextLine], page_width: float) -> list[Pd
 
 
 def helper_heading_level(line: PdfTextLine, body_size: float) -> int | None:
+    # 标题等级按 Markdown 标记、编号模式和版式信号依次判定，弱信号不能覆盖强信号。
     text = line.text.strip()
     if not text or text.startswith("#") or LIST_ITEM_RE.match(text):
         return None
@@ -416,6 +417,7 @@ def convert_pdf(
     document_kind: str = "guideline",
 ) -> DocumentRecord:
     """Convert one PDF to front-matter Markdown under data/markdown_raw/{doc_id}.md."""
+    # 先评估原 PDF 再决定 OCR，最终元数据同时保留原始与转换后质量状态。
 
     if document_kind not in {"guideline", "consensus"}:
         raise ValueError("document_kind must be guideline or consensus")
@@ -432,7 +434,7 @@ def convert_pdf(
     conversion_report = helper_inspect_pdf_for_ingestion(conversion_pdf) if ocr_result.applied else pdf_report
     raw = helper_with_pymupdf4llm(conversion_pdf) or helper_with_pymupdf(conversion_pdf)
     title = extract_title(raw, pdf)
-    source_institution = extract_source_institution(pdf, raw, title=title, document_kind=document_kind)
+    source_institution = extract_source_institution(pdf, raw, title=title)
     publication_date = extract_publication_date(pdf, raw)
     file_sha = sha256_file(pdf)
     doc_id = make_doc_id(source_institution, publication_date, file_sha)

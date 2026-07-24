@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from src.pipeline.cleaning.evidence_pipeline import run_evidence_pipeline
+from src.pipeline.cleaning.evidence_pipeline import DEFAULT_EMBEDDING_MODEL, run_evidence_pipeline
 from src.utils.io import DATA_DIR
 
 
@@ -28,7 +28,7 @@ def run_pipeline(
     skip_pdf_to_markdown: bool = False,
     skip_vector: bool = False,
     legacy_json_bm25: bool = False,
-    embedding_model: str = "BAAI/bge-m3",
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ocr_mode: str = "auto",
     ocr_languages: str = "chi_sim+eng",
 ) -> dict[str, Any]:
@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-pdf-to-markdown", action="store_true", help="Reuse existing markdown_raw files.")
     parser.add_argument("--skip-vector", action="store_true", help="Skip optional FAISS/vector index building.")
     parser.add_argument("--legacy-json-bm25", action="store_true", help="Also build legacy JSON BM25 indexes.")
-    parser.add_argument("--embedding-model", default="BAAI/bge-m3", help="SentenceTransformer model for optional vectors.")
+    parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL, help="SentenceTransformer model for optional vectors.")
     parser.add_argument("--ocr-mode", choices=["never", "auto", "force"], default="auto", help="OCRmyPDF mode for scanned PDFs.")
     parser.add_argument("--ocr-languages", default="chi_sim+eng", help="OCR language list passed to OCRmyPDF.")
     return parser.parse_args()

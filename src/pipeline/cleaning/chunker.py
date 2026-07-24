@@ -127,6 +127,7 @@ def helper_fallback_chunk(metadata: dict[str, Any], body: str, sections: list[An
 
 
 def chunk_markdown(markdown: str, clean_path: str = "") -> list[ChunkRecord]:
+    # 先按章节语义边界生成分块；正文无法切分时才建立单个可追踪兜底块。
     metadata, body = parse_front_matter(markdown)
     sections = encode_markdown(markdown)
     chunks: list[ChunkRecord] = []
