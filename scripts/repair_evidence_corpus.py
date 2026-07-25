@@ -24,7 +24,6 @@ from src.pipeline.cleaning.encoder import encode_all
 from src.pipeline.cleaning.chunker import chunk_all
 from src.pipeline.cleaning.pdf_to_md import helper_convert_pdf_worker, helper_deduplicate_doc_id
 from src.retrieval.document_repr import build_document_representations
-from src.retrieval.sqlite_store import build_sqlite_store
 from src.utils.front_matter import parse_front_matter
 from src.utils.io import read_jsonl, write_jsonl
 
@@ -303,7 +302,6 @@ def main() -> None:
     stages["sections"] = encode_all(data_dir / "markdown_clean", data_dir / "sections")
     stages["document_representations"] = build_document_representations(data_dir / "markdown_clean", data_dir)
     stages["chunks"] = chunk_all(data_dir / "markdown_clean", data_dir / "chunks")
-    stages["sqlite"] = build_sqlite_store(data_dir, data_dir / "index" / "rag.sqlite")
 
     inventory = finalize_inventory(inventory, data_dir, conversion_errors)
     status_after = dict(Counter(str(row["status"]) for row in inventory))
@@ -334,11 +332,10 @@ def main() -> None:
                 "consensus_pdf_dir": str(consensus_pdf_dir),
                 "source_pdf_inventory": str(data_dir / "source_pdf_inventory.jsonl"),
                 "document_manifest": str(data_dir / "documents.jsonl"),
-                "sqlite_db": str(data_dir / "index" / "rag.sqlite"),
             },
             "source_status": status_after,
             "stages": stages,
-            "vector": {"skipped": True, "reason": "no vector index exists in the active SQLite-only build"},
+            "postgresql": {"next_step": "reload JSONL artifacts into PostgreSQL and rebuild pgvector embeddings"},
         },
     )
     unresolved = status_after.get("confirmed_still_unprocessed", 0) + status_after.get("conversion_failed", 0)

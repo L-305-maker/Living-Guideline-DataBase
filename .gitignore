@@ -15,3 +15,5 @@ tests/
 tmp/
 deploy/pdf-markdown-rag-mcp.service
 .venv
+.venv-mineru/
+.venv-mineru-gpu/
