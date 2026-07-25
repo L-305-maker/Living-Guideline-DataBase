@@ -12,9 +12,9 @@
 | `atomic_chunker.py` | 生成可独立检索的原子块，保留推荐与证据结构 |
 | `table_chunker.py` | 生成表格父块、行块和备注块 |
 | `chunk_linker.py` | 建立父子、表格和相邻块双向关系 |
-| `bm25_index.py`、`vector_index.py` | 本地词法及向量索引 |
+| `bm25_index.py` | 本地词法索引 |
 | `chunk_retrieve_service.py` | 查询、过滤和结果组装 |
-| `structural_rag.py` | 运行完整结构化处理流程 |
+| `structural_rag.py` | 运行完整结构化处理流程，并在提供 encoder 时执行向量召回 |
 | `evaluation.py` | 检查召回和结构保持效果 |
 | `models.py` | 块、章节和链接数据结构 |
 | `text_templates.py` | 不同块类型的检索文本模板 |

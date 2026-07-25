@@ -56,11 +56,6 @@ def relative_to_workspace(path: str | Path) -> str:
         return str(resolved)
 
 
-def relative_to_project(path: str | Path) -> str:
-    """Backward-compatible alias for older callers."""
-
-    return relative_to_workspace(path)
-
 
 def iter_markdown_files(directory: str | Path) -> Iterator[Path]:
     yield from sorted(Path(directory).glob("*.md"))
