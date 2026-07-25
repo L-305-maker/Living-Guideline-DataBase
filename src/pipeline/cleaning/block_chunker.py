@@ -20,6 +20,3 @@ def chunk_blocks(
         "chunks": result.get("chunks", 0),
         "chunks_dir": str(chunks_dir),
     }
-
-
-chunk_all = chunk_blocks

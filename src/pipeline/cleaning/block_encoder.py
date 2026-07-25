@@ -2,7 +2,7 @@
 
 In the evidence pipeline, a block is the complete Markdown section produced
 from heading-aware parsing. The on-disk directory remains named ``sections`` so
-it can be ingested by the existing SQLite/FTS builder.
+it can be ingested by the PostgreSQL storage builder.
 """
 
 from __future__ import annotations

@@ -233,47 +233,6 @@ def helper_repair_chunks(data_dir: Path, documents: dict[str, dict[str, Any]]) -
     return {"chunk_files_changed": changed_files, "chunk_rows_changed": changed_rows, "chunks_total": len(all_rows)}
 
 
-def helper_repair_vector_metadata(data_dir: Path) -> dict[str, Any]:
-    index_dir = data_dir / "index"
-    metadata_path = index_dir / "vector_indexes_metadata.json"
-    metadata: dict[str, Any] = {}
-    if metadata_path.exists():
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            metadata = {}
-    for key, manifest_name in (
-        ("document_card_index", "faiss_document_cards_shards.json"),
-        ("document_view_index", "faiss_document_views_shards.json"),
-        ("chunk_index", "faiss_chunks_shards.json"),
-    ):
-        manifest_path = index_dir / manifest_name
-        if not manifest_path.exists():
-            continue
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        metadata[key] = {
-            "count": manifest.get("count"),
-            "dim": manifest.get("dim"),
-            "shards": len(manifest.get("shards", [])),
-            "manifest": str(manifest_path),
-        }
-        metadata.setdefault("model", manifest.get("model"))
-    expected_cards = sum(1 for _ in read_jsonl(data_dir / "document_cards.jsonl"))
-    expected_views = sum(1 for _ in read_jsonl(data_dir / "document_views.jsonl"))
-    expected_chunks = sum(1 for _ in read_jsonl(data_dir / "chunks" / "all_chunks.jsonl"))
-    card_count = (metadata.get("document_card_index") or {}).get("count")
-    view_count = (metadata.get("document_view_index") or {}).get("count")
-    chunk_count = (metadata.get("chunk_index") or {}).get("count")
-    metadata["expected_document_card_count"] = expected_cards
-    metadata["expected_document_view_count"] = expected_views
-    metadata["expected_chunk_count"] = expected_chunks
-    metadata["needs_rebuild"] = card_count != expected_cards or view_count != expected_views or chunk_count != expected_chunks
-    metadata["built"] = bool(metadata.get("document_card_index") or metadata.get("document_view_index") or metadata.get("chunk_index"))
-    if metadata:
-        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"vector_metadata_repaired": bool(metadata)}
-
-
 def repair_quality(data_dir: str | Path = DATA_DIR, year_start: int = 2012, year_end: int = 2026) -> dict[str, Any]:
     data_path = Path(data_dir)
     documents_path = data_path / "documents.jsonl"
@@ -299,8 +258,6 @@ def repair_quality(data_dir: str | Path = DATA_DIR, year_start: int = 2012, year
     documents_by_id = {record["doc_id"]: record for record in repaired_documents}
     section_stats = helper_repair_sections(data_path, documents_by_id)
     chunk_stats = helper_repair_chunks(data_path, documents_by_id)
-    vector_stats = helper_repair_vector_metadata(data_path)
-
     return {
         "documents": len(repaired_documents),
         "year_start": year_start,
@@ -310,7 +267,6 @@ def repair_quality(data_dir: str | Path = DATA_DIR, year_start: int = 2012, year
         "date_repairs": date_repairs,
         **section_stats,
         **chunk_stats,
-        **vector_stats,
     }
 
 

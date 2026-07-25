@@ -14,7 +14,6 @@ from src.pipeline.cleaning.cleaner import assess_cleaned_body
 from src.pipeline.cleaning.semantic_chunker import retrieval_text
 from src.pipeline.quality.repair_quality import (
     helper_reference_like,
-    helper_repair_vector_metadata,
     helper_sync_sections_from_documents,
 )
 from src.retrieval.document_repr.builder import (
@@ -570,7 +569,6 @@ def helper_sync_derived_metadata(data_dir: Path, documents_by_id: dict[str, dict
     stats: dict[str, Any] = {}
     stats.update(helper_sync_sections(data_dir, documents_by_id))
     stats.update(helper_sync_chunks(data_dir, documents_by_id))
-    stats.update(helper_repair_vector_metadata(data_dir))
     return stats
 
 

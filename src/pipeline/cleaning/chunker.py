@@ -10,10 +10,8 @@ from typing import Any
 from src.models.schemas import ChunkRecord, dump_model
 from src.pipeline.cleaning.encoder import encode_markdown
 from src.pipeline.cleaning.semantic_chunker import (
-    TARGET_TOKENS,
     estimate_tokens,
     retrieval_text,
-    split_section_content as _semantic_split_section_content,
     split_section_semantic_content,
 )
 from src.retrieval.document_repr.section_classifier import classify_section
@@ -54,22 +52,6 @@ def compact_chunk_record(record: dict[str, Any] | ChunkRecord) -> dict[str, Any]
         dict.fromkeys(str(label).strip() for label in labels if str(label).strip())
     ) or ["未分类"]
     return {field: values.get(field) for field in CHUNK_OUTPUT_FIELDS}
-
-def split_section_content(
-    content: str,
-    min_tokens: int = 120,
-    max_tokens: int = 420,
-    overlap_ratio: float = 0.10,
-) -> list[str]:
-    """Backward-compatible wrapper around semantic chunking."""
-
-    return _semantic_split_section_content(
-        content,
-        min_tokens=min_tokens,
-        target_tokens=min(TARGET_TOKENS, max_tokens),
-        max_tokens=max_tokens,
-        overlap_tokens=int(max_tokens * overlap_ratio),
-    )
 
 
 def helper_fallback_chunk_content(metadata: dict[str, Any], body: str) -> str:

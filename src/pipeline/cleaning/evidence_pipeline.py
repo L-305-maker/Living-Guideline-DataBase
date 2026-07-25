@@ -1,4 +1,4 @@
-﻿"""Evidence-library cleaning pipeline.
+"""Evidence-library cleaning pipeline.
 
 The pipeline is intentionally retrieval-first:
 
@@ -6,26 +6,22 @@ raw PDF -> raw Markdown -> clean Markdown -> complete blocks -> small chunks.
 
 It does not extract recommendations, PICO questions, GRADE candidates, or
 evidence items. Those concepts are downstream reasoning concerns for the agent,
-not entities produced during cleaning.
+not entities produced during cleaning. PostgreSQL ingestion and vectorization
+are handled by ``src.storage`` commands after these JSONL artifacts exist.
 """
 
 from __future__ import annotations
 
 import json
-import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-from src.retrieval.bm25_store import build_bm25_indexes
-from src.retrieval.document_repr import build_document_representations
-from src.retrieval.sqlite_store import build_sqlite_store
-from src.retrieval.vector_store import DEFAULT_EMBEDDING_MODEL, build_vector_indexes
 
 from src.pipeline.cleaning.block_chunker import chunk_blocks
 from src.pipeline.cleaning.block_encoder import encode_blocks
 from src.pipeline.cleaning.markdown_cleaner import clean_markdown_dir
 from src.pipeline.cleaning.pdf_to_markdown import convert_pdfs
+from src.retrieval.document_repr import build_document_representations
 from src.utils.io import DATA_DIR
 
 
@@ -40,16 +36,19 @@ class EvidencePipelinePaths:
     markdown_clean_dir: Path
     blocks_dir: Path
     chunks_dir: Path
-    index_dir: Path
     raw_manifest: Path
     document_manifest: Path
     document_cards: Path
     document_views: Path
-    sqlite_db: Path
     run_manifest: Path
 
     @classmethod
-    def from_data_dir(cls, data_dir: str | Path, raw_pdf_dir: str | Path | None = None, consensus_pdf_dir: str | Path | None = None) -> "EvidencePipelinePaths":
+    def from_data_dir(
+        cls,
+        data_dir: str | Path,
+        raw_pdf_dir: str | Path | None = None,
+        consensus_pdf_dir: str | Path | None = None,
+    ) -> "EvidencePipelinePaths":
         root = Path(data_dir)
         return cls(
             data_dir=root,
@@ -59,12 +58,10 @@ class EvidencePipelinePaths:
             markdown_clean_dir=root / "markdown_clean",
             blocks_dir=root / "sections",
             chunks_dir=root / "chunks",
-            index_dir=root / "index",
             raw_manifest=root / "documents_raw.jsonl",
             document_manifest=root / "documents.jsonl",
             document_cards=root / "document_cards.jsonl",
             document_views=root / "document_views.jsonl",
-            sqlite_db=root / "index" / "rag.sqlite",
             run_manifest=root / "evidence_pipeline_manifest.json",
         )
 
@@ -84,22 +81,17 @@ def run_evidence_pipeline(
     raw_pdf_dir: str | Path | None = None,
     consensus_pdf_dir: str | Path | None = None,
     skip_pdf_to_markdown: bool = False,
-    skip_vector: bool = False,
-    legacy_json_bm25: bool = False,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ocr_mode: str = "auto",
     ocr_languages: str = "chi_sim+eng",
 ) -> dict[str, Any]:
     """Run the evidence-library build and return a machine-readable manifest."""
 
-    # 所有阶段共享同一组规范路径，避免调用方各自推导目录造成产物错位。
     paths = EvidencePipelinePaths.from_data_dir(data_dir, raw_pdf_dir, consensus_pdf_dir)
     for directory in [
         paths.markdown_raw_dir,
         paths.markdown_clean_dir,
         paths.blocks_dir,
         paths.chunks_dir,
-        paths.index_dir,
     ]:
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -112,42 +104,34 @@ def run_evidence_pipeline(
         }
     else:
         stages["pdf_to_markdown"] = convert_pdfs(
-            paths.raw_pdf_dir, paths.markdown_raw_dir, paths.raw_manifest,
-            ocr_mode=ocr_mode, ocr_output_dir=paths.data_dir / "ocr_pdf",
-            ocr_languages=ocr_languages, document_kind="guideline",
+            paths.raw_pdf_dir,
+            paths.markdown_raw_dir,
+            paths.raw_manifest,
+            ocr_mode=ocr_mode,
+            ocr_output_dir=paths.data_dir / "ocr_pdf",
+            ocr_languages=ocr_languages,
+            document_kind="guideline",
         )
-        # 共识文件追加到同一原始 manifest，并通过 document_kind 与指南区分。
         if paths.consensus_pdf_dir.exists():
             stages["consensus_pdf_to_markdown"] = convert_pdfs(
-                paths.consensus_pdf_dir, paths.markdown_raw_dir, paths.raw_manifest,
-                ocr_mode=ocr_mode, ocr_output_dir=paths.data_dir / "ocr_pdf",
-                ocr_languages=ocr_languages, document_kind="consensus", append=True,
+                paths.consensus_pdf_dir,
+                paths.markdown_raw_dir,
+                paths.raw_manifest,
+                ocr_mode=ocr_mode,
+                ocr_output_dir=paths.data_dir / "ocr_pdf",
+                ocr_languages=ocr_languages,
+                document_kind="consensus",
+                append=True,
             )
 
     stages["clean_markdown"] = clean_markdown_dir(paths.markdown_raw_dir, paths.markdown_clean_dir, paths.document_manifest)
     stages["encode_blocks"] = encode_blocks(paths.markdown_clean_dir, paths.blocks_dir)
     stages["document_representations"] = build_document_representations(paths.markdown_clean_dir, paths.data_dir)
     stages["chunk_blocks"] = chunk_blocks(paths.markdown_clean_dir, paths.chunks_dir)
-    stages["sqlite_fts"] = build_sqlite_store(paths.data_dir, paths.sqlite_db)
-    # SQLite 建库会产生大量临时对象，向量模型加载前主动回收可降低峰值内存。
-    gc.collect()
-
-    if legacy_json_bm25:
-        stages["legacy_json_bm25"] = build_bm25_indexes(paths.markdown_clean_dir, paths.chunks_dir / "all_chunks.jsonl", paths.index_dir)
-    if skip_vector:
-        # manifest 明确记录跳过原因，服务部署时可判断是否具备向量检索条件。
-        stages["vector"] = {"skipped": True, "reason": "skip_vector was explicitly enabled"}
-    else:
-        stages["vector"] = build_vector_indexes(
-            paths.markdown_clean_dir,
-            paths.chunks_dir / "all_chunks.jsonl",
-            paths.index_dir,
-            embedding_model,
-        )
 
     manifest = {
-        "pipeline_version": "evidence_cleaning_rag_v1",
-        "goal": "clean, split, and index guideline evidence for an evidence-based medicine agent",
+        "pipeline_version": "evidence_cleaning_pg_v1",
+        "goal": "clean and split guideline evidence for PostgreSQL ingestion",
         "extracts_recommendations": False,
         "extracts_pico_questions": False,
         "artifacts": paths.as_dict(),
