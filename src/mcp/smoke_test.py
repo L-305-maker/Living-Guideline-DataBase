@@ -1,40 +1,35 @@
-﻿"""Smoke-test Search, Read, and Retrieve APIs behind the MCP tools."""
+"""Smoke-test PostgreSQL Search, Read, and Retrieve APIs behind MCP tools."""
 
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 
-from src.mcp.api_read import read
-from src.mcp.api_retrieve import retrieve
-from src.mcp.api_search import search
+from src.mcp.api_pg import read_pg, retrieve_pg, search_pg
 
 
-def smoke_test(data_dir: str | Path = "data/evidence") -> dict[str, object]:
-    search_results = search(
+def smoke_test(query: str = "diabetes hypertension guideline", topk: int = 3) -> dict[str, object]:
+    search_results = search_pg(
         {
-            "query": "糖尿病 胰岛素",
+            "query": query,
             "time_range": "2012-2026",
-            "topk": 3,
+            "topk": topk,
             "recency_boost": True,
-        },
-        data_dir=data_dir,
+        }
     )
     if not search_results:
-        raise RuntimeError("search returned no results")
+        raise RuntimeError("search_pg returned no results")
 
-    doc = read({"doc_id": search_results[0]["doc_id"], "max_chars": 500}, data_dir=data_dir)
-    chunks = retrieve(
+    doc = read_pg({"doc_id": search_results[0]["doc_id"], "max_chars": 500})
+    chunks = retrieve_pg(
         {
-            "query": "糖尿病患者胰岛素治疗如何管理",
+            "query": query,
             "time_range": "2012-2026",
-            "topk": 3,
-        },
-        data_dir=data_dir,
+            "topk": topk,
+        }
     )
     if not chunks:
-        raise RuntimeError("retrieve returned no chunks")
+        raise RuntimeError("retrieve_pg returned no chunks")
 
     return {
         "search_count": len(search_results),
@@ -56,9 +51,10 @@ def smoke_test(data_dir: str | Path = "data/evidence") -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="data/evidence")
+    parser.add_argument("--query", default="diabetes hypertension guideline")
+    parser.add_argument("--topk", type=int, default=3)
     args = parser.parse_args()
-    print(json.dumps(smoke_test(args.data_dir), ensure_ascii=False, indent=2))
+    print(json.dumps(smoke_test(args.query, args.topk), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

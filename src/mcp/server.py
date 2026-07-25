@@ -1,11 +1,14 @@
-﻿"""MCP server exposing Search, Read, and Retrieve as first-class tools."""
+"""MCP server exposing PostgreSQL Search, Read, and Retrieve tools."""
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
+from src.mcp.call_logger import log_mcp_call
+from src.mcp.api_pg import read_pg as read_api
+from src.mcp.api_pg import retrieve_pg as retrieve_api
+from src.mcp.api_pg import search_pg as search_api
 from src.mcp.server_common import (
     env_bool as helper_env_bool,
     env_int as helper_env_int,
@@ -14,23 +17,10 @@ from src.mcp.server_common import (
     run_server,
     search_payload,
 )
-from src.mcp.call_logger import log_mcp_call
-from src.utils.io import DATA_DIR as DEFAULT_DATA_DIR
 
-BACKEND = os.environ.get("RAG_BACKEND", "local").strip().lower()
-IS_POSTGRES_BACKEND = BACKEND in {"postgres", "postgresql", "pg"}
-SEARCH_DEFAULT_TOPK = 10 if IS_POSTGRES_BACKEND else 20
-RETRIEVE_DEFAULT_TOPK = 5 if IS_POSTGRES_BACKEND else 30
-DATA_DIR = Path(os.environ.get("RAG_DATA_DIR", str(DEFAULT_DATA_DIR)))
-
-if IS_POSTGRES_BACKEND:
-    from src.mcp.api_pg import read_pg as read_api
-    from src.mcp.api_pg import retrieve_pg as retrieve_api
-    from src.mcp.api_pg import search_pg as search_api
-else:
-    from src.mcp.api_read import read as read_api
-    from src.mcp.api_retrieve import retrieve as retrieve_api
-    from src.mcp.api_search import search as search_api
+BACKEND = "postgres"
+SEARCH_DEFAULT_TOPK = 10
+RETRIEVE_DEFAULT_TOPK = 5
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -38,11 +28,9 @@ except ImportError:  # pragma: no cover
     FastMCP = None  # type: ignore[assignment]
 
 
-
-
 mcp = (
     FastMCP(
-        f"pdf-markdown-rag-{BACKEND}",
+        "pdf-markdown-rag-postgres",
         host=os.environ.get("MCP_HOST", "127.0.0.1"),
         port=helper_env_int("MCP_PORT", 8000),
         streamable_http_path=os.environ.get("MCP_STREAMABLE_HTTP_PATH", "/mcp"),
@@ -57,12 +45,7 @@ mcp = (
 
 
 def helper_call_api(tool_name: str, api: Any, payload: dict[str, Any]) -> Any:
-    def call() -> Any:
-        if IS_POSTGRES_BACKEND:
-            return api(payload)
-        return api(payload, data_dir=DATA_DIR)
-
-    return log_mcp_call(tool_name, BACKEND, payload, call)
+    return log_mcp_call(tool_name, BACKEND, payload, lambda: api(payload))
 
 
 if mcp is not None:
@@ -77,7 +60,7 @@ if mcp is not None:
         recency_boost: bool = False,
         topk: int = SEARCH_DEFAULT_TOPK,
     ) -> list[dict[str, Any]]:
-        """Search candidate guideline documents by keywords, source institution, and time range."""
+        """Search candidate guideline documents from PostgreSQL."""
 
         return helper_call_api(
             "search",
@@ -95,7 +78,7 @@ if mcp is not None:
 
     @mcp.tool()
     def read(doc_id: str | None = None, title: str | None = None, max_chars: int | None = None) -> dict[str, Any]:
-        """Read a full clean Markdown document by doc_id or title."""
+        """Read a clean Markdown document from PostgreSQL by doc_id or title."""
 
         return helper_call_api("read", read_api, read_payload(doc_id, title, max_chars))
 
@@ -108,7 +91,7 @@ if mcp is not None:
         publication_date: str | None = None,
         topk: int = RETRIEVE_DEFAULT_TOPK,
     ) -> list[dict[str, Any]]:
-        """Retrieve traceable chunks with BM25+Dense recall followed by one reranker pass."""
+        """Retrieve traceable chunks from PostgreSQL full-text and pgvector indexes."""
 
         return helper_call_api(
             "retrieve",

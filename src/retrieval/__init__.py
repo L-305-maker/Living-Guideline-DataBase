@@ -1,2 +1,1 @@
-"""Search indexes: BM25, vector store, and RRF fusion."""
-
+"""Retrieval helpers shared by the PostgreSQL backend."""
