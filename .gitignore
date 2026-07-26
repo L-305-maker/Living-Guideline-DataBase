@@ -12,8 +12,14 @@ __pycache__/
 .ruff_cache/
 .codex/
 tests/
+!tests/
+tests/*
+!tests/__init__.py
+!tests/guideline_information/
+!tests/guideline_information/*.py
 tmp/
 deploy/pdf-markdown-rag-mcp.service
 .venv
 .venv-mineru/
 .venv-mineru-gpu/
+tests/
