@@ -41,5 +41,13 @@ def make_candidate_id(
     return f"{algorithm_version}:cand:{stable_hash(source_block_key, source_revision_id, candidate_text, length=24)}"
 
 
+def make_extraction_id(candidate_id: str, extractor_name: str, model_name: str, prompt_version: str, schema_version: str) -> str:
+    return make_record_id("extraction", candidate_id, extractor_name, model_name, prompt_version, schema_version)
+
+
+def make_verification_id(extraction_id: str, verifier_name: str, model_name: str, prompt_version: str, schema_version: str) -> str:
+    return make_record_id("verification", extraction_id, verifier_name, model_name, prompt_version, schema_version)
+
+
 def make_record_id(prefix: str, *parts: Any, algorithm_version: str = ID_ALGORITHM_VERSION) -> str:
     return f"{algorithm_version}:{prefix}:{stable_hash(*parts, length=24)}"

@@ -1,0 +1,26 @@
+Prompt version: recommendation_extraction_v1
+
+Extract P0 Recommendation fields from the supplied candidate text and allowed context.
+Do not reason step by step. Output the final JSON immediately. Return exactly one JSON object. Do not return an array, a recommendations list, markdown, or explanatory text. Keep the JSON compact; include only short evidence quotes for the extracted first recommendation.
+
+Required top-level keys:
+- is_formal_recommendation: boolean
+- recommendation_type: one of FORMAL_RECOMMENDATION, GOOD_PRACTICE_STATEMENT, IMPLEMENTATION_REMARK, RESEARCH_RECOMMENDATION, RATIONALE, EVIDENCE_SUMMARY, NOT_RECOMMENDATION, UNRESOLVED
+- recommendation_text: string, empty string only when is_formal_recommendation is false
+- direction: string or null
+- strength: string or null
+- certainty: string or null
+- population: string or null
+- interventions: array of strings
+- dosage: string or null
+- duration: string or null
+- conditions: array of strings
+- field_evidence: object
+
+Use these exact field names. Do not use recommendation, recommendations, intervention, comparison, outcome, strength_of_recommendation, certainty_of_evidence, medication_name, population_name, recommendation_name, dosage_value, dosage_unit, frequency_value, or duration_value as top-level keys.
+
+If multiple formal recommendations are present, extract the first complete formal recommendation only. Do not split into multiple objects.
+If the candidate is not a formal recommendation, return is_formal_recommendation false, recommendation_type NOT_RECOMMENDATION, recommendation_text "", null scalar fields, empty arrays, and field_evidence {}.
+If a field is not directly supported by the candidate text or allowed context, return null for scalar fields or [] for arrays. Do not infer dosage, population, strength, certainty, or direction from medical knowledge.
+
+For every non-empty medical field, include field_evidence entries keyed by field name. Each evidence item should include quote, span_start, span_end, source_block_key, source_type, value_original, value_normalized, and confidence_signal. confidence_signal is only a model signal, not a calibrated probability.

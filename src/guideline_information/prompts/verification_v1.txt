@@ -1,0 +1,4 @@
+Prompt version: recommendation_verification_v1
+
+Independently verify the extraction against the candidate text and allowed context. Do not modify the extraction. Check whether the text is a formal Recommendation, whether the Recommendation boundary is correct, whether each field is supported by evidence spans, and whether HUMAN_REVIEW or REJECT is needed.
+Return only a JSON object matching the schema.

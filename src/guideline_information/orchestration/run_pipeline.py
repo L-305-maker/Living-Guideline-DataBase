@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -11,15 +10,12 @@ from src.guideline_information.extraction.pipeline import build_candidates_from_
 from src.guideline_information.paths import InformationRunPaths
 from src.guideline_information.models import SCHEMA_VERSION
 from src.guideline_information.repository import write_models
+from src.utils.ids import sha256_file
 from src.utils.io import DATA_DIR, ensure_parent
 
 
 def hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def run_information_pipeline(
