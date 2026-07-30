@@ -24,9 +24,11 @@ class CandidateBuilder:
         *,
         classifier: Classifier = classify_block_type,
         context_builder: ContextBuilder | None = None,
+        include_hard_negatives: bool = True,
     ) -> None:
         self.classifier = classifier
         self.context_builder = context_builder or ContextBuilder()
+        self.include_hard_negatives = include_hard_negatives
 
     def build(self, sections: Iterable[dict[str, Any]], pipeline_run_id: str) -> list[RecommendationCandidate]:
         section_list = list(sections)
@@ -37,7 +39,7 @@ class CandidateBuilder:
                 continue
             section_path = [str(item) for item in record.get("section_path") or []]
             block_type = self.classifier(text, section_path)
-            if block_type != "recommendation_candidate":
+            if block_type != "recommendation_candidate" and not (self.include_hard_negatives and _is_hard_negative(block_type, text)):
                 continue
             source_block_key = make_source_block_key(
                 str(record.get("doc_id") or ""),
@@ -60,9 +62,19 @@ class CandidateBuilder:
                     candidate_text=text,
                     context_before=context.before,
                     context_after=context.after,
+                    title=str(record.get("title") or ""),
+                    source_institution=str(record.get("source_institution") or ""),
+                    publication_date=str(record.get("publication_date") or ""),
                     candidate_signals=[block_type],
-                    candidate_profile={"block_type": block_type},
-                    candidate_score=1.0,
+                    candidate_profile={"block_type": block_type, "hard_negative": block_type != "recommendation_candidate"},
+                    candidate_score=1.0 if block_type == "recommendation_candidate" else 0.25,
                 )
             )
         return candidates
+
+
+def _is_hard_negative(block_type: str, text: str) -> bool:
+    lower = text.lower()
+    return block_type in {"method", "rationale_candidate", "evidence_candidate", "reference"} or any(
+        token in lower for token in ["research recommendation", "good practice", "rationale", "executive summary"]
+    )
