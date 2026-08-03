@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from statistics import median
 from typing import Any
 
 from src.models.schemas import DocumentRecord, dump_model
+from src.pipeline.ocr.mineru_runner import MineruRun, mineru_enabled, run_mineru
 from src.pipeline.ocr.ocrmypdf_runner import OcrResult, run_ocrmypdf
 from src.pipeline.ocr.pdf_quality import PdfTextLayerReport, inspect_pdf_text_layer
 from src.utils.clinical_department import classify_clinical_departments
@@ -382,6 +384,32 @@ def helper_maybe_run_ocr(
     return run_ocrmypdf(pdf, helper_ocr_output_path(pdf, ocr_output_dir), languages=ocr_languages, force_ocr=ocr_mode == "force")
 
 
+def helper_try_run_mineru(
+    pdf: Path,
+    report: PdfTextLayerReport | None,
+    *,
+    ocr_mode: str,
+) -> MineruRun:
+    """Route scanned PDFs to MinerU and return the produced Markdown.
+
+    Returns a no-op ``MineruRun`` when MinerU is disabled, the PDF does not
+    need OCR, or ``ocr_mode`` forbids OCR, so callers fall back to the
+    OCRmyPDF path unchanged.
+    """
+    if ocr_mode == "never":
+        return MineruRun(applied=False)
+    if ocr_mode not in {"auto", "force"}:
+        raise ValueError("ocr_mode must be one of: never, auto, force")
+    should_ocr = ocr_mode == "force" or bool(report and report.needs_ocr)
+    if not should_ocr or not mineru_enabled():
+        return MineruRun(applied=False)
+    try:
+        with tempfile.TemporaryDirectory(prefix="mineru_ocr_", ignore_cleanup_errors=True) as tmp:
+            return run_mineru(pdf, output_dir=Path(tmp))
+    except Exception as exc:  # noqa: BLE001
+        return MineruRun(applied=False, error=f"mineru: {exc}")
+
+
 def helper_pdf_quality_metadata(report: PdfTextLayerReport | None, prefix: str = "pdf") -> dict[str, str]:
     if report is None:
         return {
@@ -423,16 +451,34 @@ def convert_pdf(
         raise ValueError("document_kind must be guideline or consensus")
     pdf = Path(pdf_path)
     pdf_report = helper_inspect_pdf_for_ingestion(pdf)
-    ocr_result = helper_maybe_run_ocr(
-        pdf,
-        pdf_report,
-        ocr_mode=ocr_mode,
-        ocr_output_dir=ocr_output_dir,
-        ocr_languages=ocr_languages,
-    )
-    conversion_pdf = Path(ocr_result.output_pdf) if ocr_result.applied else pdf
-    conversion_report = helper_inspect_pdf_for_ingestion(conversion_pdf) if ocr_result.applied else pdf_report
-    raw = helper_with_pymupdf4llm(conversion_pdf) or helper_with_pymupdf(conversion_pdf)
+    raw: str | None = None
+    ocr_result = OcrResult("none", False, str(pdf), str(pdf), "")
+    conversion_report: PdfTextLayerReport | None = pdf_report
+    # 自动分流:扫描件优先由 MinerU 直接产出 Markdown;失败时回退 OCRmyPDF + PyMuPDF。
+    mineru_failure = ""
+    if ocr_mode != "never":
+        mineru_run = helper_try_run_mineru(pdf, pdf_report, ocr_mode=ocr_mode)
+        if mineru_run.applied:
+            raw = mineru_run.markdown
+            ocr_result = OcrResult("mineru", True, str(pdf), str(pdf), "")
+            # MinerU 直接产出 Markdown,不再检查"转换后 PDF"的文本层,故 pdf_* 元数据
+            # 为 unknown/false(表示已无需 OCR);ocr_status 仍为 applied。
+            conversion_report = None
+        elif mineru_run.error:
+            mineru_failure = f"mineru: {mineru_run.error}"
+    if raw is None:
+        fallback = helper_maybe_run_ocr(
+            pdf,
+            pdf_report,
+            ocr_mode=ocr_mode,
+            ocr_output_dir=ocr_output_dir,
+            ocr_languages=ocr_languages,
+        )
+        ocr_error = f"{mineru_failure}; " + fallback.error if mineru_failure else fallback.error
+        ocr_result = OcrResult(fallback.engine, fallback.applied, fallback.input_pdf, fallback.output_pdf, ocr_error)
+        conversion_pdf = Path(ocr_result.output_pdf) if ocr_result.applied else pdf
+        conversion_report = helper_inspect_pdf_for_ingestion(conversion_pdf) if ocr_result.applied else pdf_report
+        raw = helper_with_pymupdf4llm(conversion_pdf) or helper_with_pymupdf(conversion_pdf)
     title = extract_title(raw, pdf)
     source_institution = extract_source_institution(pdf, raw, title=title)
     publication_date = extract_publication_date(pdf, raw)

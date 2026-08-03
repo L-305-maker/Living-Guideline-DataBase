@@ -6,6 +6,7 @@
 | --- | --- |
 | `pdf_quality.py` | 根据页数、可抽取字符和页面密度判断是否需要 OCR |
 | `ocrmypdf_runner.py` | 调用本地 OCR 工具并管理输出 |
+| `mineru_runner.py` | 调用本地 MinerU(GPU)将扫描件 PDF 直接转成 Markdown,含跨进程互斥锁 |
 | `baidu_ocr.py` | 页面渲染、百度 OCR、版面重建、缓存、配额和批处理 |
 | `deepseek_ocr.py` | 调用 DeepSeek OCR 服务识别页面并按页缓存 Markdown；仅用于显式选择该后端的任务 |
 
@@ -19,6 +20,22 @@
 默认页缓存位于 `data/evidence/baidu_ocr_pages`。更换 DPI 或识别策略后，应确认旧缓存是否仍适用。
 
 DeepSeek OCR 的地址、模型与凭据必须通过运行环境提供，禁止写入源码或日志。切换 OCR 后端后需要使用独立缓存目录，避免不同模型的页面结果互相覆盖。
+
+## MinerU 自动分流
+
+`convert_pdf` 检测到扫描件（`needs_ocr`）时，默认自动分流到本地 MinerU：由 `mineru_runner.run_mineru` 直接产出 Markdown，写入与普通文档相同的 `markdown_raw/{doc_id}.md`，后续清洗、切分、入库与向量化完全统一。MinerU 不可用或运行失败时自动回退到 OCRmyPDF 路径，`ocr_engine`/`ocr_error` 如实记录实际引擎与原因。
+
+配置（全部可选，均有默认值）：
+
+- `MINERU_OCR_MODE`：设为 `never` 关闭自动分流（默认启用）。
+- `MINERU_EXE`：MinerU 可执行文件路径，默认 `<workspace>/.venv-mineru-gpu/Scripts/mineru.exe`，其次 `mineru`（PATH）。
+- `MINERU_CONFIG`：tools 配置 JSON，默认 `<workspace>/data/mineru/mineru.json`。
+- `MINERU_MODELSCOPE_CACHE` / `MODELSCOPE_CACHE`：模型缓存目录，默认 `<workspace>/data/mineru/modelscope`。
+- `MINERU_LANGUAGE`：OCR 语言（`-l`），默认 `ch`。
+- `MINERU_TIMEOUT_SECONDS`：单篇超时，默认 3600。
+- `CUDA_VISIBLE_DEVICES`：透传给 MinerU 子进程，默认 `0`。
+
+多进程批量转换时，`mineru_runner` 用跨进程文件锁串行化 MinerU 调用，避免多个 worker 争抢 GPU 显存。
 
 ## 执行语义
 

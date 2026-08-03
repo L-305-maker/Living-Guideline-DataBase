@@ -25,3 +25,4 @@ deploy/pdf-markdown-rag-mcp.service
 information/
 tests/
 .reasonix/
+reasonix.toml
