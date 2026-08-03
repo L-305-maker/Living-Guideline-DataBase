@@ -1,4 +1,4 @@
-qdrant_storage/
+﻿qdrant_storage/
 .vscode
 outputs/
 .playwright-cli/
@@ -22,4 +22,6 @@ deploy/pdf-markdown-rag-mcp.service
 .venv
 .venv-mineru/
 .venv-mineru-gpu/
+information/
 tests/
+.reasonix/
