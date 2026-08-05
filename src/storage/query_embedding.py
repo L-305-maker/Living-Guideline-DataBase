@@ -1,4 +1,8 @@
-"""Shared query embedding helpers for PostgreSQL vector retrieval."""
+# 查询向量化的共享工具，被 PostgreSQL 检索链路复用。
+#
+# 关键不变量：
+#   查询向量所用模型必须与数据库中已有的 embedding 行 model 字段一致，
+#   否则余弦距离与原向量的口径不同，结果不可比较。
 
 from __future__ import annotations
 
@@ -7,13 +11,17 @@ from functools import lru_cache
 from typing import Any, Iterable
 
 
-# 查询向量模型必须与数据库向量记录中的 model 字段一致，否则相似度不可比较。
-# 默认使用 Qwen3-Embedding-8B；经 PG_VECTOR_MODEL 可切换为其他 sentence-transformers 模型。
+# 默认使用 Qwen3-Embedding-8B；可经 PG_VECTOR_MODEL 切换到其它 sentence-transformers 模型。
+# 注意：换模型必须重新向量化，否则旧向量记录不会被使用，但 PG 中仍会残留。
 DEFAULT_MODEL = os.getenv("PG_VECTOR_MODEL", "Qwen/Qwen3-Embedding-8B")
+
+# 默认向量维度 1024，必须与 postgres_store.py VECTOR_SCHEMA_SQL 中的 vector(1024) 保持一致。
 DEFAULT_DIM = 1024
 
 
 def _parse_matryoshka_dim() -> int:
+    # Matryoshka 表示学习允许从单一模型按子集维度输出向量。
+    # 此处解析环境变量，解析失败回退到 1024 以保证与建库时的表结构兼容。
     raw = os.getenv("PG_VECTOR_MATRYOSHKA_DIM", "1024")
     try:
         return int(raw)
@@ -21,21 +29,34 @@ def _parse_matryoshka_dim() -> int:
         return 1024
 
 
-# Qwen3-Embedding 支持 MRL(Matryoshka Representation Learning)，可输出 32-4096 维。
-# 默认 1024 与现有 vector(1024) 表结构一致；若经 PG_VECTOR_MATRYOSHKA_DIM 修改维度，
-# 必须同步修改 postgres_store.py VECTOR_SCHEMA_SQL 中三处 embedding vector(N)。
+# Qwen3-Embedding 支持 MRL，可输出 32-4096 维；默认 1024 与 vector(1024) 列定义一致。
+# 调整此值后必须同步修改 postgres_store.py 中三处 embedding vector(N) 列宽并重建表。
 DEFAULT_MATRYOSHKA_DIM = _parse_matryoshka_dim()
-# 远程服务器首次部署通常需要联网下载；稳定运行后可用环境变量切换为仅本地缓存。
+
+# 远程服务器稳定运行后通常只读本地缓存；首次部署或换模型需要联网拉权重。
+# 用环境变量 PG_VECTOR_LOCAL_ONLY=1 切换，避免每次启动都触发网络请求。
 DEFAULT_LOCAL_FILES_ONLY = os.getenv("PG_VECTOR_LOCAL_ONLY", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 
 @lru_cache(maxsize=4)
 def load_model(model_name: str = DEFAULT_MODEL):
+    """加载 sentence-transformers 模型实例并按 lru_cache 缓存。
+
+    - maxsize=4：同时支持 4 种不同模型名共存；切换模型不需要重启进程。
+    - dtype / attn_implementation 由环境变量透传：分别对应 PG_VECTOR_MODEL_DTYPE
+      （bf16 / float16 / float32）和 PG_VECTOR_MODEL_ATTN（flash_attention_2 等），
+      避免硬编码，方便远端部署调优。
+    - tokenizer padding_side=left：BGE/Qwen 系模型对齐左填充以稳定检索结果。
+    """
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore
     except ImportError as exc:
-        raise RuntimeError("sentence-transformers is required for embedding models: python -m pip install sentence-transformers") from exc
-    # 缓存模型实例，避免每次请求都重复加载权重并额外占用显存。
+        raise RuntimeError(
+            "sentence-transformers is required for embedding models: "
+            "python -m pip install sentence-transformers"
+        ) from exc
+
+    # 把 dtype / attention 实现通过 model_kwargs 透传给底层 transformers AutoModel。
     model_kwargs: dict[str, Any] = {}
     dtype = os.getenv("PG_VECTOR_MODEL_DTYPE", "").strip()
     if dtype:
@@ -43,6 +64,7 @@ def load_model(model_name: str = DEFAULT_MODEL):
     attn = os.getenv("PG_VECTOR_MODEL_ATTN", "").strip()
     if attn:
         model_kwargs["attn_implementation"] = attn
+
     return SentenceTransformer(
         model_name,
         local_files_only=DEFAULT_LOCAL_FILES_ONLY,
@@ -52,11 +74,14 @@ def load_model(model_name: str = DEFAULT_MODEL):
 
 
 def encode_with_model(model: Any, texts: list[str], *, model_name: str = DEFAULT_MODEL):
-    """Encode texts with the shared normalization + matryoshka settings.
+    """用已加载的模型对文本列表做向量化。
 
-    ``matryoshka_dim`` is passed for Qwen3-Embedding by default. Setting
-    PG_VECTOR_MATRYOSHKA_DIM explicitly forces it for any model (intended for
-    other MRL-capable models; non-MRL models may reject the argument).
+    关键设置：
+    - normalize_embeddings=True：输出 L2 归一化向量，使余弦距离退化为内积，
+      与 pgvector 的 vector_cosine_ops 索引计算口径一致。
+    - convert_to_numpy=True：返回 numpy.ndarray，方便后续写入 pgvector。
+    - matryoshka_dim：仅当模型为 Qwen3-Embedding 或环境变量显式覆盖时才传入；
+      非 MRL 模型传此参数会被底层库报错，因此严格按条件分支处理。
     """
     kwargs: dict[str, Any] = dict(normalize_embeddings=True, convert_to_numpy=True)
     if "Qwen3-Embedding" in model_name or os.getenv("PG_VECTOR_MATRYOSHKA_DIM"):
@@ -65,12 +90,21 @@ def encode_with_model(model: Any, texts: list[str], *, model_name: str = DEFAULT
 
 
 def vector_literal(values: Iterable[float]) -> str:
-    # pgvector 接受方括号文本格式；固定小数位可减小 SQL 参数体积并保持结果稳定。
+    """把 Python 数值序列渲染成 pgvector 接受的方括号文本格式。
+
+    固定 8 位小数的原因：
+    - 控制 SQL 参数体积，便于复用 prepared statement；
+    - 避免不同进程/不同 float 实现产生的微小差异导致 hash 抖动（影响缓存与调试可复现性）。
+    """
     return "[" + ",".join(f"{float(value):.8f}" for value in values) + "]"
 
 
 def query_vector_literal(query: str, model_name: str = DEFAULT_MODEL) -> str:
+    """将单条查询文本编码为可直接嵌入 SQL 的 pgvector 字面量字符串。
+
+    与建库时使用的 encode_with_model 完全对齐：相同的 normalize_embeddings、
+    相同的 matryoshka_dim，保证查询向量与库内向量在同一向量空间中可计算余弦距离。
+    """
     model = load_model(model_name)
-    # 与建库阶段保持相同的 L2 归一化设置，使余弦距离计算口径一致。
     embedding = encode_with_model(model, [query], model_name=model_name)[0]
     return vector_literal(embedding)
