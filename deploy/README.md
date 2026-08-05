@@ -27,4 +27,4 @@ python -B scripts/remote_pg_build.py your-ssh-alias
 
 默认远端项目目录为 `/home/lhj/project/evidence_generation`，数据目录为项目下的 `data/evidence`，模型缓存为 `/data/lhj/huggingface`。路径不同时使用 `--project-dir`、`--data-dir` 和 `--hf-home` 覆盖。
 
-脚本依次执行建表、流式入库、cards/views/chunks 的分页 BGE-M3 向量化、向量索引创建和 `verify`。中断后若 PostgreSQL 数据快照未变化，可用 `--skip-ingest` 只补缺失向量；不要在上传了新数据后使用该参数。
+脚本依次执行建表、流式入库、cards/views/chunks 的分页 Qwen3-Embedding-8B 向量化、向量索引创建和 `verify`。中断后若 PostgreSQL 数据快照未变化，可用 `--skip-ingest` 只补缺失向量；不要在上传了新数据后使用该参数。

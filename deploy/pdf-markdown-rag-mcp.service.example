@@ -28,12 +28,15 @@ Environment=HF_HOME=/data/lhj/huggingface
 Environment=HF_HUB_CACHE=/data/lhj/huggingface/hub
 Environment=SENTENCE_TRANSFORMERS_HOME=/data/lhj/huggingface
 Environment=PG_VECTOR_RETRIEVAL_REQUIRED=1
-Environment=PG_VECTOR_MODEL=BAAI/bge-m3
+Environment=PG_VECTOR_MODEL=Qwen/Qwen3-Embedding-8B
 Environment=PG_VECTOR_LOCAL_ONLY=1
-Environment=BGE_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+# Qwen3-Embedding-8B 建议 bf16(需 Ampere+ GPU,不支持时去掉下面两行)
+Environment=PG_VECTOR_MODEL_DTYPE=bfloat16
+Environment=BGE_RERANKER_MODEL=Qwen/Qwen3-Reranker-4B
 Environment=BGE_RERANKER_LOCAL_ONLY=1
-Environment=BGE_RERANKER_BATCH_SIZE=16
-Environment=BGE_RERANKER_MAX_LENGTH=1024
+Environment=BGE_RERANKER_BATCH_SIZE=8
+Environment=BGE_RERANKER_MAX_LENGTH=2048
+Environment=BGE_RERANKER_DTYPE=bfloat16
 ExecStart=/home/lhj/project/evidence_generation/.venv/bin/python -m src.mcp
 Restart=on-failure
 RestartSec=5
