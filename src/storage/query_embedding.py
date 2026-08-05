@@ -85,7 +85,7 @@ def encode_with_model(model: Any, texts: list[str], *, model_name: str = DEFAULT
     """
     kwargs: dict[str, Any] = dict(normalize_embeddings=True, convert_to_numpy=True)
     if "Qwen3-Embedding" in model_name or os.getenv("PG_VECTOR_MATRYOSHKA_DIM"):
-        kwargs["matryoshka_dim"] = DEFAULT_MATRYOSHKA_DIM
+        kwargs["truncate_dim"] = DEFAULT_MATRYOSHKA_DIM
     return model.encode(texts, **kwargs)
 
 
