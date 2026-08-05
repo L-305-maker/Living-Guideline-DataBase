@@ -1,4 +1,4 @@
-﻿"""Vectorize document cards, document views, and chunks with BGE-M3 into pgvector."""
+﻿"""Vectorize document cards, document views, and chunks with Qwen3-Embedding-8B (matryoshka_dim=1024) into pgvector."""
 
 from __future__ import annotations
 
@@ -7,7 +7,12 @@ import json
 from typing import Any
 
 from src.storage.postgres_store import connect
-from src.storage.query_embedding import DEFAULT_MODEL, load_model as helper_load_model, vector_literal as _vector_literal
+from src.storage.query_embedding import (
+    DEFAULT_MODEL,
+    encode_with_model as _encode_with_model,
+    load_model as helper_load_model,
+    vector_literal as _vector_literal,
+)
 
 
 def ensure_vector_schema(dsn: str | None = None) -> None:
@@ -117,7 +122,7 @@ def helper_vectorize_rows(
                 batch = rows[start : start + batch_size]
                 texts = [row[1] for row in batch]
                 print(f"[vectorize] encoding {kind} {start + 1}-{start + len(batch)}...", flush=True)
-                embeddings = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+                embeddings = _encode_with_model(model, texts, model_name=model_name)
                 payload = [
                     (row[0], model_name, int(embeddings.shape[1]), _vector_literal(embedding))
                     for row, embedding in zip(batch, embeddings)

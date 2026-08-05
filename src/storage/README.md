@@ -5,7 +5,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `postgres_store.py` | 建表、全量入库、统计、PostgreSQL 全文检索和向量索引创建 |
-| `bge_m3_vectorize.py` | 读取卡片、视图、分块，使用 BGE-M3 编码并写入 pgvector 表 |
+| `bge_m3_vectorize.py` | 读取卡片、视图、分块，使用 Qwen3-Embedding-8B（matryoshka_dim=1024）编码并写入 pgvector 表 |
 | `query_embedding.py` | 缓存查询模型并生成 pgvector 参数文本 |
 | `pg_hybrid_retrieval.py` | 融合 PostgreSQL 词法通道、pgvector 通道和重排结果 |
 

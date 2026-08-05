@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from src.retrieval.chunk_normalizer import iter_normalized_chunks
+from src.storage.query_embedding import DEFAULT_MODEL
 from src.utils.io import DATA_DIR, read_jsonl
 from src.utils.records import (
     department_text as helper_department_text,
@@ -696,7 +697,9 @@ def database_stats(dsn: str | None = None) -> dict[str, Any]:
     return result
 
 
-def verify_retrieval_snapshot(dsn: str | None = None, model_name: str = "BAAI/bge-m3") -> dict[str, Any]:
+def verify_retrieval_snapshot(dsn: str | None = None, model_name: str | None = None) -> dict[str, Any]:
+    if model_name is None:
+        model_name = DEFAULT_MODEL
     artifact_tables = ("documents", "document_cards", "document_views", "sections", "chunks")
     vector_targets = (
         ("document_cards", "document_card_embeddings"),
@@ -1036,7 +1039,7 @@ def main() -> None:
         action="store_true",
         help="For ingest, append only new doc_ids and leave existing documents unchanged.",
     )
-    parser.add_argument("--model", default=os.getenv("PG_VECTOR_MODEL", "BAAI/bge-m3"))
+    parser.add_argument("--model", default=os.getenv("PG_VECTOR_MODEL", DEFAULT_MODEL))
     args = parser.parse_args()
     if args.command == "init":
         payload = init_schema(args.dsn, args.with_vector)
