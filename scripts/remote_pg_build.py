@@ -39,6 +39,8 @@ set +a
 : "${POSTGRES_DSN:?POSTGRES_DSN is not set in the remote environment file}"
 export PG_VECTOR_MODEL="$model_name"
 export PG_VECTOR_LOCAL_ONLY=1
+# 8B 模型默认 bf16 加载(需 Ampere+ GPU;不支持时 export PG_VECTOR_MODEL_DTYPE=float16)
+export PG_VECTOR_MODEL_DTYPE="${PG_VECTOR_MODEL_DTYPE:-bfloat16}"
 export HF_HOME="$hf_home"
 export HF_HUB_CACHE="$hf_home/hub"
 export SENTENCE_TRANSFORMERS_HOME="$hf_home"
@@ -90,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python", default=".venv/bin/python")
     parser.add_argument("--data-dir", default="data/evidence")
     parser.add_argument("--env-file", default="/etc/pdf-markdown-rag/postgres.env")
-    parser.add_argument("--model", default="BAAI/bge-m3")
+    parser.add_argument("--model", default="Qwen/Qwen3-Embedding-8B")
     parser.add_argument("--hf-home", default="/data/lhj/huggingface")
     parser.add_argument("--ingest-batch-size", type=int, default=500)
     parser.add_argument("--vector-batch-size", type=int, default=32)
