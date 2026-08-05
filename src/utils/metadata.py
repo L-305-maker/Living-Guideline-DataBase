@@ -8,27 +8,80 @@ from pathlib import Path
 
 
 PATH_HINTS = {
+    # 完整来源白名单：与 data/raw_pdf/ 下目录一一对应（含 gin / sccm_guidelines 两个非 *_pdf 目录）。
+    "aaaai_pdf": "AAAAI",
     "aan_pdf": "AAN",
+    "aao_hns_pdf": "AAO-HNS",
+    "aaos_pdf": "AAOS",
+    "aapmr_pdf": "AAPM&R",
     "aasld_pdf": "AASLD",
     "aasm_pdf": "AASM",
+    "aats_pdf": "AATS",
+    "acog_pdf": "ACOG",
+    "acpgbi_pdf": "ACPGBI",
+    "ada_pdf": "ADA",
     "aha_pdf": "AHA",
+    "ameriburn_pdf": "ABA",
+    "apsa_pdf": "APSA",
+    "ascrs_pdf": "ASCRS",
+    "asps_pdf": "ASPS",
+    "asrm_pdf": "ASRM",
     "ats_pdf": "ATS",
+    "bapras_pdf": "BAPRAS",
+    "bc_pdf": "BC",
+    "boa_pdf": "BOA",
+    "bsp_pdf": "BSP",
+    "bspd_pdf": "BSPD",
+    "btf_pdf": "BTF",
+    "bts_pdf": "BTS",
+    "ccs_pdf": "CCS",
     "cdc_pdf": "CDC",
     "china_pdf": "China",
     "cma_pdf": "CMA",
+    "cns_pdf": "CNS",
+    "cua_pdf": "CUA",
+    "eacts_pdf": "EACTS",
+    "eaes_pdf": "EAES",
+    "east_pdf": "EAST",
+    "eras_pdf": "ERAS",
+    "ernica_pdf": "ERNICA",
+    "ers_pdf": "ERS",
     "esc_pdf": "ESC",
+    "escp_pdf": "ESCP",
+    "eshre_pdf": "ESHRE",
+    "esicm_pdf": "ESICM",
+    "espghan_pdf": "ESPGHAN",
+    "esvs_pdf": "ESVS",
+    "gin": "GIN",
     "gina_pdf": "GINA",
     "gold_pdf": "GOLD",
     "idsa_pdf": "IDSA",
+    "inesss_pdf": "INESSS",
+    "isbi_pdf": "ISBI",
+    "iwgdf_pdf": "IWGDF",
     "jacc_pdf": "JACC",
     "kdigo_pdf": "KDIGO",
+    "naspghan_pdf": "NASPGHAN",
     "nice_pdf": "NICE",
     "pmc_pdf": "PMC",
+    "posna_pdf": "POSNA",
+    "rch_pdf": "RCH",
+    "rcog_pdf": "RCOG",
+    "rcpch_pdf": "RCPCH",
+    "sages_pdf": "SAGES",
+    "sccm_guidelines": "SCCM",
+    "sdcep_pdf": "SDCEP",
     "sign_pdf": "SIGN",
+    "sts_pdf": "STS",
+    "svs_pdf": "SVS",
     "trip_pdf": "TRIP",
     "uspstf_pdf": "USPSTF",
     "vadod_pdf": "VA/DOD",
+    "vsgbi_pdf": "VSGBI",
     "who_pdf": "WHO",
+    "wjes_pdf": "WSES",
+    "wounds_pdf": "Wounds",
+    "wses_pdf": "WSES",
 }
 TEXT_SOURCE_PATTERNS = [
     ("WHO", ("world health organization", "\u4e16\u754c\u536b\u751f\u7ec4\u7ec7")),
@@ -86,12 +139,17 @@ def clean_title_from_filename(path: str | Path) -> str:
     return stem if re.search(r"[\u4e00-\u9fff]", stem) else stem.title()
 
 
+GENERIC_SOURCE_DIRS = {"raw_pdf", "consensus", "pdfs", "documents", "pages"}
+
+
 def helper_source_from_path(path: Path) -> str | None:
     for part in path.parts:
-        hint = PATH_HINTS.get(part.lower())
+        lowered = part.lower()
+        if lowered in GENERIC_SOURCE_DIRS:
+            continue
+        hint = PATH_HINTS.get(lowered)
         if hint:
             return hint
-        lowered = part.lower()
         if lowered.endswith("_pdf") and len(lowered) > 4:
             return lowered[:-4]
     return None
