@@ -1,4 +1,13 @@
-﻿"""PDF to Markdown conversion with front matter and stable document IDs."""
+﻿"""PDF to Markdown conversion with front matter and stable document IDs.
+
+主要职责：
+1. 用 pymupdf4llm 优先提取 PDF 文本层；若文本层空或扫描版则降级到 OCR；
+2. OCR 路径有三种：OCRmyPDF（默认）/ 百度 OCR / MinerU（GPU）；
+3. 文本层 → Markdown 时按坐标合并同基线 span，把 PyMuPDF blocks 转为有序行；
+4. 提取 front-matter 元数据（title / 出版日期 / 来源机构 / 摘要 / 临床科室）；
+5. 计算稳定 doc_id（基于 institution + publication_date + sha256），便于跨阶段追踪；
+6. 写出 markdown_raw/<doc_id>.md + documents_raw.jsonl manifest。
+"""
 
 from __future__ import annotations
 
@@ -25,24 +34,24 @@ from src.utils.io import DATA_DIR, ensure_dir, read_jsonl, write_jsonl
 from src.utils.metadata import extract_abstract, extract_publication_date, extract_source_institution, extract_title
 
 
-SECTION_NUMBER_RE = re.compile(r"^(?:\d+(?:\.\d+){1,4}|[IVXLCM]+\.)\s+[A-Z0-9(][\w\s,;:/&()\-–—]+$", re.I)
-COMMON_SECTION_RE = re.compile(
+SECTION_NUMBER_RE = re.compile(r"^(?:\d+(?:\.\d+){1,4}|[IVXLCM]+\.)\s+[A-Z0-9(][\w\s,;:/&()\-–—]+$", re.I)  # 数字编号章节标题（如 1.2 / II. / IV.），用于启发式识别章节起始。
+COMMON_SECTION_RE = re.compile(  # 常见章节英文关键词（abstract / methods / recommendations 等），识别章节起始。
     r"^(abstract|summary|executive summary|introduction|background|methods?|methodology|"
     r"recommendations?|guidelines?|conclusions?|discussion|results?|evidence|scope|"
     r"target population|references|bibliography|appendix|acknowledg(?:e)?ments?)\b",
     re.I,
 )
-CHINESE_COMMON_SECTION_RE = re.compile(
+CHINESE_COMMON_SECTION_RE = re.compile(  # 常见章节中文关键词（摘要/方法/推荐意见/参考文献 等）。
     r"^(摘要|提要|背景|前言|引言|方法|推荐意见|推荐|建议|指南|共识|结论|讨论|结果|证据|"
     r"适用范围|适用人群|目标人群|参考文献|附录|致谢)\b"
 )
-CHINESE_NUMBERED_SECTION_RE = re.compile(r"^(?:[一二三四五六七八九十]+[、.．]|（[一二三四五六七八九十]+）|第[一二三四五六七八九十\d]+[章节])")
-CITATION_LABEL_RE = re.compile(r"^\[?\d+(?:\.\d+){1,5}\]?\s*(?:\([A-Z]+\))?$")
-REFERENCE_HEADING_RE = re.compile(r"^(references|bibliography|\u53c2\u8003\u6587\u732e)$", re.I)
-TABLE_TITLE_RE = re.compile(r"^(table|fig(?:ure)?|box|algorithm)\s+\d+", re.I)
-LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+|\([a-zA-Z0-9]+\)\s+)")
-TERMINAL_SENTENCE_RE = re.compile(r"[.!?。！？]\s*$")
-WHITESPACE_RE = re.compile(r"\s+")
+CHINESE_NUMBERED_SECTION_RE = re.compile(r"^(?:[一二三四五六七八九十]+[、.．]|（[一二三四五六七八九十]+）|第[一二三四五六七八九十\d]+[章节])")  # 中文编号章节（一、二、 / 第 N 章 / 第 N 节）。
+CITATION_LABEL_RE = re.compile(r"^\[?\d+(?:\.\d+){1,5}\]?\s*(?:\([A-Z]+\))?$")  # 引用标签如 [1.2.3] 或 (A)，参考文献列表中的条目标识。
+REFERENCE_HEADING_RE = re.compile(r"^(references|bibliography|\u53c2\u8003\u6587\u732e)$", re.I)  # 参考文献标题（references/bibliography/参考文献）。
+TABLE_TITLE_RE = re.compile(r"^(table|fig(?:ure)?|box|algorithm)\s+\d+", re.I)  # 表格/图/算法标题前缀（Table N / Fig N / Box N / Algorithm N）。
+LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+|\([a-zA-Z0-9]+\)\s+)")  # 列表项前缀（- / 1. / (a)）。
+TERMINAL_SENTENCE_RE = re.compile(r"[.!?。！？]\s*$")  # 句末标点（中英文），用于判断一句是否结束。
+WHITESPACE_RE = re.compile(r"\s+")  # 任意空白字符，文本层规范化时统一替换为单空格。
 TABLE_VALUE_HEADINGS = {"standard", "guideline", "option", "level", "description", "term", "definition"}
 
 
@@ -58,6 +67,7 @@ class PdfTextLine:
 
 
 def helper_needs_join_space(left: str, right: str) -> bool:
+    """判定两段文本是否需要插入空格拼接（CJK / 标点相邻则不需要）。"""
     if not left or not right:
         return False
     if left[-1].isspace() or right[0].isspace():
@@ -72,6 +82,7 @@ def helper_needs_join_space(left: str, right: str) -> bool:
 
 
 def helper_merge_adjacent_line_fragments(lines: list[PdfTextLine]) -> list[PdfTextLine]:
+    """把同行（同 baseline、相似字号、间距小）的多片段合并成单行。"""
     if not lines:
         return []
     merged: list[PdfTextLine] = []
@@ -102,6 +113,7 @@ def helper_merge_adjacent_line_fragments(lines: list[PdfTextLine]) -> list[PdfTe
 
 
 def helper_open_doc(pdf_path: str | Path):
+    """惰性 import fitz，打开 PDF 文档对象，缺包时给出明确错误。"""
     try:
         import fitz  # type: ignore
     except ImportError as exc:
@@ -121,16 +133,19 @@ def helper_with_pymupdf4llm(pdf_path: Path) -> str | None:
 
 
 def helper_normalize_pdf_text_line(text: str) -> str:
+    """规范化 PDF 文本层单行：去 NBSP、合并连续空白。"""
     return WHITESPACE_RE.sub(" ", (text or "").replace("\u00a0", " ")).strip()
 
 
 def helper_is_bold_span(span: dict[str, Any]) -> bool:
+    """判定 PyMuPDF span 是否加粗（font 名含 bold 或 flags 位 16）。"""
     font = str(span.get("font") or "").lower()
     flags = int(span.get("flags") or 0)
     return "bold" in font or bool(flags & 16)
 
 
 def helper_join_spans(spans: list[dict[str, Any]]) -> str:
+    """把同一 baseline 的 spans 按 x 坐标拼接；span 间空隙 > 1px 时插入空格。"""
     parts: list[str] = []
     previous_x1: float | None = None
     for span in spans:
@@ -153,6 +168,7 @@ def helper_join_spans(spans: list[dict[str, Any]]) -> str:
 
 
 def helper_collect_text_lines(page: Any) -> list[PdfTextLine]:
+    """从 PyMuPDF page dict 抽取带坐标的文本行并合并相邻碎片，返回有序行列表。"""
     lines: list[PdfTextLine] = []
     for block in page.get_text("dict", sort=False).get("blocks", []):
         if block.get("type") != 0:
@@ -182,6 +198,7 @@ def helper_collect_text_lines(page: Any) -> list[PdfTextLine]:
 
 
 def helper_body_text_size(lines: list[PdfTextLine]) -> float:
+    """估算正文（非标题、非加粗、非表格标题）的代表字号，用于后续标题识别阈值。"""
     candidates = [
         line.size
         for line in lines
@@ -193,6 +210,7 @@ def helper_body_text_size(lines: list[PdfTextLine]) -> float:
 
 
 def helper_uppercase_ratio(text: str) -> float:
+    """字符串中大写字母占比，用于判定『是否全大写标题』。"""
     letters = [char for char in text if char.isalpha()]
     if not letters:
         return 0.0
@@ -332,6 +350,7 @@ def helper_with_pymupdf(pdf_path: Path) -> str:
 
 
 def helper_ensure_title_heading(markdown: str, title: str) -> str:
+    """确保 Markdown 第一行是 # 标题，没有则用 metadata 的 title 注入。"""
     body = markdown.strip()
     if body.startswith("# "):
         return body + "\n"
@@ -677,6 +696,7 @@ def convert_all(
 
 
 def main() -> None:
+    """CLI 入口：python -m src.pipeline.cleaning.pdf_to_md。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", default=str(DATA_DIR / "raw_pdf"))
     parser.add_argument("--output-dir", default=str(DATA_DIR / "markdown_raw"))

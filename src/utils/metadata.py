@@ -1,3 +1,10 @@
+# 从 Markdown 与文件路径中"尽力"提取元数据（title / publication_date / source_institution / abstract）。
+#
+# 关键约束：
+# - PATH_HINTS：data/raw_pdf/ 下目录与发布机构短名白名单（路径优先）；
+# - TEXT_SOURCE_PATTERNS：从正文文本二次识别发布机构；
+# - CMA_TEXT_PATTERNS + CMA_GENERIC_ORG_RE：中华医学会等中文机构识别；
+# - extract_publication_date 优先取文件名年份（期刊页眉可能含与发布日无关的历史年份）。
 """Best-effort metadata extraction from Markdown and file paths."""
 
 from __future__ import annotations
@@ -7,8 +14,9 @@ import unicodedata
 from pathlib import Path
 
 
+# 完整来源白名单：与 data/raw_pdf/ 下目录一一对应（含 gin / sccm_guidelines 两个非 *_pdf 目录）。
+# 新增 PDF 来源时同步在本表追加映射；helper_source_from_path 按此优先匹配。
 PATH_HINTS = {
-    # 完整来源白名单：与 data/raw_pdf/ 下目录一一对应（含 gin / sccm_guidelines 两个非 *_pdf 目录）。
     "aaaai_pdf": "AAAAI",
     "aan_pdf": "AAN",
     "aao_hns_pdf": "AAO-HNS",
@@ -83,8 +91,10 @@ PATH_HINTS = {
     "wounds_pdf": "Wounds",
     "wses_pdf": "WSES",
 }
+
+# 文本二次识别的发布机构（按优先级高的先匹配）；未命中时回退 "Unknown"。
 TEXT_SOURCE_PATTERNS = [
-    ("WHO", ("world health organization", "\u4e16\u754c\u536b\u751f\u7ec4\u7ec7")),
+    ("WHO", ("world health organization", "世界卫生组织")),
     ("NICE", ("national institute for health and care excellence", "nice guideline", "nice guidelines")),
     ("CDC", ("centers for disease control", "centers for disease control and prevention")),
     ("VA/DOD", ("va/dod", "department of veterans affairs")),
@@ -95,40 +105,54 @@ TEXT_SOURCE_PATTERNS = [
     ("USPSTF", ("u.s. preventive services task force", "us preventive services task force")),
     ("AASLD", ("american association for the study of liver diseases",)),
 ]
+
+# CMA（中华医学会）相关的中英文模式：包含 医学会 / 协会 / 学会 / 联盟 等关键词。
 CMA_TEXT_PATTERNS = (
-    "\u4e2d\u534e\u533b\u5b66\u4f1a",
-    "\u4e2d\u56fd\u533b\u5e08\u534f\u4f1a",
-    "\u4e2d\u534e\u9884\u9632\u533b\u5b66\u4f1a",
-    "\u4e2d\u56fd\u533b\u836f\u6559\u80b2\u534f\u4f1a",
-    "\u4e2d\u56fd\u6297\u764c\u534f\u4f1a",
-    "\u4e2d\u56fd\u533b\u9662\u534f\u4f1a",
-    "\u4e2d\u56fd\u7814\u7a76\u578b\u533b\u9662\u5b66\u4f1a",
-    "\u4e2d\u56fd\u8001\u5e74\u533b\u5b66\u5b66\u4f1a",
-    "\u4e2d\u56fd\u5eb7\u590d\u533b\u5b66\u4f1a",
-    "\u4e2d\u56fd\u4e2d\u897f\u533b\u7ed3\u5408\u5b66\u4f1a",
-    "\u4e2d\u56fd\u8425\u517b\u5b66\u4f1a",
-    "\u4e2d\u56fd\u5352\u4e2d\u5b66\u4f1a",
-    "\u4e2d\u56fd\u836f\u5b66\u4f1a",
-    "\u4e2d\u56fd\u533b\u7597\u4fdd\u5065\u56fd\u9645\u4ea4\u6d41\u4fc3\u8fdb\u4f1a",
-    "\u56fd\u5bb6\u611f\u67d3\u6027\u75be\u75c5\u4e34\u5e8a\u533b\u5b66\u7814\u7a76\u4e2d\u5fc3",
-    "\u56fd\u5bb6\u4f20\u67d3\u75c5\u533b\u5b66\u4e2d\u5fc3",
-    "\u56fd\u5bb6\u536b\u751f\u5065\u5eb7\u59d4",
-    "\u75be\u75c5\u9884\u9632\u63a7\u5236\u4e2d\u5fc3",
-    "\u9884\u9632\u533b\u5b66\u4f1a",
+    "中华医学会",
+    "中国医师协会",
+    "中华预防医学会",
+    "中国医药教育协会",
+    "中国抗癌协会",
+    "中国医院协会",
+    "中国研究型医院学会",
+    "中国老年医学学会",
+    "中国康复医学会",
+    "中国中西医结合学会",
+    "中国营养学会",
+    "中国卒中学会",
+    "中国药学会",
+    "中国医疗保健国际交流促进会",
+    "国家感染性疾病临床医学研究中心",
+    "国家传染病医学中心",
+    "国家卫生健康委",
+    "疾病预防控制中心",
+    "预防医学会",
     "cma.j.",
     "Chinese Medical Association",
     "Chinese Medical Doctor Association",
     "Chinese Preventive Medicine Association",
 )
-CMA_GENERIC_ORG_RE = re.compile(r"(?:\u4e2d\u534e|\u4e2d\u56fd)[\u4e00-\u9fff]{0,30}(?:\u533b\u5b66\u4f1a|\u533b\u5e08\u534f\u4f1a|\u534f\u4f1a|\u5b66\u4f1a|\u8054\u76df|\u59d4\u5458\u4f1a|\u4e13\u5bb6\u7ec4)")
-ABSTRACT_BOUNDARY_RE = re.compile(r"(\u3010\s*(?:\u6458\u8981|\u63d0\u8981)\s*\u3011|(?:\u6458\u8981|\u63d0\u8981|Abstract)\s*[:\uff1a])", re.I)
+
+# CMA 兜底正则：中/英文『中华/中国 + ... + 医学会/协会/学会/联盟/委员会/专家组』
+CMA_GENERIC_ORG_RE = re.compile(r"(?:中华|中国)[\u4e00-\u9fff]{0,30}(?:医学会|医师协会|协会|学会|联盟|委员会|专家组)")
+
+# 摘要边界：识别【摘要】/【提要】/Abstract: 等标记，便于只取标题块之前的内容。
+ABSTRACT_BOUNDARY_RE = re.compile(r"(\u3010\s*(?:摘要|提要)\s*\u3011|(?:摘要|提要|Abstract)\s*[:\uff1a])", re.I)
 YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
 HEADING_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+# 全角字符 → 半角：用于年份提取前的归一化
 FULLWIDTH_RE = re.compile(r"[\uff01-\uff5e]")
+
+# 坏标题字符：\ufffd（替换符）、C0 控制字符（除 \t \n 等常见空白）、DEL 与 C1 控制区。
 BAD_TITLE_CHARS_RE = re.compile(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
 def clean_title_from_filename(path: str | Path) -> str:
+    """从文件名派生标题：去数字前缀 + ID-style 字符，把 _/- 转空格。
+
+    中文文件名保留原样；纯英文文件名走 title case 提升可读性。
+    空 stem 兜底返回 'Untitled'。
+    """
     stem = Path(path).stem
     stem = re.sub(r"^\d{5,}[_\-\s]+", "", stem)
     stem = re.sub(r"^\d{5,}", "", stem)
@@ -139,10 +163,18 @@ def clean_title_from_filename(path: str | Path) -> str:
     return stem if re.search(r"[\u4e00-\u9fff]", stem) else stem.title()
 
 
+# 视为"通用"的目录名：跳过这些路径段，不参与发布机构识别。
 GENERIC_SOURCE_DIRS = {"raw_pdf", "consensus", "pdfs", "documents", "pages"}
 
 
 def helper_source_from_path(path: Path) -> str | None:
+    """从 PDF 路径中按目录段推断发布机构。
+
+    行为：
+    - 跳过 GENERIC_SOURCE_DIRS 段（这些不含发布机构信息）；
+    - 先按 PATH_HINTS 白名单精确匹配；
+    - 否则若以 `_pdf` 结尾（且长度 > 4），用去掉 `_pdf` 后缀作为短名。
+    """
     for part in path.parts:
         lowered = part.lower()
         if lowered in GENERIC_SOURCE_DIRS:
@@ -156,28 +188,38 @@ def helper_source_from_path(path: Path) -> str | None:
 
 
 def helper_source_header(text: str, max_chars: int = 3000) -> str:
+    """取正文头部到摘要边界为止的内容，用于发布机构二次识别。
+
+    注意：摘要之后会引用大量其它机构，截在边界前避免误判。
+    """
     head = (text or "")[:max_chars]
     match = ABSTRACT_BOUNDARY_RE.search(head)
     return head[: match.start()] if match else head
 
 
 def helper_is_consensus_path(path: Path) -> bool:
+    """判定路径是否位于 consensus/ 目录下（影响 source_institution 默认值）。"""
     return any(part.lower() == "consensus" for part in path.parts)
 
 
 def helper_has_cma_signal(text: str) -> bool:
+    """判定文本是否含有 CMA（中华医学会及其相关学会）的特征短语。"""
     if any(pattern in text for pattern in CMA_TEXT_PATTERNS):
         return True
     return bool(CMA_GENERIC_ORG_RE.search(text))
 
 
 def extract_source_institution(pdf_path: str | Path, text: str = "", title: str = "") -> str:
+    """推断 PDF 的发布机构：路径白名单 → CMA 模式 → TEXT_SOURCE_PATTERNS → Unknown。
+
+    仅使用标题/文件名/摘要前 3000 字，避免正文中引用的机构被误判为发布方。
+    consensus/ 目录下的 PDF 显式返回 'Unknown'（待人工标注）。
+    """
     path = Path(pdf_path)
     path_hint = helper_source_from_path(path)
     if path_hint:
         return path_hint
 
-    # 仅使用标题、文件名和摘要前的作者区推断来源；扫描全文会把正文引用的机构误判为发布方。
     header = helper_source_header(text)
     source_haystack = f"{path.name}\n{title}\n{header}"
     if helper_has_cma_signal(source_haystack):
@@ -193,17 +235,23 @@ def extract_source_institution(pdf_path: str | Path, text: str = "", title: str 
 
 
 def helper_normalize_digits(text: str) -> str:
+    """NFKC 规范化：把全角数字 ０-９ 转半角 0-9 等。"""
     return unicodedata.normalize("NFKC", text)
 
 
 def helper_candidate_years(text: str) -> list[int]:
+    """从字符串中提取 [2012, 2026] 区间内的 4 位年份，去重保序。"""
     normalized = helper_normalize_digits(text)
     years = [int(match.group(1)) for match in YEAR_RE.finditer(normalized)]
     return [year for year in years if 2012 <= year <= 2026]
 
 
 def extract_publication_date(pdf_path: str | Path, text: str = "") -> str:
-    # 优先使用文件名中的年份，期刊页眉可能包含与发布日期无关的历史年份。
+    """推断 PDF 发布日期：文件名年份优先 → 正文头部年份 → 'unknown'。
+
+    关键设计：期刊页眉可能含历史年份（成立时间等），文件名年份更准确；
+    日期默认补 -01-01（月日未知，按 1 月 1 日兜底）。
+    """
     file_years = helper_candidate_years(str(pdf_path))
     if file_years:
         return f"{file_years[0]}-01-01"
@@ -215,6 +263,11 @@ def extract_publication_date(pdf_path: str | Path, text: str = "") -> str:
 
 
 def helper_title_score(title: str) -> float:
+    """标题质量评分（越高越像真标题）。
+
+    加分项：字母/数字/CJK 占比；
+    减分项：控制字符、ASCII 符号、短标题、卷期号等期刊噪声。
+    """
     normalized = helper_normalize_digits(title or "").strip()
     if not normalized:
         return -100.0
@@ -239,9 +292,11 @@ def helper_title_score(title: str) -> float:
 
 
 def is_suspicious_title(title: str) -> bool:
+    """判定标题是否噪声（期刊卷期、过短、过多元字符等）。"""
     normalized = helper_normalize_digits(title or "").strip()
     if len(normalized) < 4 or BAD_TITLE_CHARS_RE.search(normalized):
         return True
+    # 期刊卷期模式：中华医学杂志 第 30 卷 第 5 期、Chin J ... Vol 30 No 5 等
     journal_header_patterns = [
         r"中华.{0,12}杂志.{0,80}第\s*\d+\s*卷.{0,40}第\s*\d+\s*期",
         r"Chin\s+J\s+.{0,80}\bVol\.?\s*\d+.{0,40}\bNo\.?\s*\d+",
@@ -263,6 +318,7 @@ def is_suspicious_title(title: str) -> bool:
 
 
 def clean_title(title: str) -> str:
+    """清洗标题：NFKC 规范化 + 去坏字符 + 去注释 + 去首尾非词字符 + 截断 180。"""
     title = helper_normalize_digits(title or "")
     title = BAD_TITLE_CHARS_RE.sub("", title)
     title = re.sub(r"<!--.*?-->", " ", title)
@@ -272,6 +328,14 @@ def clean_title(title: str) -> str:
 
 
 def extract_title(markdown: str, pdf_path: str | Path) -> str:
+    """从 Markdown 与 PDF 文件名中提取最可能的标题。
+
+    候选来源：
+    1. 第一个 # 标题；
+    2. 前 12 个非注释非空行；
+    3. PDF 文件名派生（clean_title_from_filename）。
+    取 helper_title_score 最高的候选；都不可用时回退到文件名版本。
+    """
     candidates: list[str] = []
     match = HEADING_RE.search(markdown)
     if match and match.group(1).strip():
@@ -291,6 +355,7 @@ def extract_title(markdown: str, pdf_path: str | Path) -> str:
 
 
 def extract_abstract(markdown: str, max_chars: int = 1200) -> str:
+    """提取摘要：跳过标题行与注释行，拼接正文直到总字符数达 max_chars。"""
     lines: list[str] = []
     for line in markdown.splitlines():
         stripped = line.strip()

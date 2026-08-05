@@ -1,3 +1,10 @@
+# Infini-AI DeepSeek OCR 2 的 PDF → Markdown 恢复（云端 API）。
+#
+# 关键设计：
+# - 逐页调用，页面级缓存 cache/deepseek_ocr_2/<doc_id>/<NNNN>.json；
+# - 多页可并发（ThreadPoolExecutor）；带连接复用通过 session；
+# - 单页失败不中断整体，只记录 page_errors；max_api_pages 控制预算；
+# - 输出 Markdown 时按页加 <!-- page: N --> 标记，与 PyMuPDF 路径统一。
 """Infini-AI DeepSeek OCR 2 PDF-to-Markdown recovery."""
 
 from __future__ import annotations
@@ -18,19 +25,27 @@ from src.utils.front_matter import dump_front_matter
 from src.utils.io import ensure_parent
 
 
+# Infini-AI 兼容 OpenAI chat completions 接口的端点。
 API_URL = "https://cloud.infini-ai.com/maas/v1/chat/completions"
 MODEL = "deepseek-ocr-2"
+# grounding 模式：让模型输出带 ref/det 标签，便于后处理清洗。
 PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
+# 单张图片 4 MB 上限：避免 API 拒绝超大图；超限自动降 DPI / 降 JPEG 质量。
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 120
+# DeepSeek 输出的 ref/det 标签：可视化坐标信息，下游清洗时移除。
 GROUNDING_TOKEN_RE = re.compile(r"<\|(?:ref|det)\|>.*?<\|/(?:ref|det)\|>")
 
 
 class DeepSeekOCRError(RuntimeError):
-    pass
+    """DeepSeek OCR 错误信号，统一对外抛错类型。"""
 
 
 def helper_api_key() -> str:
+    """按优先级读取 API key：INFINI_API_KEY → GENSTUDIO_API_KEY → API_KEY。
+
+    全部缺失时给出明确错误，提示用户在 .env 中设置 INFINI_API_KEY。
+    """
     api_key = (
         os.environ.get("INFINI_API_KEY")
         or os.environ.get("GENSTUDIO_API_KEY")
@@ -42,6 +57,13 @@ def helper_api_key() -> str:
 
 
 def helper_render_page_jpeg(pdf_path: Path, page_index: int, dpi: int = 180) -> bytes:
+    """把 PDF 单页渲染为 JPEG 字节。
+
+    多次降级策略（保证 ≤4 MB 上限）：
+    1. DPI 候选：[180, 150, 120, 96]，按需递减；
+    2. 同一 DPI 内，JPEG 质量候选：[85, 70, 55, 40]；
+    3. 仍超限则抛 RuntimeError。
+    """
     try:
         import fitz  # type: ignore
     except ImportError as exc:
@@ -63,6 +85,14 @@ def helper_render_page_jpeg(pdf_path: Path, page_index: int, dpi: int = 180) -> 
 
 
 def helper_response_text(payload: dict[str, Any]) -> str:
+    """从 OpenAI 风格响应中提取 Markdown 文本。
+
+    处理：
+    - content 可能是 list（多段），用 \\n 拼接；
+    - 自动剥掉 ```markdown 围栏；
+    - 删除 GROUNDING_TOKEN（ref/det 标签）；
+    - 空内容抛 DeepSeekOCRError（不让空响应伪装成成功）。
+    """
     choices = payload.get("choices") or []
     if not choices:
         raise DeepSeekOCRError("DeepSeek OCR response did not include choices.")
@@ -85,7 +115,13 @@ def ocr_image_markdown(
     session: requests.Session | None = None,
     retries: int = 1,
 ) -> dict[str, Any]:
-    # 单页调用负责请求、响应形状和 Markdown 提取，服务错误不得伪装成空识别结果。
+    """单页 OCR 调用：构造请求 → POST → 解析响应 → 返回 Markdown。
+
+    重试策略：
+    - 网络异常 / HTTP 429 / 5xx：按 2^attempt 指数退避重试，最多 retries 次；
+    - 4xx 业务错误（除 429）：立即抛错，不重试；
+    - 流式响应：超时限制 REQUEST_TIMEOUT_SECONDS 整体（包含所有 chunk 接收）。
+    """
     client = session or requests.Session()
     request_payload = {
         "model": MODEL,
@@ -161,7 +197,15 @@ def ocr_pdf_to_markdown(
     dpi: int = 180,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    # 逐页缓存与输出顺序绑定，部分页面失败时必须保留明确失败状态。
+    """整本 PDF OCR：逐页渲染 → API 调用 → 缓存 → 拼装 Markdown。
+
+    关键行为：
+    - 缓存目录 cache/deepseek_ocr_2/<doc_id>/<NNNN>.json，已存在的页跳过；
+    - max_api_pages 限制本次新增 API 调用数（保留预算给后续任务）；
+    - 单页失败记入 page_errors，但不影响其它页；
+    - 全部成功才写 output（带 front-matter + <!-- page: N --> 标记）；
+    - 返回字段：pages_ocr / api_calls / cached_pages / missing_pages / complete / errors。
+    """
     pdf = Path(pdf_path)
     pages = helper_page_count(pdf)
     cache_root = Path(cache_dir) / "deepseek_ocr_2" / doc_id
@@ -171,6 +215,7 @@ def ocr_pdf_to_markdown(
     missing_indexes = [index for index, path in enumerate(cache_paths) if not path.is_file()]
     if max_api_pages is not None:
         missing_indexes = missing_indexes[:max_api_pages]
+    # 无缺失页时跳过 api_key 读取，避免无意义的环境变量错误。
     resolved_api_key = api_key or (helper_api_key() if missing_indexes else "")
 
     def process_page(page_index: int) -> str:
@@ -196,6 +241,7 @@ def ocr_pdf_to_markdown(
             return f"page {page_no}: {str(exc)[:400]}"
 
     page_errors: list[str] = []
+    # 当调用方传入自定义 session 时强制单线程：避免共享 session 的竞态。
     workers = 1 if session is not None else max(1, max_workers)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(process_page, page_index) for page_index in missing_indexes]

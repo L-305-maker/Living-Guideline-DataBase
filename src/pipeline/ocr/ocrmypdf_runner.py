@@ -1,3 +1,7 @@
+# 可选的 OCRmyPDF 集成：扫描版 PDF 的本地 OCR 入口。
+#
+# 触发条件：src.pipeline.ocr.pdf_quality.assess_pdf_text_layer 判定 needs_ocr=True 时。
+# 优点：本地运行、零配额限制；缺点：扫描版 PDF 走 Tesseract，准确性低于云端 OCR / MinerU。
 """Optional OCRmyPDF integration for scanned PDF ingestion."""
 
 from __future__ import annotations
@@ -10,6 +14,13 @@ from shutil import which
 
 @dataclass(frozen=True)
 class OcrResult:
+    """单次 OCR 调用结果（结构化、便于 audit 与失败重试）。
+
+    engine：调用的引擎名（ocrmypdf / baidu / mineru / deepseek）
+    applied：是否实际跑了 OCR（False 时通常因命令缺失或前置检查失败）
+    input_pdf / output_pdf：输入输出 PDF 路径
+    error：失败原因摘要；成功时为空字符串
+    """
     engine: str
     applied: bool
     input_pdf: str
@@ -27,9 +38,16 @@ def run_ocrmypdf(
     optimize: int = 1,
     timeout_seconds: int = 900,
 ) -> OcrResult:
-    """Run OCRmyPDF if it is installed and return a structured result."""
-    # 外部命令调用集中在此边界，返回值同时记录是否执行、输出路径和可诊断错误。
+    """调用本地 ocrmypdf 处理扫描版 PDF。
 
+    默认参数偏向"已含文本层则跳过 OCR（--skip-text）"：
+    - redo_ocr=True：删除已有文本层并重跑（删 --skip-text，加 --redo-ocr）
+    - force_ocr=True：强制全页 OCR（删 --skip-text，加 --force-ocr）
+    - optimize=N：图像压缩级别（0-3，1 是平衡）
+    - timeout_seconds：单次超时（默认 15 分钟）
+
+    返回：OcrResult 而非抛异常，便于上层聚合多个 PDF 的 OCR 状态。
+    """
     executable = which("ocrmypdf")
     source = Path(input_pdf)
     target = Path(output_pdf)

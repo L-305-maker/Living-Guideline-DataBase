@@ -1,3 +1,12 @@
+# chunk 检索的简单评估指标。
+#
+# 主要指标：
+# - Chunk Recall@{5,10,20,50}：前 k 个返回中是否命中 relevant_chunk_ids；
+# - MRR@10：首个命中的倒数排名（Reciprocal Rank）；
+# - Doc Recall@10：top10 文档级是否命中；
+# - Chunk Type Precision@10：top10 中 high_value_types 占比。
+#
+# HIGH_VALUE_TYPES 集合定义哪些 chunk_type 算"高价值"，用于类型精度评估。
 """Simple retrieval metrics for chunk queries."""
 
 from __future__ import annotations
@@ -9,6 +18,7 @@ from src.guideline_chunking.chunk_retrieve_service import ChunkRetrieveService
 from src.guideline_chunking.io_utils import read_jsonl
 
 
+# 高价值 chunk_type 集合：评估时用于计算 Type Precision@10。
 HIGH_VALUE_TYPES = {
     "recommendation_candidate",
     "evidence_candidate",
@@ -22,6 +32,7 @@ HIGH_VALUE_TYPES = {
 
 
 def evaluate_chunk_retrieval(index_dir: str | Path, queries_path: str | Path, top_k: int = 50) -> dict[str, float]:
+    """在给定 queries 上评估 ChunkRetrieveService，返回多档 Recall / MRR / Doc Recall / Type Precision。"""
     service = ChunkRetrieveService(index_dir)
     queries = list(read_jsonl(queries_path))
     if not queries:
@@ -46,6 +57,7 @@ def evaluate_chunk_retrieval(index_dir: str | Path, queries_path: str | Path, to
         if relevant_doc_ids and relevant_doc_ids.intersection(result_doc_ids):
             doc_recall_hits += 1
         top10 = results[:10]
+        # top10 为空时精度为 0；避免 ZeroDivisionError
         type_precision_total += (
             sum(1 for result in top10 if result.chunk_type in HIGH_VALUE_TYPES) / len(top10) if top10 else 0.0
         )
@@ -63,10 +75,12 @@ def evaluate_chunk_retrieval(index_dir: str | Path, queries_path: str | Path, to
 
 
 def format_metrics(metrics: dict[str, float]) -> str:
+    """把 metrics 字典按 key 排序格式化为多行文本。"""
     return "\n".join(f"{name}: {value:.4f}" for name, value in metrics.items())
 
 
 def helper_reciprocal_rank(result_ids: list[str], relevant_ids: set[str]) -> float:
+    """计算首个命中的倒数排名（MRR）；无 relevant_ids 返回 0.0。"""
     if not relevant_ids:
         return 0.0
     for index, chunk_id in enumerate(result_ids, start=1):
@@ -76,6 +90,7 @@ def helper_reciprocal_rank(result_ids: list[str], relevant_ids: set[str]) -> flo
 
 
 def helper_metric_names(top_k: int) -> list[str]:
+    """返回标准指标名列表（含 Chunk Recall@top_k）。"""
     return [
         "Chunk Recall@5",
         "Chunk Recall@10",

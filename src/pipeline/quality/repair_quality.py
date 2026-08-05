@@ -1,4 +1,14 @@
-﻿"""Repair common post-ingest metadata and retrieval quality issues."""
+﻿# 入库后常见元数据与检索质量问题的自动修复。
+#
+# 主要修复：
+# - title：空 / 噪声标题 → 用 extract_title 从正文重新抽取；
+# - publication_date：缺失或越界（不在 year_start..year_end 区间）→ 重新解析；
+# - abstract：缺失 / 含控制字符 / 可读比 < 0.55 → 用 helper_fallback_abstract 兜底；
+# - 同步：sections 与 chunks 沿用最新 documents 元数据（title / publication_date / 临床科室）；
+# - is_reference_section：根据标题与内容启发式重新判定。
+#
+# 安全设计：所有改动走临时文件 + os.replace，避免半成品；单文档失败不中断。
+"""Repair common post-ingest metadata and retrieval quality issues."""
 
 from __future__ import annotations
 
@@ -15,18 +25,27 @@ from src.utils.io import DATA_DIR, read_jsonl, write_jsonl
 from src.utils.metadata import clean_title, extract_abstract, extract_publication_date, extract_title, is_suspicious_title
 
 
+# 合法日期形如 2012-01-01；其它格式（unknown、缺失）走重新解析路径。
 VALID_DATE_RE = re.compile(r"^(20[1-2]\d)-\d{2}-\d{2}$")
-READABLE_CHAR_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff，。；：、“”‘’（）《》—\-.,;:!?()/%\s]")
+
+# 可读字符集合：拉丁字母 / 数字 / CJK / 中英文标点。计算 readable_ratio 时用。
+READABLE_CHAR_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff，。；：、“”‘’（）《》—\-.,;:!?()/%s]")
+
+# 控制字符集合：用于排除异常摘要（OCR 残留乱码含大量控制字符）。
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+# section 同步字段：title / publication_date / source_institution / clinical_department
 SECTION_METADATA_KEYS = ('title', 'publication_date', 'source_institution', 'clinical_department')
 
 
 def helper_year(value: str | None) -> int | None:
+    """从字符串中提取 4 位年份（1900-2099）。"""
     match = re.search(r"(19\d{2}|20\d{2})", value or "")
     return int(match.group(1)) if match else None
 
 
 def helper_valid_publication_date(value: str | None, year_start: int = 2012, year_end: int = 2026) -> bool:
+    """判定日期是否在合法范围内（含格式校验 + 年份区间校验）。"""
     if not value or value == "unknown":
         return False
     if not VALID_DATE_RE.match(value):
@@ -36,6 +55,7 @@ def helper_valid_publication_date(value: str | None, year_start: int = 2012, yea
 
 
 def helper_reference_like(content: str, section_path: list[Any] | None = None) -> bool:
+    """综合 section_path / HTML 标记 / 列表起始三种信号判定是否为参考文献段。"""
     normalized_path = [str(item).strip() for item in (section_path or []) if str(item).strip()]
     return bool(
         any(REFERENCE_RE.match(item) for item in normalized_path)
@@ -50,6 +70,10 @@ def helper_sync_section_record(
     *,
     clear_missing_fields: bool = False,
 ) -> tuple[dict[str, Any], bool]:
+    """把 sections/*.jsonl 中每行的元数据字段同步到 documents 的当前值。
+
+    clear_missing_fields=True 时也写入空字符串（清字段）；默认仅当 doc 有值时同步。
+    """
     new_row = dict(row)
     changed = False
     for key in SECTION_METADATA_KEYS:
@@ -75,6 +99,7 @@ def helper_sync_sections_from_documents(
     *,
     clear_missing_fields: bool = False,
 ) -> dict[str, int]:
+    """逐文件同步 sections/*.jsonl 到当前 documents 状态，返回改动行数与文件数。"""
     changed_files = 0
     changed_rows = 0
     for path in sorted((data_dir / 'sections').glob('*.jsonl')):
@@ -102,6 +127,7 @@ def helper_sync_sections_from_documents(
 
 
 def helper_fallback_abstract(body: str, max_chars: int = 800) -> str:
+    """从正文首部构造兜底摘要：去注释/标题/表格行，截取 ~800 字符。"""
     text = re.sub(r"<!--.*?-->", " ", body or "", flags=re.S)
     lines: list[str] = []
     for raw_line in text.splitlines():
@@ -118,6 +144,7 @@ def helper_fallback_abstract(body: str, max_chars: int = 800) -> str:
 
 
 def helper_readable_ratio(text: str) -> float:
+    """可读字符占比（去空白后）。用于判定文本是否可作为摘要。"""
     compact = re.sub(r"\s+", "", text or "")
     if not compact:
         return 0.0
@@ -126,6 +153,10 @@ def helper_readable_ratio(text: str) -> float:
 
 
 def helper_usable_abstract(text: str) -> str:
+    """规范化摘要文本：去多余空白、截断 800、控制字符或可读比低则视为空。
+
+    返回空字符串表示「不可用」，调用方应回退到 fallback 或 title。
+    """
     abstract = re.sub(r"\s+", " ", text or "").strip()
     if len(abstract) > 800:
         abstract = abstract[:800]
@@ -135,6 +166,10 @@ def helper_usable_abstract(text: str) -> str:
 
 
 def helper_load_markdown(record: dict[str, Any]) -> tuple[Path | None, dict[str, str], str, str]:
+    """读 markdown_clean 文件，返回 (path, metadata, body, full_markdown)。
+
+    文件不存在时返回 (None, {}, '', '')，调用方据此跳过写回。
+    """
     path_value = record.get("markdown_clean_path") or ""
     path = Path(path_value) if path_value else None
     if path is not None and path.exists():
@@ -145,7 +180,16 @@ def helper_load_markdown(record: dict[str, Any]) -> tuple[Path | None, dict[str,
 
 
 def helper_repair_document(record: dict[str, Any], year_start: int, year_end: int) -> tuple[dict[str, Any], bool]:
-    # 修复策略按问题类型选择最小改动，修复后必须重新计算质量而不是沿用旧结论。
+    """修复单篇 documents 记录 + markdown front-matter。
+
+    修复策略（按问题类型选择最小改动）：
+    - title 为空 / 噪声 → extract_title 重新抽取；
+    - publication_date 越界或格式错误 → extract_publication_date 重新解析；
+    - abstract 缺失 / 含控制字符 / 可读比低 → fallback 兜底；
+    - front-matter 与修复结果不一致 → 写回并重算 content_sha256。
+
+    返回 (repaired_record, changed)。
+    """
     path, metadata, body, markdown = helper_load_markdown(record)
     changed = False
     repaired = dict(record)
@@ -195,10 +239,15 @@ def helper_repair_document(record: dict[str, Any], year_start: int, year_end: in
 
 
 def helper_repair_sections(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict[str, int]:
+    """同步 sections/*.jsonl 到当前 documents 状态。"""
     return helper_sync_sections_from_documents(data_dir, documents)
 
 
 def helper_repair_chunks(data_dir: Path, documents: dict[str, dict[str, Any]]) -> dict[str, int]:
+    """同步 chunks/*.jsonl + 重建聚合文件 all_chunks.jsonl。
+
+    同步策略与 sections 相同：4 个元数据字段 + is_reference_section。
+    """
     changed_files = 0
     changed_rows = 0
     all_rows: list[dict[str, Any]] = []
@@ -234,6 +283,13 @@ def helper_repair_chunks(data_dir: Path, documents: dict[str, dict[str, Any]]) -
 
 
 def repair_quality(data_dir: str | Path = DATA_DIR, year_start: int = 2012, year_end: int = 2026) -> dict[str, Any]:
+    """批量修复 documents + sections + chunks，写回原文件，返回改动统计。
+
+    关键行为：
+    - 越界日期（不在 year_start..year_end）的文档会被剔除出 repaired_documents；
+    - 修改前后计算 changed_documents / title_repairs / date_repairs；
+    - sections 与 chunks 同步到最新 documents 状态。
+    """
     data_path = Path(data_dir)
     documents_path = data_path / "documents.jsonl"
     repaired_documents: list[dict[str, Any]] = []
@@ -271,6 +327,7 @@ def repair_quality(data_dir: str | Path = DATA_DIR, year_start: int = 2012, year
 
 
 def main() -> None:
+    """CLI 入口：python -m src.pipeline.quality.repair_quality [flags]。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=str(DATA_DIR))
     parser.add_argument("--year-start", type=int, default=2012)

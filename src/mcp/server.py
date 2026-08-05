@@ -1,3 +1,11 @@
+# MCP server：暴露 search / read / retrieve 三个工具的 FastMCP 入口。
+#
+# 关键设计：
+# - BACKEND = "postgres"：当前仅 PG 后端，避免误连旧 SQLite；
+# - 三个 @mcp.tool() 装饰的函数全部经 helper_call_api → log_mcp_call 包装：
+#   自动审计 + 异常原样抛出；
+# - SEARCH_DEFAULT_TOPK = 10 / RETRIEVE_DEFAULT_TOPK = 5：合理上限，避免单次返回过大；
+# - host / port / sse_path / message_path 全部从环境变量读，sse 与 streamable-http 模式可同进程并存。
 """MCP server exposing PostgreSQL Search, Read, and Retrieve tools."""
 
 from __future__ import annotations
@@ -28,6 +36,8 @@ except ImportError:  # pragma: no cover
     FastMCP = None  # type: ignore[assignment]
 
 
+# 单一 FastMCP 实例：name 'pdf-markdown-rag-postgres' 与 systemd 单元中的 MCP 服务名一致。
+# 缺 mcp>=1.9 时 mcp=None，工具装饰全部跳过，避免冷启动 import 失败。
 mcp = (
     FastMCP(
         "pdf-markdown-rag-postgres",
@@ -45,6 +55,7 @@ mcp = (
 
 
 def helper_call_api(tool_name: str, api: Any, payload: dict[str, Any]) -> Any:
+    """统一包装：所有 MCP 工具都走 log_mcp_call 审计 + 异常透传。"""
     return log_mcp_call(tool_name, BACKEND, payload, lambda: api(payload))
 
 
@@ -60,8 +71,7 @@ if mcp is not None:
         recency_boost: bool = False,
         topk: int = SEARCH_DEFAULT_TOPK,
     ) -> list[dict[str, Any]]:
-        """Search candidate guideline documents from PostgreSQL."""
-
+        """文档级检索：从 PostgreSQL BM25 + 向量索引召回候选指南文档。"""
         return helper_call_api(
             "search",
             search_api,
@@ -78,8 +88,7 @@ if mcp is not None:
 
     @mcp.tool()
     def read(doc_id: str | None = None, title: str | None = None, max_chars: int | None = None) -> dict[str, Any]:
-        """Read a clean Markdown document from PostgreSQL by doc_id or title."""
-
+        """按 doc_id 或 title 读取完整 clean Markdown 文档（max_chars 控制截断）。"""
         return helper_call_api("read", read_api, read_payload(doc_id, title, max_chars))
 
     @mcp.tool()
@@ -91,8 +100,7 @@ if mcp is not None:
         publication_date: str | None = None,
         topk: int = RETRIEVE_DEFAULT_TOPK,
     ) -> list[dict[str, Any]]:
-        """Retrieve traceable chunks from PostgreSQL full-text and pgvector indexes."""
-
+        """分块级检索：从 PG 全文 + 向量索引召回 traceable chunks（含 consensus fallback）。"""
         return helper_call_api(
             "retrieve",
             retrieve_api,
@@ -108,6 +116,7 @@ if mcp is not None:
 
 
 def main() -> None:
+    """CLI 入口：跑 run_server() 启动 MCP 服务（stdio / sse / streamable-http 三选一）。"""
     run_server(mcp)
 
 

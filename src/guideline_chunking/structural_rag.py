@@ -22,7 +22,7 @@ from src.guideline_chunking.models import DocumentMeta, ParsedBlock
 from src.retrieval.rrf import rrf_fusion
 
 
-RECOMMENDATION_RE = re.compile(
+RECOMMENDATION_RE = re.compile(  # 推荐类关键词（中英文），用于判定段落是否为推荐。
     r"\b(recommend(?:s|ing|ations?)?|suggest(?:s|ing|ions?)?|should|is advised|we recommend|we suggest)\b|"
     r"\b(?:is|are|was|were|be|being)\s+(?:not\s+)?(?:recommended|suggested)\b|"
     r"\b(?:not\s+)?recommended\s+(?:for|to|that|as)\b|"
@@ -31,25 +31,25 @@ RECOMMENDATION_RE = re.compile(
     r"应在|应根据|应进行|应给予|应避免|应考虑|应首先|应仅限|应采用|应使用|应告知|应评估)",
     re.I,
 )
-DOSE_UNIT_PATTERN = (
+DOSE_UNIT_PATTERN = (  # 剂量单位正则（如 5 mg / 100 mcg / 10 mL）。
     r"\b\d+(?:\.\d+)?\s*(?:[mM][cC][gG]|[mM][gG]|g|[kK][gG]|[mM][lL]|[iI][uU])\b|"
     r"\b\d+(?:\.\d+)?\s+(?:[uU][nN][iI][tT][sS]?)\b"
 )
-DOSE_UNIT_RE = re.compile(DOSE_UNIT_PATTERN)
-CLINICAL_DETAIL_RE = re.compile(
+DOSE_UNIT_RE = re.compile(DOSE_UNIT_PATTERN)  # 剂量单位识别预编译版本。
+CLINICAL_DETAIL_RE = re.compile(  # 临床细节关键词（剂量 / 给药途径 / 方案 等中英文）。
     rf"({DOSE_UNIT_PATTERN}|(?i:\b(?:dose|dosage|regimen)\b)|\b(?:IV|PO)\b|剂量|用量|给药|口服|静脉|疗程|"
     r"(?:用药|给药|治疗|化疗|放疗)方案)"
 )
-SENTENCE_SPLIT_RE = re.compile(
+SENTENCE_SPLIT_RE = re.compile(  # 中英文句末标点切句正则。
     r"(?<=[.!?])\s+(?=(?:[A-Z0-9\"']))|"
     r"(?<=[。！？；])\s*|"
     r"(?<=[遥])\s*|"
     r"(?<=曰)\s*(?=[(（\dA-Z一二三四五六七八九十])"
 )
-CITATION_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\d{1,4}\s+(?=(?:[A-Z\"']))")
-TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
-CHINESE_MOJIBAKE_CHARS = set("窑源园圆员缘远苑愿怨援袁暂咱渊冤遥郾蚤灶则凿葬泽糟酝藻贼燥增")
-QUERY_SYNONYMS = {
+CITATION_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\d{1,4}\s+(?=(?:[A-Z\"']))")  # 引用后的句号 + 数字组合切分（避免把 'NEJM. 2020' 视为句末）。
+TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")  # Markdown 表格分隔行识别（---|--- 等）。
+CHINESE_MOJIBAKE_CHARS = set("窑源园圆员缘远苑愿怨援袁暂咱渊冤遥郾蚤灶则凿葬泽糟酝藻贼燥增")  # 常见中文 mojibake 字符集，用于检测文本是否含编码错误。
+QUERY_SYNONYMS = {  # 查询同义词字典（中英双向），用于扩展查询召回。
     "kidney transplant": ["renal transplant", "kidney transplantation", "肾脏移植", "肾移植"],
     "kidney transplantation": ["kidney transplant", "renal transplant", "肾脏移植", "肾移植"],
     "left ventricular ejection fraction": ["LVEF", "左心室射血分数", "左室射血分数"],
@@ -61,7 +61,7 @@ QUERY_SYNONYMS = {
     "myocardial infarction": ["MI", "heart attack"],
     "acetaminophen": ["paracetamol"],
 }
-BILINGUAL_QUERY_KEYWORDS = {
+BILINGUAL_QUERY_KEYWORDS = {  # 双语关键词映射：英文短词 → 中文术语。
     "left ventricular ejection fraction": "左心室射血分数",
     "ejection fraction": "射血分数",
     "below 40": "低于40%",
@@ -70,14 +70,14 @@ BILINGUAL_QUERY_KEYWORDS = {
     "kidney transplantation": "肾脏移植",
     "renal transplant": "肾移植",
 }
-CHUNK_KEYWORDS = {
+CHUNK_KEYWORDS = {  # chunk_type → 关键词词典：BM25 索引扩展用。
     "recommendation": "recommend recommendation guideline suggest should advised treatment",
     "recommendation_bundle": "recommend recommendation guideline suggest should advised treatment",
     "clinical_detail": "dose dosage regimen mg mcg ml iv po percent table",
     "general": "guideline section evidence background",
 }
-MAX_RECOMMENDATION_BUNDLE_CHARS = 2500
-QUERY_PHRASE_STOPWORDS = {
+MAX_RECOMMENDATION_BUNDLE_CHARS = 2500  # 推荐+证据 bundle 最大字符数（超过则截断）。
+QUERY_PHRASE_STOPWORDS = {  # 查询短语停用词（避免噪声短语匹配）。
     "guideline",
     "recommendation",
     "recommend",
@@ -105,6 +105,7 @@ class GuidelineChunk:
 
 
 class TextEncoder(Protocol):
+    """文本编码器 Protocol，encode 签名：text -> list of float。"""
     def encode(self, texts: list[str]) -> list[list[float]]:
         """Return one dense vector per input text."""
 

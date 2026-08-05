@@ -1,3 +1,10 @@
+# 规范化 chunk JSONL 记录的字段契约，供 storage 入库与 hybrid retrieval 共用。
+#
+# 关键设计：
+# - 收敛多个 chunk schema 版本（旧版可能缺 chunk_index / retrieval_text / token_count）；
+# - 自动按 doc_id 编号（chunk_index 缺失时由 per_doc_index 兜底）；
+# - 强制重新计算 text_for_embedding 与 retrieval_text，保持入库与检索口径一致；
+# - 临床科室从 documents 继承 + 按 chunk 实际内容重算（多科室集合）。
 """Normalize chunk JSONL records for storage and retrieval indexes."""
 
 from __future__ import annotations
@@ -10,10 +17,13 @@ from src.utils.clinical_department import classify_chunk_departments
 from src.utils.io import DATA_DIR, read_jsonl
 
 
+# 与 src.utils.text.SEARCH_TOKEN_RE 等价的 token 计数正则：
+# 英文按 [A-Za-z0-9]+（含连字符/撇号分词），中文按单字。
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|[\u4e00-\u9fff]")
 
 
 def load_document_metadata(data_dir: str | Path = DATA_DIR) -> dict[str, dict[str, Any]]:
+    """读 documents.jsonl 返回 doc_id → record 字典，供 chunk 字段继承。"""
     return {record["doc_id"]: record for record in read_jsonl(Path(data_dir) / "documents.jsonl")}
 
 
@@ -21,6 +31,13 @@ def iter_normalized_chunks(
     data_dir: str | Path = DATA_DIR,
     chunks_path: str | Path | None = None,
 ) -> Iterator[dict[str, Any]]:
+    """流式产出规范化后的 chunk 记录。
+
+    行为：
+    - 默认读 chunks/all_chunks.jsonl；
+    - 若 chunk_index 缺失，按 per_doc_index 自增编号兜底；
+    - 始终返回新 dict（normalize_chunk_record 的输出），不修改原始记录。
+    """
     data_path = Path(data_dir)
     docs = load_document_metadata(data_path)
     path = Path(chunks_path) if chunks_path else data_path / "chunks" / "all_chunks.jsonl"
@@ -39,7 +56,14 @@ def normalize_chunk_record(
     documents: dict[str, dict[str, Any]] | None = None,
     chunk_index: int = 0,
 ) -> dict[str, Any]:
-    # 旧版与新版字段在此收敛为唯一契约，缺省值必须保持可检索且可追踪。
+    """把 chunk 记录统一为下游契约所需的字段集。
+
+    输入兼容：doc_id 来自 chunk 或 source_doc_id；
+    section_path 兼容 heading_path 别名；
+    content 兼容 text / recommendation 别名；
+    字段继承顺序：旧字段 > documents 元数据 > 默认值。
+    重新计算项：chunk_type / text_for_embedding / retrieval_text / token_count / clinical_department(s)。
+    """
     doc_id = helper_doc_id(record)
     doc = (documents or {}).get(doc_id, {})
     section_path = as_list(record.get("section_path") or record.get("heading_path") or [])
@@ -83,6 +107,10 @@ def normalize_chunk_record(
 
 
 def helper_doc_id(record: dict[str, Any]) -> str:
+    """提取 doc_id（兼容 doc_id / source_doc_id 两种字段名）。
+
+    缺失时抛 KeyError（避免 silently 写入空 doc_id 导致检索断裂）。
+    """
     doc_id = record.get("doc_id") or record.get("source_doc_id")
     if not doc_id:
         raise KeyError("chunk record missing doc_id/source_doc_id")
@@ -90,6 +118,7 @@ def helper_doc_id(record: dict[str, Any]) -> str:
 
 
 def as_list(value: Any) -> list[Any]:
+    """把字段值规整为 list：None → []，list 原样，其它 → [value]。"""
     if value is None:
         return []
     if isinstance(value, list):
@@ -98,6 +127,10 @@ def as_list(value: Any) -> list[Any]:
 
 
 def helper_embedding_text(section_path: list[Any], chunk_type: str, content: str) -> str:
+    """构造 text_for_embedding：把章节路径 + chunk 类型 + 内容拼成结构化文本。
+
+    前缀标签（[GUIDELINE SECTION] / [CHUNK TYPE]）让向量模型在嵌入时能区分章节与正文。
+    """
     return "\n".join(
         [
             "[GUIDELINE SECTION]: " + " > ".join(str(item) for item in section_path),

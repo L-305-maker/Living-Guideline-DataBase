@@ -1,3 +1,13 @@
+# 把 retrieval JSONL 产物改写为固定的最小契约（compact 形式）。
+#
+# 应用场景：当字段 schema 演进时，旧 JSONL 可能含冗余或过时的字段；
+# 跑一遍 compact_artifacts 会按 projector 把每条记录投影到最小集合，
+# 既减小文件体积，又消除与新 schema 的字段差异。
+#
+# 关键安全设计：
+# - 写临时文件再原子替换（.compact.tmp → rename），任一步失败保留原文件
+# - JSONL 解析失败抛 ValueError（包含行号），方便快速定位
+# - 进度信息每 500 个文件打印一次（适合大批量场景）
 """Rewrite retrieval JSONL artifacts to their fixed minimal contracts."""
 
 from __future__ import annotations
@@ -13,6 +23,11 @@ from src.utils.io import DATA_DIR
 
 
 def helper_rewrite(path: Path, projector: Callable[[dict[str, Any]], dict[str, Any]]) -> tuple[int, int, int]:
+    """把单个 JSONL 文件经 projector 投影后原地覆盖。
+
+    返回：(行数, 改写前字节数, 改写后字节数)。
+    失败时 unlink 临时文件，保留原文件不变。
+    """
     before = path.stat().st_size
     temporary = path.with_suffix(path.suffix + ".compact.tmp")
     count = 0
@@ -25,6 +40,7 @@ def helper_rewrite(path: Path, projector: Callable[[dict[str, Any]], dict[str, A
                     record = json.loads(line)
                 except json.JSONDecodeError as exc:
                     raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
+                # separators=(",", ":") 紧凑 JSON：节省 30-40% 磁盘与解析开销。
                 target.write(json.dumps(projector(record), ensure_ascii=False, separators=(",", ":")) + "\n")
                 count += 1
         temporary.replace(path)
@@ -35,7 +51,14 @@ def helper_rewrite(path: Path, projector: Callable[[dict[str, Any]], dict[str, A
 
 
 def compact_artifacts(data_dir: str | Path = DATA_DIR) -> dict[str, Any]:
-    # 所有 JSONL 先写临时文件再原子替换，任一步失败都要清理临时产物并保留原文件。
+    """压紧 document_cards / document_views / chunks 三类 JSONL。
+
+    实现要点：
+    - cards 与 views 走 helper_rewrite；
+    - chunks 按文件分片单独处理，同时把内容追加写到 all_chunks.jsonl 聚合文件；
+    - 聚合文件也通过临时文件最终原子替换；
+    - 所有异常路径 unlink 临时文件并保留原文件，保证幂等可重跑。
+    """
     root = Path(data_dir)
     card_count, card_before, card_after = helper_rewrite(root / "document_cards.jsonl", compact_document_card)
     view_count, view_before, view_after = helper_rewrite(root / "document_views.jsonl", compact_document_view)
@@ -87,6 +110,7 @@ def compact_artifacts(data_dir: str | Path = DATA_DIR) -> dict[str, Any]:
 
 
 def main() -> None:
+    """CLI 入口：python -m src.pipeline.cleaning.compact_retrieval_artifacts [flags]。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=str(DATA_DIR))
     args = parser.parse_args()

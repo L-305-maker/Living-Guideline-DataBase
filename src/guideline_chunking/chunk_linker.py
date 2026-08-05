@@ -1,3 +1,10 @@
+# Chunk 关系链接构建。
+#
+# 模块职责：为 atomic / section / table 三类 chunk 之间建立 ChunkLink 关系图。
+# 关键设计：
+# - 关系类型 5 种：parent_section / previous_chunk / next_chunk / table_parent_to_row / row_to_table_parent / same_section；
+# - 同章节邻居仅连后续 5 个，避免链接数随章节长度平方增长；
+# - link_id 用 SHA1(source:target:link_type)[:10] 生成，保证幂等可重入。
 """Chunk relationship construction."""
 
 from __future__ import annotations
@@ -12,6 +19,14 @@ def build_chunk_links(
     atomic_chunks: list[AtomicChunk],
     table_chunks: list[TableChunk],
 ) -> list[ChunkLink]:
+    """为 atomic / section / table 三类 chunk 构建 ChunkLink 列表。
+
+    5 种关系：
+    1. parent_section：每个 atomic / table → 所属 section；
+    2. previous_chunk / next_chunk：atomic 间的前后指针（按文档顺序）；
+    3. table_parent_to_row / row_to_table_parent：表格行与父表的双向链接（便于整表扩展 / 行级回溯）；
+    4. same_section：同章节内的邻居（只连后续 5 个，避免链接数爆炸）。
+    """
     links: list[ChunkLink] = []
     all_child_chunks = [*atomic_chunks, *table_chunks]
     for chunk in all_child_chunks:
@@ -25,7 +40,7 @@ def build_chunk_links(
         if chunk.next_chunk_id:
             links.append(make_link(chunk.doc_id, chunk.chunk_id, chunk.next_chunk_id, "next_chunk", {}))
 
-    # 表格行同时建立父到子和子到父链接，支持整表扩展与行级回溯。
+    # 表格行同时建立父→子和子→父链接，支持整表扩展与行级回溯。
     table_parents = {chunk.table_id: chunk for chunk in table_chunks if chunk.chunk_type == "table_parent"}
     for chunk in table_chunks:
         if chunk.chunk_type != "table_row":
@@ -49,6 +64,7 @@ def build_chunk_links(
 
 
 def make_link(doc_id: str, source: str, target: str, link_type: str, metadata: dict) -> ChunkLink:
+    """构造单条 ChunkLink；link_id = SHA1(source:target:link_type)[:10]，保证幂等。"""
     digest = hashlib.sha1(f"{source}:{target}:{link_type}".encode("utf-8")).hexdigest()[:10]
     return ChunkLink(
         link_id=f"{doc_id}_link_{digest}",
@@ -61,6 +77,7 @@ def make_link(doc_id: str, source: str, target: str, link_type: str, metadata: d
 
 
 def helper_doc_id_for_section(sections: list[SectionChunk], section_id: str) -> str:
+    """从 section_id 反查 doc_id；找不到时返回 "unknown"（兜底）。"""
     for section in sections:
         if section.section_id == section_id:
             return section.doc_id

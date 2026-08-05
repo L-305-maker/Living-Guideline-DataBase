@@ -1,3 +1,10 @@
+# PDF 文本层评估与 OCR 路由信号。
+#
+# 流程：inspect_pdf_text_layer → assess_pdf_text_layer → 输出 PdfTextLayerReport。
+# PdfTextLayerReport 决定是否走 OCR：
+# - is_scanned=True：超过 60% 页面是扫描件 → 必须 OCR
+# - needs_ocr=True：文本层字符数过少 → 建议 OCR
+# - quality ∈ {ok, warning, poor}：给下游 front-matter 提供提示
 """PDF text-layer inspection and OCR routing signals."""
 
 from __future__ import annotations
@@ -9,6 +16,11 @@ from typing import Any, Iterable
 
 @dataclass(frozen=True)
 class PdfPageTextStats:
+    """单页文本层统计：page_number / text_chars / image_area_ratio。
+
+    image_area_ratio 是图片 bbox 面积与页面面积的比值，
+    与 text_chars 共同作为 OCR 路由决策的依据。
+    """
     page_number: int
     text_chars: int
     image_area_ratio: float
@@ -16,6 +28,16 @@ class PdfPageTextStats:
 
 @dataclass(frozen=True)
 class PdfTextLayerReport:
+    """整篇 PDF 的文本层评估报告。
+
+    字段：
+    - pages / text_chars / text_chars_per_page：基本统计
+    - low_text_pages / image_pages / scanned_pages：异常页计数
+    - low_text_page_ratio / image_page_ratio / scanned_page_ratio：异常页占比
+    - is_scanned：是否整篇都是扫描件
+    - needs_ocr：是否建议走 OCR
+    - quality ∈ {ok, warning, poor}：用于 front-matter 的 cleaning_quality
+    """
     pages: int
     text_chars: int
     text_chars_per_page: float
@@ -30,6 +52,7 @@ class PdfTextLayerReport:
     quality: str
 
     def as_metadata(self, prefix: str = "pdf") -> dict[str, str]:
+        """序列化为 front-matter 字段（带 prefix 区分 source_pdf / pdf）。"""
         return {
             f"{prefix}_page_count": str(self.pages),
             f"{prefix}_text_chars": str(self.text_chars),
@@ -50,9 +73,13 @@ def assess_pdf_text_layer(
     image_page_area_ratio: float = 0.45,
     scanned_page_ratio_threshold: float = 0.60,
 ) -> PdfTextLayerReport:
-    """Classify whether a PDF text layer is usable or likely needs OCR."""
-    # 扫描件判断综合页级字符密度和可读文本比例，单页异常不能直接代表整篇文档。
+    """汇总单页统计 → 整篇 PDF 的文本层报告。
 
+    决策表：
+    - is_scanned：扫描页占比 ≥60% 或（极低字符密度 + 高图片占比）
+    - needs_ocr：扫描件 / 平均字符过少 / 低文本页 ≥50%
+    - quality：扫描件或字符密度 <40 → poor；其余 needs_ocr 或低文本页 ≥25% → warning；其它 ok
+    """
     page_stats = list(pages)
     page_count = len(page_stats)
     text_chars = sum(page.text_chars for page in page_stats)
@@ -66,6 +93,7 @@ def assess_pdf_text_layer(
     image_page_ratio = image_pages / max(1, page_count)
     scanned_page_ratio = scanned_pages / max(1, page_count)
 
+    # 扫描件判断综合页级字符密度和可读文本比例，单页异常不能直接代表整篇文档。
     is_scanned = bool(
         page_count > 0
         and (
@@ -98,6 +126,10 @@ def assess_pdf_text_layer(
 
 
 def helper_page_image_area_ratio(page: Any) -> float:
+    """计算单页所有图片块面积与页面面积之比。
+
+    容错处理：get_text 抛异常返回 0.0，避免单页错误中断整篇评估。
+    """
     page_area = max(1.0, float(page.rect.width * page.rect.height))
     image_area = 0.0
     try:
@@ -117,8 +149,7 @@ def helper_page_image_area_ratio(page: Any) -> float:
 
 
 def inspect_pdf_text_layer(pdf_path: str | Path) -> PdfTextLayerReport:
-    """Inspect a PDF's embedded text layer and image coverage."""
-
+    """打开 PDF，逐页统计文本与图片面积，汇总为 PdfTextLayerReport。"""
     try:
         import fitz  # type: ignore
     except ImportError as exc:

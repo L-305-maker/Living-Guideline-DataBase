@@ -1,3 +1,12 @@
+# MCP 后端 API 的冒烟测试：验证 search / read / retrieve 三链路通畅。
+#
+# 流程：
+# 1. search_pg(query, time_range, topk) → 拿首条 doc_id；
+# 2. read_pg(doc_id, max_chars=500) → 验证 read API 返回正文；
+# 3. retrieve_pg(query, time_range, topk) → 验证分块检索返回非空。
+#
+# 用法：python -m src.mcp.smoke_test [--query ...] [--topk N]
+# 适合部署后做"链路 1 跳"健康检查。
 """Smoke-test PostgreSQL Search, Read, and Retrieve APIs behind MCP tools."""
 
 from __future__ import annotations
@@ -9,6 +18,7 @@ from src.mcp.api_pg import read_pg, retrieve_pg, search_pg
 
 
 def smoke_test(query: str = "diabetes hypertension guideline", topk: int = 3) -> dict[str, object]:
+    """三步冒烟：search → read → retrieve，返回简化后的统计信息。"""
     search_results = search_pg(
         {
             "query": query,
@@ -50,6 +60,7 @@ def smoke_test(query: str = "diabetes hypertension guideline", topk: int = 3) ->
 
 
 def main() -> None:
+    """CLI 入口：默认 query='diabetes hypertension guideline'，topk=3。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--query", default="diabetes hypertension guideline")
     parser.add_argument("--topk", type=int, default=3)

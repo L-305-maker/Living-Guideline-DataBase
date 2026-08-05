@@ -1,3 +1,9 @@
+# MCP 入口的共享配置与启动逻辑。
+#
+# 模块职责：
+# - env_bool / env_int：环境变量解析（统一 1/true/yes/on 与数值）；
+# - search_payload / read_payload / retrieve_payload：构造稳定的请求 dict（避免 MCP 工具逐个手写字段）；
+# - run_server：校验 MCP_TRANSPORT 取值（stdio/sse/streamable-http）后调 mcp.run()。
 """MCP 服务入口共享的配置、请求载荷和启动逻辑。"""
 
 from __future__ import annotations
@@ -7,8 +13,10 @@ from typing import Any
 
 
 def env_bool(name: str, default: bool = False) -> bool:
-    """读取布尔环境变量，未配置时返回调用方默认值。"""
+    """读取布尔环境变量，未配置时返回调用方默认值。
 
+    接受 1/true/yes/on（大小写不敏感）；其它值（含空串、0、no、off）返回 False。
+    """
     value = os.environ.get(name)
     if value is None:
         return default
@@ -17,7 +25,6 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 def env_int(name: str, default: int) -> int:
     """读取整数环境变量；非法值按可选配置处理并回退默认值。"""
-
     value = os.environ.get(name)
     if value is None:
         return default
@@ -37,7 +44,6 @@ def search_payload(
     topk: int,
 ) -> dict[str, Any]:
     """构造文档搜索工具的稳定请求结构。"""
-
     return {
         "query": query,
         "source_institution": source_institution,
@@ -53,7 +59,6 @@ def read_payload(
     doc_id: str | None, title: str | None, max_chars: int | None
 ) -> dict[str, Any]:
     """构造全文读取工具的稳定请求结构。"""
-
     return {"doc_id": doc_id, "title": title, "max_chars": max_chars}
 
 
@@ -66,7 +71,6 @@ def retrieve_payload(
     topk: int,
 ) -> dict[str, Any]:
     """构造分块检索工具的稳定请求结构。"""
-
     return {
         "query": query,
         "source_institution": source_institution,
@@ -78,8 +82,14 @@ def retrieve_payload(
 
 
 def run_server(mcp: Any) -> None:
-    """校验传输配置并启动 MCP 服务。"""
+    """校验传输配置并启动 MCP 服务。
 
+    校验：
+    - mcp 不为 None（要求 mcp>=1.9 已安装）；
+    - MCP_TRANSPORT ∈ {stdio, sse, streamable-http}，否则 ValueError。
+
+    启动：通过 mcp.run(transport=...) 启动；MCP_MOUNT_PATH 可选，仅 sse / streamable-http 有效。
+    """
     if mcp is None:
         raise RuntimeError(
             "Install mcp>=1.9 to run the MCP server: python -m pip install mcp>=1.9"

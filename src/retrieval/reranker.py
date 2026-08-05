@@ -1,4 +1,18 @@
-"""Document reranker interfaces for document-level search."""
+"""Reranker 抽象与多种实现：用于在 RRF 融合后对候选重新排序。
+
+主要组件：
+- DocumentReranker / ChunkReranker：Protocol 接口定义；
+- NoopReranker：占位实现，忽略查询内容只裁剪数量；
+- RuleBasedDocumentReranker / RuleBasedChunkReranker：基于规则 + 查询词重叠的轻量实现；
+- BgeM3DocumentReranker / BgeM3ChunkReranker：基于 Qwen3-Reranker-4B 的重型实现（GPU）；
+- default_*_reranker / helper_cached_*_reranker：按环境变量决定使用哪种实现的工厂函数。
+
+设计原则：
+- 文档重排与 chunk 重排接口分离：documents 用 match_reason.boosts；chunks 用 chunk_type 权重；
+- 质量惩罚：OCR 失败 / mojibake / noisy_ocr_lines 等清洗 flag 触发 quality_score_multiplier 扣分；
+- 时效性加分：recency_boost=True 时按 publication_year 与当前年的距离做对数衰减；
+- 缓存：helper_cached_* 用 lru_cache 避免每次调用重新初始化 BGE 模型。
+"""
 
 from __future__ import annotations
 
@@ -19,19 +33,21 @@ from src.utils.records import (
 )
 
 
-DEFAULT_BGE_RERANKER_MODEL = "Qwen/Qwen3-Reranker-4B"
-GUIDE_RE = re.compile(r"(guideline|guidelines|consensus|recommendations?|\u6307\u5357|\u5171\u8bc6)", re.I)
-OCR_UNRESOLVED_STATUSES = {"needed_unavailable", "needed_not_applied", "needed_but_disabled", "failed"}
-OCR_REVIEW_STATUSES = {"applied_needs_review"}
-HIGH_RISK_CLEANING_FLAGS = {"likely_ocr_failure", "low_text_signal", "noisy_ocr_lines", "pdf_text_mojibake"}
+DEFAULT_BGE_RERANKER_MODEL = "Qwen/Qwen3-Reranker-4B"  # 默认 BGE Reranker 模型：Qwen3-Reranker-4B（4B 参数），可通过环境变量 BGE_RERANKER_MODEL 覆盖。
+GUIDE_RE = re.compile(r"(guideline|guidelines|consensus|recommendations?|\u6307\u5357|\u5171\u8bc6)", re.I)  # 指南/共识/推荐类关键词，用于检测候选是否为指南文档。
+OCR_UNRESOLVED_STATUSES = {"needed_unavailable", "needed_not_applied", "needed_but_disabled", "failed"}  # OCR 状态中视为『未解决』的取值集合，触发质量扣分。
+OCR_REVIEW_STATUSES = {"applied_needs_review"}  # OCR 已应用但需人工 review 的状态，轻度扣分。
+HIGH_RISK_CLEANING_FLAGS = {"likely_ocr_failure", "low_text_signal", "noisy_ocr_lines", "pdf_text_mojibake"}  # 高风险清洗标记：OCR 失败 / 低文本信号 / 噪声行 / 文本乱码，触发重度扣分。
 
 
 class DocumentReranker(Protocol):
+    """文档级 Reranker Protocol。"""
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
         """Reorder already-recalled document candidates."""
 
 
 class ChunkReranker(Protocol):
+    """chunk 级 Reranker Protocol。"""
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
         """Reorder already-recalled chunk candidates."""
 
@@ -44,10 +60,12 @@ class NoopReranker:
 
 
 class NoopDocumentReranker(NoopReranker):
+    """NoopReranker 的文档特化子类。"""
     pass
 
 
 class NoopChunkReranker(NoopReranker):
+    """NoopReranker 的 chunk 特化子类。"""
     pass
 
 

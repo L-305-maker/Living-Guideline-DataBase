@@ -1,4 +1,17 @@
-"""Rule-based clinical department classification for guideline metadata."""
+"""基于关键词规则的临床科室分类器。
+
+模块职责：
+- DEPARTMENT_RULES：约 40 条科室的关键词词典（中英文双语 + 短语形式）；
+- score_clinical_departments：标题加权 + 正文加权的打分函数；
+- classify_clinical_departments：多标签分类（返回 departments list + 主科室 + scope）；
+- classify_chunk_departments：在文档级科室集合内做 chunk 级再分类；
+- allowed_departments：暴露给上层的科室枚举。
+
+设计原则：
+- 标题命中权重（title_bonus=4）远高于正文（text_weight=1），防止跨学科正文污染；
+- 关键词分中英文两套匹配路径：CJK 走子串包含，英文走单词边界正则；
+- 多标签阈值：相对阈值 35%（默认）+ 最小分数 2，避免单次偶然命中拉高科室数量；
+- 容错：未命中 → 返回 [UNKNOWN_DEPARTMENT]，下游可识别并兜底。"""
 
 from __future__ import annotations
 

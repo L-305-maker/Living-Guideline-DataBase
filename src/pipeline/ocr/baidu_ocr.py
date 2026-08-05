@@ -1,4 +1,12 @@
-"""Baidu high-accuracy OCR for PDF-to-Markdown recovery."""
+"""Baidu 高精度 OCR（带坐标），用于 PDF → Markdown 恢复。
+
+关键设计：
+- 单 PDF → 逐页渲染为 JPEG → 调百度 accurate_position OCR；
+- 返回 words_result 含每行坐标（left/top/width/height），便于按版面恢复单/双栏；
+- 单页缓存到 page_cache/accurate_position/<doc_id>/<NNNN>.json，避免重复计费；
+- 配额耗尽时通过 BaiduQuotaExceeded 抛错，由批处理转为 deferred_quota 任务；
+- 错误码 17/19 → 配额；18 → 服务繁忙，按指数退避重试。
+"""
 
 from __future__ import annotations
 
@@ -25,10 +33,12 @@ OCR_INCOMPLETE = {"needed_unavailable", "needed_but_disabled", "failed", "applie
 
 
 class BaiduQuotaExceeded(RuntimeError):
+    """百度配额耗尽信号（错误码 17/19），由批处理转为 deferred_quota 状态。"""
     pass
 
 
 def helper_credentials() -> tuple[str, str]:
+    """读取 BAIDU_OCR_API_KEY/SECRET_KEY（兼容旧 BAIDU_API_KEY/SECRET_KEY 别名）。"""
     api_key = os.environ.get("BAIDU_OCR_API_KEY") or os.environ.get("BAIDU_API_KEY")
     secret_key = os.environ.get("BAIDU_OCR_SECRET_KEY") or os.environ.get("BAIDU_SECRET_KEY")
     if not api_key or not secret_key:
@@ -37,6 +47,7 @@ def helper_credentials() -> tuple[str, str]:
 
 
 def get_access_token(session: requests.Session | None = None) -> str:
+    """获取 access_token：优先用 BAIDU_OCR_ACCESS_TOKEN，否则按 API key 兑换。"""
     direct_token = os.environ.get("BAIDU_OCR_ACCESS_TOKEN")
     if direct_token:
         return direct_token
@@ -58,6 +69,7 @@ def get_access_token(session: requests.Session | None = None) -> str:
 
 
 def helper_form_size(image_bytes: bytes) -> int:
+    """估算 base64 编码后 form 表单字节数（百度 10MB 上限参考值）。"""
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return len(urlencode({"image": encoded}).encode("ascii"))
 
@@ -86,6 +98,7 @@ def helper_render_page_jpeg(pdf_path: Path, page_index: int, dpi: int = 180) -> 
 
 
 def helper_safe_ocr_error(payload: dict[str, Any]) -> str:
+    """把百度错误响应压成可读字符串（Baidu OCR error {code}: {message}）。"""
     code = payload.get("error_code") or payload.get("error") or "unknown"
     message = payload.get("error_msg") or payload.get("error_description") or "unknown error"
     return f"Baidu OCR error {code}: {message}"
@@ -140,6 +153,7 @@ def ocr_image_payload(
 
 
 def helper_payload_layout(payload: dict[str, Any], page_width: int | None = None) -> tuple[str, str]:
+    """按坐标把 words_result 重组为单栏或双栏 Markdown，恢复原始版面顺序。"""
     lines = [item for item in payload.get("words_result", []) if str(item.get("words") or "").strip()]
     positioned = [item for item in lines if isinstance(item.get("location"), dict)]
     if len(positioned) != len(lines) or not lines:
@@ -232,10 +246,12 @@ def helper_payload_layout(payload: dict[str, Any], page_width: int | None = None
 
 
 def helper_payload_text(payload: dict[str, Any], page_width: int | None = None) -> str:
+    """helper_payload_layout 的文本便捷接口（丢弃 layout_mode 信息）。"""
     return helper_payload_layout(payload, page_width)[0]
 
 
 def helper_payload_confidence(payload: dict[str, Any]) -> float | None:
+    """汇总全页 confidence.average，用于审计平均识别准确率。"""
     values = []
     for item in payload.get("words_result", []):
         probability = item.get("probability") or {}
@@ -253,6 +269,7 @@ def helper_write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def helper_page_count(pdf_path: Path) -> int:
+    """惰性 import fitz，读 PDF 总页数。"""
     try:
         import fitz  # type: ignore
     except ImportError as exc:

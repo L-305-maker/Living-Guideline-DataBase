@@ -1,3 +1,10 @@
+# Table-aware chunk 构造：把 Markdown 表格拆为 table_parent + 多 table_row + 可选 table_note。
+#
+# 关键设计：
+# - parent chunk 保存完整表格，row chunk 用于精确召回，二者通过 table_id 关联；
+# - 行列数不一致时按表头补空值，保持 embedding 模板的列语义稳定；
+# - 紧随表格的"Note:" / "Notes：" 文本单独建 note chunk，保留语义不污染行数据；
+# - parse_markdown_table 失败只跳过当前表并写 warning，不中断整篇文档。
 """Table-aware chunk construction."""
 
 from __future__ import annotations
@@ -17,6 +24,14 @@ def build_table_chunks(
     meta: DocumentMeta,
     warnings: list[ChunkBuildWarning] | None = None,
 ) -> list[TableChunk]:
+    """为每个表格 block 生成 1 个 table_parent + N 个 table_row + 可选 table_note。
+
+    关键设计：
+    - parent chunk 保存完整表格，row chunk 用于精确召回，二者通过 table_id 关联；
+    - 行列数不一致时按表头补空值，保持 embedding 模板的列语义稳定；
+    - 紧随表格的说明文字（"Note:" / "Notes："）单独建 note chunk；
+    - 解析失败只跳过当前表并写 warning（table_parse_failed），不中断整篇文档。
+    """
     chunks: list[TableChunk] = []
     table_index = 0
     table_blocks = [block for block in blocks if block.block_type == "table"]
@@ -148,6 +163,13 @@ def build_table_chunks(
 
 
 def parse_markdown_table(text: str) -> tuple[list[str], list[list[str]]]:
+    """解析 Markdown 表格：表头 + 至少 2 行（含分隔行）。
+
+    校验：
+    - 必须有表头 + 分隔行；
+    - 分隔行格式必须为 '-' 3+ 个（可选 ':' 包裹）；
+    - 数据行需以 | 起止。
+    """
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     if len(lines) < 2:
         raise ValueError("Failed to parse markdown table header.")
@@ -160,20 +182,27 @@ def parse_markdown_table(text: str) -> tuple[list[str], list[list[str]]]:
 
 
 def helper_cells(line: str) -> list[str]:
+    """剥离 | 包围符并按 | 切分单元格。"""
     stripped = line.strip().strip("|")
     return [cell.strip() for cell in stripped.split("|")]
 
 
 def helper_is_separator(cell: str) -> bool:
+    """判定是否为有效分隔符：3+ 个 '-'（可选 ':' 包裹表示对齐）。"""
     stripped = cell.strip()
     return len(stripped.replace(":", "")) >= 3 and set(stripped.replace(":", "")) == {"-"}
 
 
 def hash_text(text: str) -> str:
+    """文本指纹：SHA1 截断 8 字符（用于 chunk_id 后缀去重）。"""
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
 
 
 def helper_following_note(table_block: ParsedBlock, blocks: list[ParsedBlock]) -> ParsedBlock | None:
+    """从表格块向后查找 Note/Notes 段（同 heading_path 且文本以 Note/Notes: 起首）。
+
+    仅匹配下一个 order_index 的块（同章节邻接），避免跨章节误命中。
+    """
     next_order = table_block.order_index + 1
     for block in blocks:
         if block.order_index != next_order:

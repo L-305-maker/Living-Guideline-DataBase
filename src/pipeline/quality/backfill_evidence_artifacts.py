@@ -1,4 +1,17 @@
-"""Review and backfill weak evidence artifacts from full cleaned Markdown text."""
+"""回填 evidence 产物的弱字段：title / publication_date / abstract / clinical_department / card fields。
+
+主要逻辑（按文档级 vs 分块级分类）：
+1. 文档级（backfill_evidence_artifacts 主循环）：
+   - title：generic / 噪声 → helper_find_better_title 重新抽取；
+   - source_institution：Unknown → helper_infer_source 从文件名/正文推断；
+   - publication_date：缺失或越界 → extract_publication_date 重解析；
+   - abstract：过短 → helper_find_best_abstract（锚定 / 兜底 / 标题三段）；
+   - clinical_department：未分类 → classify_clinical_department 重跑；
+   - cleaning_quality：helper_apply_audit_quality 按正文信号重新评估。
+2. 卡片字段（helper_backfill_card_fields）：从全文信号补 key_recommendations / scope / target_population / clinical_questions_pico。
+3. 派生同步（sync_derived=True 时）：写完 documents/cards/views 后再同步 sections 与 chunks。
+
+dry_run=True 时计算完整变更但不写文件，便于预览。"""
 
 from __future__ import annotations
 
@@ -41,20 +54,20 @@ from src.utils.metadata import (
 )
 
 
-VALID_DATE_RE = re.compile(r"^(20[1-2]\d)-\d{2}-\d{2}$")
-CJK_RE = re.compile(r"[\u4e00-\u9fff]")
-REFERENCE_START_RE = re.compile(r"(?im)^\s*#{0,6}\s*(references|bibliography|\u53c2\u8003\u6587\u732e)\b")
-TITLE_KEYWORD_RE = re.compile(
+VALID_DATE_RE = re.compile(r"^(20[1-2]\d)-\d{2}-\d{2}$")  # 合法 publication_date 格式：YYYY-MM-DD 且年份 2010-2029。
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")  # 中文字符判定，用于 expected_chinese 与文本编码失败检测。
+REFERENCE_START_RE = re.compile(r"(?im)^\s*#{0,6}\s*(references|bibliography|\u53c2\u8003\u6587\u732e)\b")  # 参考文献标题（references/bibliography/参考文献）起始，便于截取正文信号。
+TITLE_KEYWORD_RE = re.compile(  # 标题关键词（中英文），评分时加权：guideline/recommendation/指南/推荐 等。
     r"(guideline|guidelines|recommendation|recommendations|consensus|statement|practice parameter|"
     r"\u6307\u5357|\u5171\u8bc6|\u63a8\u8350|\u89c4\u8303|\u8bca\u7597|\u8bca\u6cbb|\u4e13\u5bb6\u5efa\u8bae)",
     re.I,
 )
-STRONG_TITLE_KEYWORD_RE = re.compile(
+STRONG_TITLE_KEYWORD_RE = re.compile(  # 强标题关键词：guideline/consensus/指南/共识/规范 等，更高分加成。
     r"(guideline|guidelines|consensus|statement|practice parameters?|"
     r"\u6307\u5357|\u5171\u8bc6|\u89c4\u8303|\u8bca\u7597|\u8bca\u6cbb|\u4e13\u5bb6\u5efa\u8bae)",
     re.I,
 )
-GENERIC_TITLE_RE = re.compile(
+GENERIC_TITLE_RE = re.compile(  # 通用噪声标题（untitled/contents/纯 hash 等），命中即扣分。
     r"^(?:"
     r"untitled|contents?|special articles?|guideline update|recommendations?|summary|executive summary|"
     r"practice guidelines?|clinical practice guidelines?|an official website.*|official websites use.*|"
@@ -62,55 +75,55 @@ GENERIC_TITLE_RE = re.compile(
     r")$",
     re.I,
 )
-SHORT_PUBLISHER_SUBTITLE_RE = re.compile(
+SHORT_PUBLISHER_SUBTITLE_RE = re.compile(  # 短发布机构副标题（如 American Academy ... Guideline），易被误识别为标题。
     r"^(?:an?\s+)?(?:american academy|american college|american association|european society|"
     r"national institute|world health organization).{0,90}(?:guideline|statement|report|consensus)$",
     re.I,
 )
-TITLE_NOISE_RE = re.compile(
+TITLE_NOISE_RE = re.compile(  # 标题里常见的 DOI / 卷期号 / URL 噪声模式，命中即降分。
     r"(?:doi\s*:|keywords?\s*:|copyright|accepted for publication|correspondence|"
     r"\bvol\.?\s*\d+|\bno\.?\s*\d+|https?://|www\.)",
     re.I,
 )
-BODY_SENTENCE_PREFIX_RE = re.compile(
+BODY_SENTENCE_PREFIX_RE = re.compile(  # 正文段起始词（introduction/methods/recommendations 等），用于阻断标题块搜索。
     r"^(?:introduction|methods?|recommendations?|purpose|findings|conclusions?|background|summary|abstract)\s*[:\uff1a]|"
     r"^(?:this document|the present document)\b",
     re.I,
 )
-ABSTRACT_PROSE_START_RE = re.compile(
+ABSTRACT_PROSE_START_RE = re.compile(  # 摘要/正文起首模式，标题块搜索遇此中断。
     r"^(?:a systematic|the purpose|the present document|this guideline|this clinical practice guideline|"
     r"this document|available data|methods?\s*:|introduction\s*:|recommendations?\s*:)",
     re.I,
 )
-AUTHOR_OR_AFFILIATION_RE = re.compile(
+AUTHOR_OR_AFFILIATION_RE = re.compile(  # 作者/单位特征（MD/PhD/university 等），用于判定标题区结束。
     r"(?:\b(?:MD|PhD|MS|MSc|MA|MPH|FRCP|RN|DO)\b|"
     r"\b(?:university|hospital|department|center|centre|school of medicine)\b|;)",
     re.I,
 )
-ABSTRACT_START_RE = re.compile(
+ABSTRACT_START_RE = re.compile(  # 摘要章节起始关键词（中英文），helper_find_anchored_abstract 用。
     r"^\s*(?:#{1,6}\s*)?(abstract|summary|executive summary|overview|background|objective|purpose|"
     r"recommendations?|conclusions?|\u6458\u8981|\u63d0\u8981)\s*[:\uff1a]?",
     re.I,
 )
-ABSTRACT_STOP_RE = re.compile(
+ABSTRACT_STOP_RE = re.compile(  # 摘要章节结束关键词（keywords/introduction 等），遇到停止收集。
     r"^\s*(?:#{1,6}\s*)?(keywords?|citation|contents?|introduction|references|bibliography|"
     r"\u5173\u952e\u8bcd|\u76ee\u5f55|\u5f15\u8a00|\u53c2\u8003\u6587\u732e)\b",
     re.I,
 )
-LOW_VALUE_ABSTRACT_RE = re.compile(r"^\s*(?:table|figure|\||doi\s*:|keywords?\s*:|https?://|www\.)", re.I)
-MOJIBAKE_MARKER_RE = re.compile(r"[锛绗鍗鏈鏉傚織圽穦碶€]")
-STRICT_QUESTION_LINE_RE = re.compile(
+LOW_VALUE_ABSTRACT_RE = re.compile(r"^\s*(?:table|figure|\||doi\s*:|keywords?\s*:|https?://|www\.)", re.I)  # 低价值摘要行（表格/figure/DOI 等），跳过。
+MOJIBAKE_MARKER_RE = re.compile(r"[锛绗鍗鏈鏉傚織圽穦碶€]")  # mojibake 标记字符集合，用于检测中文文档文本编码失败。
+STRICT_QUESTION_LINE_RE = re.compile(  # 严格 PICO 问题行匹配（clinical questions / 临床问题 等）。
     r"(\bPICO\b|\b(?:clinical|key|research)\s+questions?\b|^\s*(?:Q|Question)\s*\d+[:.)-]|"
     r"\u4e34\u5e8a\u95ee\u9898|\u5173\u952e\u95ee\u9898)",
     re.I,
 )
-STRICT_RECOMMENDATION_LINE_RE = re.compile(
+STRICT_RECOMMENDATION_LINE_RE = re.compile(  # 严格推荐行匹配（recommend / recommend not / 推荐 / 应当 等）。
     r"(recommendation\s*(?:statement|statements|\d+)?|we recommend|we suggest|strong recommendation|"
     r"conditional recommendation|is recommended|are recommended|not recommended|should(?:\s+not)?|"
     r"\u63a8\u8350|\u5efa\u8bae|\u4e0d\u63a8\u8350|\u4e0d\u5b9c|\u5e94\u8be5|\u5e94\u5f53|\u5e94\u4e88|\u5e94\u8003\u8651|\u4e0d\u5e94)",
     re.I,
 )
-CITATION_LIKE_RE = re.compile(
+CITATION_LIKE_RE = re.compile(  # 引用/期刊引用模式，避免把文献列表误判为推荐。
     r"(\[[Jj]\]|\b(?:doi|pmid)\b|(?:19|20)\d{2}\s*[,;]\s*\d+|"
     r"(?:19|20)\d{2}[^.\n]{0,80}:\s*\d+|"
     r"\b(?:Surg|Med|Clin|Journal|Neurosurgery|Pancreatology|Transpl|Hepatol|Lancet|JAMA|BMJ)\b.{0,80}(?:19|20)\d{2})",
@@ -119,24 +132,29 @@ CITATION_LIKE_RE = re.compile(
 
 
 def helper_split_flags(value: str | None) -> list[str]:
+    """把 cleaning_flags 字符串按 ',' 拆分为 list，自动去空白。"""
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
 def helper_valid_publication_date(value: str | None) -> bool:
+    """判定 publication_date 是否为合法 YYYY-MM-DD 格式。"""
     if not value or value == "unknown":
         return False
     return bool(VALID_DATE_RE.match(value))
 
 
 def helper_metadata_bool(metadata: dict[str, str], key: str) -> bool:
+    """读 front-matter 布尔字段（1/true/yes/y 视为 True）。"""
     return str(metadata.get(key, "")).strip().lower() in {"1", "true", "yes", "y"}
 
 
 def helper_weak_text(value: str | None, min_chars: int = 80) -> bool:
+    """判定文本是否过短（去空白后 < min_chars，默认 80）。"""
     return len(helper_normalize_space(value or "")) < min_chars
 
 
 def helper_is_generic_title(title: str) -> bool:
+    """通用标题判定：空白 / generic 模式 / 字母比 < 35% / is_suspicious_title。"""
     normalized = clean_title(title)
     if not normalized:
         return True
@@ -153,6 +171,7 @@ def helper_is_generic_title(title: str) -> bool:
 
 
 def helper_clean_title_candidate(line: str) -> str:
+    """清洗候选标题：去 Markdown 标题符 / 「Title:」前缀 / 截断 180 字符。"""
     line = re.sub(r"^\s*#{1,6}\s*", "", line or "").strip()
     line = re.sub(r"^\s*(?:title|题名)\s*[:\uff1a]\s*", "", line, flags=re.I)
     line = clean_title(line)
@@ -162,6 +181,7 @@ def helper_clean_title_candidate(line: str) -> str:
 
 
 def helper_first_alpha_is_lower(text: str) -> bool:
+    """判定首个字母是否小写（句子开头时不应作为标题候选）。"""
     for char in text:
         if char.isalpha():
             return char.isascii() and char.islower()
@@ -169,6 +189,7 @@ def helper_first_alpha_is_lower(text: str) -> bool:
 
 
 def helper_join_title_lines(lines: list[str]) -> str:
+    """把多行标题片段按行拼接，处理连字符断行。"""
     output = ""
     for line in lines:
         stripped = helper_clean_title_candidate(line)
@@ -184,6 +205,7 @@ def helper_join_title_lines(lines: list[str]) -> str:
 
 
 def helper_candidate_title_blocks(body: str) -> list[tuple[str, int]]:
+    """从文首 ≤600 行扫描候选标题块，按 STRONG_TITLE_KEYWORD 早停。"""
     # 候选标题只从文首有限区域提取，并过滤页眉、目录和正文句子等高风险噪声。
     raw_lines = body.splitlines()[:600]
     candidates: list[tuple[str, int]] = []
@@ -235,6 +257,7 @@ def helper_candidate_title_blocks(body: str) -> list[tuple[str, int]]:
 
 
 def helper_title_candidate_score(title: str, index: int) -> float:
+    """标题评分：位置 + 长度 + 关键词命中 + CJK 数 + 强关键词位置加权。"""
     # 标题评分组合位置、长度和结构信号，任何单一弱特征都不能独立决定结果。
     if not title or helper_is_generic_title(title) or TITLE_NOISE_RE.search(title):
         return -1000.0
@@ -267,6 +290,7 @@ def helper_title_candidate_score(title: str, index: int) -> float:
 
 
 def helper_find_better_title(body: str, source_file: str) -> str:
+    """综合候选标题与文件名标题，选最高分（>=55）的结果。"""
     candidates = helper_candidate_title_blocks(body)
     filename_title = clean_title_from_filename(source_file)
     if filename_title:
@@ -278,6 +302,7 @@ def helper_find_better_title(body: str, source_file: str) -> str:
 
 
 def helper_readable_ratio(text: str) -> float:
+    """可读字符占比（去空白后），用于摘要与正文质量判定。"""
     compact = re.sub(r"\s+", "", text or "")
     if not compact:
         return 0.0
@@ -286,6 +311,7 @@ def helper_readable_ratio(text: str) -> float:
 
 
 def helper_usable_abstract(text: str, max_chars: int = 1200) -> str:
+    """规范化摘要：截断 1200 + 最短长度 40 + 可读比 ≥0.55。"""
     abstract = helper_normalize_space(text or "")
     if len(abstract) > max_chars:
         abstract = abstract[:max_chars].rstrip()
@@ -297,6 +323,7 @@ def helper_usable_abstract(text: str, max_chars: int = 1200) -> str:
 
 
 def helper_find_anchored_abstract(body: str, max_chars: int = 1200) -> str:
+    """从摘要关键词起首的位置收集摘要，遇到 keywords/introduction 停止。"""
     lines: list[str] = []
     collecting = False
     for raw_line in body.splitlines():
@@ -322,6 +349,7 @@ def helper_find_anchored_abstract(body: str, max_chars: int = 1200) -> str:
 
 
 def helper_find_fallback_abstract(body: str, title: str, max_chars: int = 1200) -> str:
+    """从正文首部拿摘要（避开标题重复行），作为锚定方法的兜底。"""
     title_norm = helper_normalize_space(title).lower()
     lines: list[str] = []
     for raw_line in extract_abstract(body, max_chars=max_chars * 3).splitlines():
@@ -338,14 +366,17 @@ def helper_find_fallback_abstract(body: str, title: str, max_chars: int = 1200) 
 
 
 def helper_find_best_abstract(body: str, title: str) -> str:
+    """三段式取最佳摘要：锚定 → fallback → 标题兜底。"""
     return helper_find_anchored_abstract(body) or helper_find_fallback_abstract(body, title) or helper_usable_abstract(title, 400)
 
 
 def helper_infer_source(source_file: str, body: str) -> str:
+    """从文件名与正文推断来源机构（Unknown 时回退）。"""
     return extract_source_institution(source_file, body)
 
 
 def helper_looks_like_text_encoding_failure(metadata: dict[str, str], body: str) -> bool:
+    """中文文档正文却几乎无 CJK 字符时判为文本编码失败（OCR/PDF 抽取出错）。"""
     source_file = (metadata.get("source_file") or "").lower()
     title = metadata.get("title") or ""
     source = metadata.get("source_institution") or ""
@@ -365,6 +396,7 @@ def helper_looks_like_text_encoding_failure(metadata: dict[str, str], body: str)
 
 
 def helper_apply_audit_quality(metadata: dict[str, str], body: str) -> bool:
+    """重新评估 cleaning_quality 与 flags，合并编码失败标记。"""
     original_quality = metadata.get("cleaning_quality", "")
     original_flags = metadata.get("cleaning_flags", "")
     report = assess_cleaned_body(body)
@@ -384,11 +416,13 @@ def helper_apply_audit_quality(metadata: dict[str, str], body: str) -> bool:
 
 
 def helper_content_before_references(body: str) -> str:
+    """截取参考文献之前的正文，避免文献列表污染全文信号。"""
     match = REFERENCE_START_RE.search(body or "")
     return body[: match.start()] if match else body
 
 
 def helper_collect_full_text_signals(body: str) -> dict[str, list[str]]:
+    """收集 recommendation / question / scope / population 四类信号，超额截断。"""
     # 全文信号用于补充文档级元数据，但不得覆盖来源文件和显式 front matter。
     signals: dict[str, list[str]] = {"recommendation": [], "question": [], "scope": [], "population": []}
     limits = {"recommendation": 28, "question": 18, "scope": 16, "population": 14}
@@ -432,6 +466,7 @@ def helper_rebuild_card_text(card: dict[str, Any]) -> None:
 
 
 def helper_backfill_card_fields(card: dict[str, Any], body: str) -> set[str]:
+    """对弱 card 字段从全文信号补齐；保持已有高可信字段不变。"""
     # 只回填缺失或确定错误的卡片字段，并保持已有高可信信息不变。
     flags = set(helper_split_flags(card.get("cleaning_flags", "")))
     if card.get("cleaning_quality") == "poor" or "likely_text_encoding_failure" in flags:
@@ -463,6 +498,7 @@ def helper_backfill_card_fields(card: dict[str, Any], body: str) -> set[str]:
 
 
 def helper_card_view_text(card: dict[str, Any], view_type: str) -> str:
+    """按 view_type 从 card.fields 取对应文本。"""
     fields = card.get("fields") or {}
     if view_type == "recommendation_summary":
         return fields.get("key_recommendations", "")
@@ -566,6 +602,7 @@ def helper_sync_chunks(data_dir: Path, documents_by_id: dict[str, dict[str, Any]
 
 
 def helper_sync_derived_metadata(data_dir: Path, documents_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """sections 与 chunks 同步的合并入口。"""
     stats: dict[str, Any] = {}
     stats.update(helper_sync_sections(data_dir, documents_by_id))
     stats.update(helper_sync_chunks(data_dir, documents_by_id))

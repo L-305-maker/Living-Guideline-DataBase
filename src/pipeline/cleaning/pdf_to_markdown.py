@@ -1,4 +1,8 @@
-﻿"""PDF to Markdown entry points for the evidence-building pipeline.
+﻿# PDF → Markdown 的 evidence 流水线入口。
+#
+# 真实实现在 src.pipeline.cleaning.pdf_to_md.convert_all / convert_pdf，
+# 这里只做 alias，便于 src.pipeline.cleaning 对外暴露稳定接口。
+"""PDF to Markdown entry points for the evidence-building pipeline.
 
 This module keeps the src pipeline aligned with the implementation that is
 already exercised under src.pipeline.cleaning.pdf_to_md.
@@ -24,8 +28,14 @@ def convert_pdfs(
     document_kind: str = "guideline",
     append: bool = False,
 ) -> dict[str, Any]:
-    """Convert raw PDF files to front-matter Markdown and write a manifest."""
+    """把 raw_pdf_dir 中的 PDF 转成 front-matter Markdown，并写 manifest。
 
+    参数：
+    - ocr_mode="auto"：仅对扫描版 PDF 触发 OCR；"never" 跳过；"force" 全部强制 OCR
+    - ocr_languages：OCRmyPDF 的语言列表（默认 chi_sim+eng）
+    - document_kind：写入 front-matter 的 document_kind 字段
+    - append=True：保留既有 markdown_raw，仅追加新文档（用于增量重建）
+    """
     return _convert_all(
         raw_pdf_dir,
         markdown_raw_dir,
@@ -38,4 +48,5 @@ def convert_pdfs(
     )
 
 
+# 旧名兼容：convert_all 等价于 convert_pdfs。
 convert_all = convert_pdfs

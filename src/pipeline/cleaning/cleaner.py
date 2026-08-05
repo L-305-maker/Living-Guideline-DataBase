@@ -1,4 +1,12 @@
-﻿"""Loss-preserving Markdown cleanup."""
+﻿"""Loss-preserving Markdown cleanup.
+
+清洗目标（loss-preserving 强调『尽量保留原文，谨慎删除』）：
+- OCR 残留：控制字符、坏 glyph、私有 Unicode 区字符、空格化拉丁数字；
+- 结构噪声：页码标记 <!-- page: N -->、重复的页眉/页脚；
+- 元数据噪声：DOI / 邮箱 / 通信作者 / 期刊卷期号 / PII 等；
+- mojibake 检测：通过 signal_ratio / weird_ratio / 拼写碎片等指标识别，
+  触发条件后写入 pdf_text_mojibake flag，并补 metadata 提示后续需要 OCR。
+"""
 
 from __future__ import annotations
 
@@ -19,46 +27,46 @@ from src.utils.io import DATA_DIR, ensure_dir, iter_markdown_files
 from src.utils.metadata import extract_abstract
 
 
-PAGE_RE = re.compile(r"^\s*<!--\s*page:\s*\d+\s*-->\s*$", re.I)
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-BAD_GLYPHS_RE = re.compile(r"[\ufffd\u25a0\u25a1\u25aa]")
-PRIVATE_USE_RE = re.compile(r"[\ue000-\uf8ff\U000f0000-\U000ffffd\U00100000-\U0010fffd]")
-WEIRD_TEXT_LAYER_RE = re.compile(r"[\x7f-\x9f\u00ac\u00ae\u00af\u00b1\u00b4-\u00b6\u00b8\u00bc-\u00be\u0370-\u03ff]")
-HEADING_RE = re.compile(r"^#{1,6}\s+", re.M)
-CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff]")
-CJK_TERMINAL_RE = re.compile(r"[。！？!?；;：:]$")
-REFERENCE_HEADING_RE = re.compile(r"^(#{1,6}\s+)(references|bibliography|\u53c2\u8003\u6587\u732e)\b", re.I | re.M)
-SPACED_ALNUM_RUN_RE = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]\s+){3,}[A-Za-z0-9](?![A-Za-z0-9])")
+PAGE_RE = re.compile(r"^\s*<!--\s*page:\s*\d+\s*-->\s*$", re.I)  # 页面标记 <!-- page: N -->，用于页眉/页脚去重与清洗。
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # 控制字符（U+0000-U+001F，除 \n \r \t），直接删除。
+BAD_GLYPHS_RE = re.compile(r"[\ufffd\u25a0\u25a1\u25aa]")  # 明显的乱码占位字符：\uFFFD 替换符、方块占位符等。
+PRIVATE_USE_RE = re.compile(r"[\ue000-\uf8ff\U000f0000-\U000ffffd\U00100000-\U0010fffd]")  # Unicode 私有区字符（PUA），常因字体缺失产生，全部删除。
+WEIRD_TEXT_LAYER_RE = re.compile(r"[\x7f-\x9f\u00ac\u00ae\u00af\u00b1\u00b4-\u00b6\u00b8\u00bc-\u00be\u0370-\u03ff]")  # PDF 文本层偶发的非 ASCII Latin 字符与希腊字母，可能是 mojibake 信号。
+HEADING_RE = re.compile(r"^#{1,6}\s+", re.M)  # Markdown 标题前缀（行首的 1-6 个 #）。
+CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff]")  # 中文字符范围（含平假名/片假名），用于中英文段判定。
+CJK_TERMINAL_RE = re.compile(r"[。！？!?；;：:]$")  # 中文/英文句末标点，决定 CJK 行是否需要继续合并。
+REFERENCE_HEADING_RE = re.compile(r"^(#{1,6}\s+)(references|bibliography|\u53c2\u8003\u6587\u732e)\b", re.I | re.M)  # 参考文献标题（references/bibliography/参考文献），用于插入标记。
+SPACED_ALNUM_RUN_RE = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]\s+){3,}[A-Za-z0-9](?![A-Za-z0-9])")  # 被空格拆散的拉丁数字连续串，OCR 常见错误，尝试合并。
 MOJIBAKE_MARKER_CHARS = set("摇揖铱鄄臆茁冶誗ꎬꎻꎮ")
-FORM_WORD_RE = re.compile(r"\b(?:date|time|name|notes?|score|pain|headache|medication|yes|no)\b", re.I)
-REPEATED_BLANK_RE = re.compile(r"_{3,}")
-JOURNAL_HEADER_RE = re.compile(
+FORM_WORD_RE = re.compile(r"\b(?:date|time|name|notes?|score|pain|headache|medication|yes|no)\b", re.I)  # 表单常见词（date/name/score/pain 等），用于识别 PDF 表单残留。
+REPEATED_BLANK_RE = re.compile(r"_{3,}")  # 连续下划线（___+），识别为表单填空符。
+JOURNAL_HEADER_RE = re.compile(  # 期刊卷期号页眉（如『中华医学杂志 第 30 卷 第 5 期』）。
     r"(?:中华.{0,24}杂志.{0,120}(?:第\s*\d+\s*卷|Vol\.?\s*\d+).{0,80}(?:第\s*\d+\s*期|No\.?\s*\d+))|"
     r"(?:(?:Chinese\s*Journal|Chin\s*J|中华).{0,120}(?:Vol\.?\s*\d+|No\.?\s*\d+))",
     re.I,
 )
-DOI_RE = re.compile(
+DOI_RE = re.compile(  # DOI 字符串（含多种 URL 形式），删除避免出现在正文。
     r"(?:https?://)?(?:dx\.)?doi\.org/\S+|"
     r"https?://(?:dx\.)?doi\.\S*|"
     r"\bdoi\b\s*[:：]?\s*(?:10\.\d{4,9}/\S+)?",
     re.I,
 )
-PII_RE = re.compile(r"\bpii\s*[:：]\s*\S+", re.I)
-EMAIL_ADDRESS_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=\d|[^A-Z0-9]|$)", re.I)
-CONTACT_LINE_RE = re.compile(
+PII_RE = re.compile(r"\bpii\s*[:：]\s*\S+", re.I)  # PII 编号（出版商内部编号），类似 DOI 处理。
+EMAIL_ADDRESS_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=\d|[^A-Z0-9]|$)", re.I)  # 邮箱地址，删除避免 PII 泄漏。
+CONTACT_LINE_RE = re.compile(  # 通信作者行（Address correspondence to ...），整行删除。
     r"^\s*(?:Address\s+correspondence\s+to|Correspondence\s+to|Corresponding\s+author|For\s+correspondence\b|Contact\s*:).{0,300}$",
     re.I,
 )
-INLINE_NOISE_RE = re.compile(
+INLINE_NOISE_RE = re.compile(  # 行内噪声（DOI/邮箱/通信作者等），按出现位置截断。
     r"(?:DOI|doi)\s*[:：]\s*\S+|"
     r"(?:E[-￣\s]*mail|Email)\s*[:：]\s*\S+|"
     r"(?:共同)?(?:通信|通讯|第一)作者\s*[:：][^。；;\n]{0,160}|"
     r"(?:Co[-\s]*(?:first|corresponding)\s+author)\s*[:：][^.;\n]{0,180}",
     re.I,
 )
-ABSTRACT_MARKER_RE = re.compile(r"(【\s*(?:提要|摘要)\s*】|(?:摘要|提要|Abstract)\s*[:：])", re.I)
-NOISY_LINE_RE = re.compile(r"^[\d\s!！?？|/\\.,;:：；()（）\\-—_+=*'\"`~<>A-Za-z]{8,}$")
-LATIN_OR_NUMBER_TOKEN_RE = re.compile(r"[A-Za-z]+|\d+")
+ABSTRACT_MARKER_RE = re.compile(r"(【\s*(?:提要|摘要)\s*】|(?:摘要|提要|Abstract)\s*[:：])", re.I)  # 摘要/提要标记（【摘要】 / Abstract:），保留正文。
+NOISY_LINE_RE = re.compile(r"^[\d\s!！?？|/\\.,;:：；()（）\\-—_+=*'\"`~<>A-Za-z]{8,}$")  # 纯符号/数字/标点的『乱码行』模式，启发式判定。
+LATIN_OR_NUMBER_TOKEN_RE = re.compile(r"[A-Za-z]+|\d+")  # 拉丁字母或数字 token，文本信号统计用。
 OCR_PUNCT_TRANSLATION = str.maketrans(
     {
         "ꎬ": "，",
@@ -219,6 +227,7 @@ def helper_metadata_flags(metadata: dict[str, Any]) -> list[str]:
 
 
 def helper_add_metadata_flag(metadata: dict[str, Any], flag: str) -> None:
+    """向 cleaning_flags 追加单个 flag（去重）。"""
     flags = helper_metadata_flags(metadata)
     if flag not in flags:
         flags.append(flag)
@@ -335,6 +344,7 @@ def helper_mark_references(body: str) -> str:
 
 
 def assess_cleaned_body(body: str) -> dict[str, Any]:
+    """评估清洗后的正文质量，返回 quality（ok/warning/poor）+ flags + signal_ratio。"""
     stats = helper_text_signal_stats(body)
     visible_count = int(stats["visible"])
     cjk = int(stats["cjk"])
@@ -381,6 +391,7 @@ def assess_cleaned_body(body: str) -> dict[str, Any]:
 
 
 def helper_apply_quality_metadata(metadata: dict[str, str], body: str) -> None:
+    """根据正文评估把 cleaning_quality / cleaning_flags / OCR 提示写入 front-matter。"""
     report = assess_cleaned_body(body)
     flags = helper_metadata_flags(metadata) + list(report["flags"])
     if helper_is_noisy_title(metadata.get("title", "")):
@@ -519,6 +530,7 @@ def clean_file(raw_path: str | Path, output_dir: str | Path = DATA_DIR / "markdo
 
 
 def helper_raw_metadata(path: Path) -> dict[str, Any]:
+    """读取 front-matter 元数据（仅解析，不读 body）。"""
     metadata, _body = parse_front_matter(path.read_text(encoding="utf-8", errors="replace"))
     return metadata
 
@@ -614,6 +626,7 @@ def clean_all(
 
 
 def main() -> None:
+    """CLI 入口：python -m src.pipeline.cleaning.cleaner。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", default=str(DATA_DIR / "markdown_raw"))
     parser.add_argument("--output-dir", default=str(DATA_DIR / "markdown_clean"))

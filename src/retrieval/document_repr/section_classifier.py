@@ -1,3 +1,11 @@
+# 章节与 chunk 的启发式分类器。
+#
+# 设计原则：
+# - SECTION_PATTERNS：每类（recommendation / scope_population / pico / evidence ...）一组中英文关键词；
+# - CHUNK_TYPE_WEIGHTS：分类后的权重表，recommendation=1.55 最高、reference=0.10 最低；
+# - classify_section 优先按 heading 文本判定（reference 标题最优先），再按 haystack 内容。
+#
+# 重要：分类器仅做粗粒度启发式，最终的精确分类仍由 LLM 抽取或人工 review 兜底。
 """Heuristic section and chunk classification for guideline search signals."""
 
 from __future__ import annotations
@@ -6,6 +14,8 @@ import re
 from typing import Iterable
 
 
+# 按"优先级"排序的章节类型分类规则（recommendation 最先匹配，因为其关键词最具体）。
+# 编译正则时统一 re.I（不区分大小写），中英文一起。
 SECTION_PATTERNS: dict[str, re.Pattern[str]] = {
     "recommendation": re.compile(
         r"(recommendation|recommendations|we recommend|we suggest|should be|is recommended|"
@@ -29,10 +39,13 @@ SECTION_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
     "table": re.compile(r"(\btable\b|\bfig(?:ure)?\b|\balgorithm\b|\u8868\s*\d*|\u56fe\s*\d*|\u6d41\u7a0b)", re.I),
     "conclusion": re.compile(r"(conclusion|summary|take-home|key points|\u7ed3\u8bba|\u603b\u7ed3|\u8981\u70b9)", re.I),
-    "background": re.compile(r"(background|introduction|epidemiology|\u80cc\u666f|\u524d\u8a00|\u5f15\u8a00)", re.I),
+    "background": re.compile(r"(background|introduction|epidemiology|\u80cc\u666f|\u524d\u8a8b|\u5f15\u8a00)", re.I),
     "reference": re.compile(r"^(references|bibliography|\u53c2\u8003\u6587\u732e)$", re.I),
 }
 
+
+# chunk_type 在 reranker / retrieval 阶段会作为加权因子使用。
+# 数值经验值：recommendation/table 是检索强信号，reference 应大幅降权。
 CHUNK_TYPE_WEIGHTS: dict[str, float] = {
     "recommendation": 1.55,
     "table": 1.35,
@@ -47,12 +60,20 @@ CHUNK_TYPE_WEIGHTS: dict[str, float] = {
 
 
 def helper_join_path(section_path: Iterable[object] | None) -> str:
+    """把 section_path（list/None）拼成空格分隔字符串，便于做关键词匹配。"""
     return " ".join(str(item) for item in (section_path or []) if item is not None)
 
 
 def classify_section(heading: str = "", section_path: Iterable[object] | None = None, content: str = "") -> str:
-    """Return the highest-value semantic type for a section."""
+    """Return the highest-value semantic type for a section.
 
+    决策流程：
+    1. heading 文本若匹配 reference 模式（"参考文献"/"references" 等）→ 直接返回 reference；
+    2. 按 SECTION_PATTERNS 顺序扫描，取首个命中类型（recommendation 最优先）；
+    3. 全部未命中 → "other"。
+
+    关键：使用 SECTION_PATTERNS 顺序而非分数，避免同一 section 同时匹配多个类型。
+    """
     path_text = helper_join_path(section_path)
     heading_text = heading or path_text
     haystack = f"{heading_text}\n{path_text}\n{content[:1200]}"
@@ -74,8 +95,13 @@ def classify_section(heading: str = "", section_path: Iterable[object] | None = 
 
 
 def classify_chunk(chunk: dict[str, object]) -> str:
-    """Classify an existing chunk record using section path and content."""
+    """对已存在的 chunk 记录返回 chunk_type。
 
+    优先级：
+    1. 已有非空 chunk_type → 原样返回（避免重复分类浪费）；
+    2. is_reference_section=True → "reference"；
+    3. 用 section_path 最后一项作为 heading，调 classify_section 重分类。
+    """
     chunk_type = str(chunk.get("chunk_type") or "").strip()
     if chunk_type:
         return chunk_type
@@ -89,4 +115,5 @@ def classify_chunk(chunk: dict[str, object]) -> str:
 
 
 def chunk_type_weight(chunk_type: str) -> float:
+    """返回 chunk_type 对应的权重；未知类型回退到 "other" 的权重。"""
     return CHUNK_TYPE_WEIGHTS.get(chunk_type, CHUNK_TYPE_WEIGHTS["other"])

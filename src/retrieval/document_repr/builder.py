@@ -1,4 +1,16 @@
-"""Build document cards and document views from clean Markdown guidelines."""
+"""从 clean Markdown 构造 document card 与多视图 document views。
+
+主要入口：
+- build_document_card(markdown, path)：从单篇 Markdown 构造 card（多字段聚合）；
+- build_document_views(card)：从 card 派生 7 类 view（title_abstract / scope_population / ...）；
+- build_document_representations(clean_dir, output_dir)：批量入口（扫整个 markdown_clean 目录）。
+- compact_document_card / compact_document_view：投影到固定字段集，避免 JSONL 体积膨胀。
+
+设计原则：
+- card 是『单文档多字段聚合』，view 是『单文档单检索意图』；
+- VIEW_PRIORITIES 控制 view 在排序时的权重（recommendation=1.35 最高，heading_tree=0.8 最低）；
+- 启发式信号提取：recommendation / pico / scope / population / table 各自独立配额池，避免某一类吞掉所有信号。
+"""
 
 from __future__ import annotations
 
@@ -17,7 +29,7 @@ from src.utils.metadata import extract_abstract
 from src.utils.text import normalize_space as helper_normalize_space
 
 
-VIEW_TYPES = [
+VIEW_TYPES = [  # 7 类 view 类型枚举，控制 build_document_views 派生顺序。
     "title_abstract",
     "scope_population",
     "recommendation_summary",
@@ -27,7 +39,7 @@ VIEW_TYPES = [
     "conclusion",
 ]
 
-VIEW_PRIORITIES = {
+VIEW_PRIORITIES = {  # view_type -> priority 映射，用于 RRF / 排序阶段加权。
     "title_abstract": 1.0,
     "scope_population": 1.15,
     "recommendation_summary": 1.35,
@@ -37,51 +49,51 @@ VIEW_PRIORITIES = {
     "conclusion": 0.85,
 }
 
-TABLE_LINE_RE = re.compile(r"^\s*(?:\|.*\||(?:table|fig(?:ure)?|algorithm)\s+\d*[:.\s].*|\u8868\s*\d*[:：.\s].*)", re.I)
-TABLE_CAPTION_RE = re.compile(
+TABLE_LINE_RE = re.compile(r"^\s*(?:\|.*\||(?:table|fig(?:ure)?|algorithm)\s+\d*[:.\s].*|\u8868\s*\d*[:：.\s].*)", re.I)  # 表格行识别：含 '|' 或 Table/Fig/Algorithm 标题前缀。
+TABLE_CAPTION_RE = re.compile(  # 表格标题行（Table N: / 表 N：），优先于普通行选取。
     r"^\s*(?:table|fig(?:ure)?|algorithm)\s*\d*[A-Za-z]?\s*[:.\-–]\s+.+|"
     r"^\s*\u8868\s*\d*[A-Za-z]?\s*[:：.\-–\s].+",
     re.I,
 )
-PICO_LINE_RE = re.compile(r"(\bPICO\b|clinical question|key question|\u4e34\u5e8a\u95ee\u9898|\u5173\u952e\u95ee\u9898)", re.I)
-QUESTION_LINE_RE = re.compile(
+PICO_LINE_RE = re.compile(r"(\bPICO\b|clinical question|key question|\u4e34\u5e8a\u95ee\u9898|\u5173\u952e\u95ee\u9898)", re.I)  # PICO 关键词行（中英文）。
+QUESTION_LINE_RE = re.compile(  # 更宽松的问题行（含 ?、？、Q1 等）。
     r"(\b(?:clinical|key|research)\s+question\b|\bPICO\b|^\s*Q\d+[:.)-]|\?|？|"
     r"\u4e34\u5e8a\u95ee\u9898|\u5173\u952e\u95ee\u9898)",
     re.I,
 )
-RECOMMENDATION_LINE_RE = re.compile(
+RECOMMENDATION_LINE_RE = re.compile(  # 推荐行：recommend/should/推荐/应该 等，覆盖强信号。
     r"(recommend(?:ation|ed)?|we recommend|we suggest|suggests?\s+against|should(?:\s+not)?|must|"
     r"is recommended|are recommended|is indicated|are indicated|not routinely indicated|"
     r"may be used|may be offered|avoid|offer|standard|option|"
     r"\u63a8\u8350|\u5efa\u8bae|\u5e94\u8be5|\u5b9c)",
     re.I,
 )
-SCOPE_LINE_RE = re.compile(
+SCOPE_LINE_RE = re.compile(  # 范围/适用关键词。
     r"(scope|population|target population|intended audience|applicability|eligible|eligibility|indication|"
     r"\u8303\u56f4|\u9002\u7528|\u4eba\u7fa4|\u76ee\u6807\u4eba\u7fa4|\u9002\u7528\u5bf9\u8c61)",
     re.I,
 )
-POPULATION_LINE_RE = re.compile(
+POPULATION_LINE_RE = re.compile(  # 人群词：成人/儿童/pregnant/adult 等。
     r"\b(?:adult|adults|children|child|pediatric|paediatric|infant|infants|adolescent|adolescents|"
     r"patient|patients|pregnan(?:t|cy)|elderly|older adults?)\b|"
     r"(成人|儿童|患儿|患者|婴幼儿|青少年|孕妇|妊娠|老年)",
     re.I,
 )
-ABSTRACT_START_RE = re.compile(
+ABSTRACT_START_RE = re.compile(  # 摘要/背景/方法/推荐等摘要起首关键词。
     r"^\s*(abstract|summary|background|objective|purpose|methods?|recommendations?|conclusions?)\s*[:：]",
     re.I,
 )
-ABSTRACT_STOP_RE = re.compile(r"^\s*(keywords?|citation|1(?:\.0)?\s+introduction|introduction|references)\b", re.I)
-LOW_VALUE_LINE_RE = re.compile(
+ABSTRACT_STOP_RE = re.compile(r"^\s*(keywords?|citation|1(?:\.0)?\s+introduction|introduction|references)\b", re.I)  # 摘要停关键词：keywords/introduction/1.0 introduction。
+LOW_VALUE_LINE_RE = re.compile(  # 低价值行：页码 / DOI / URL / 利益冲突等。
     r"^\s*(?:<!--\s*page:|page\s+\d+\b|keywords?\s*:|citation\s*:|doi\s*:|https?://|www\.|"
     r"submitted for publication|accepted for publication|copyright|conflict of interest|none were declared)\b",
     re.I,
 )
-SPACED_OCR_RE = re.compile(r"(?:[A-Za-zＡ-Ｚａ-ｚ０-９]\s+){12,}")
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;。！？；])\s+")
+SPACED_OCR_RE = re.compile(r"(?:[A-Za-zＡ-Ｚａ-ｚ０-９]\s+){12,}")  # 超长被空格拆散的 token（OCR 常见错误），用于判定不可用行。
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;。！？；])\s+")  # 按句末标点切句。
 
 
-CARD_OUTPUT_FIELDS = (
+CARD_OUTPUT_FIELDS = (  # document_cards.jsonl 写入字段集（最小契约）。
     "doc_id",
     "title",
     "publication_date",
@@ -90,7 +102,7 @@ CARD_OUTPUT_FIELDS = (
     "document_kind",
     "card_text",
 )
-VIEW_OUTPUT_FIELDS = (
+VIEW_OUTPUT_FIELDS = (  # document_views.jsonl 写入字段集（含 view_id / priority）。
     "view_id",
     "doc_id",
     "view_type",

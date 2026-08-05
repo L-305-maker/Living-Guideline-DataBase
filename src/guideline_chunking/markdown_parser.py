@@ -1,3 +1,10 @@
+# Markdown block 解析器：保留 heading_path / page / char span 等溯源字段。
+#
+# 关键设计：
+# - 逐行扫描，状态机：维持 heading_stack、current_page、pending 三组状态；
+# - 页码标记（<!-- page: N -->）单独 flush pending 后只更新 current_page；
+# - 标题层级维护：截断到当前 level-1 父路径再追加，避免 heading_stack 越积越长；
+# - 表格与普通段落必须分块：pending_is_table 标志在跨类型时强制 flush。
 """Markdown block parser with heading path, page, and char span retention."""
 
 from __future__ import annotations
@@ -9,11 +16,23 @@ from src.guideline_chunking.block_classifier import classify_block_type
 from src.guideline_chunking.models import DocumentMeta, ParsedBlock
 
 
+# 标题识别：1-5 个 # + 标题文本（不支持 6 级，与上游约定一致）
 HEADING_RE = re.compile(r"^(#{1,5})\s+(.+?)\s*$")
+# 页码标记：HTML 注释、方括号包裹、裸 page 三种写法兼容
 PAGE_RE = re.compile(r"(?:<!--\s*page:\s*(\d+)\s*-->|^\[page\s+(\d+)\]$|^page\s+(\d+)$)", re.I)
 
 
 def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBlock]:
+    """把 Markdown 文本解析为 ParsedBlock 列表，每个 block 携带完整溯源字段。
+
+    流程：
+    1. 维护 heading_stack（当前 heading 层级）和 current_page（最近的页码）；
+    2. 遇到标题：flush 旧 pending，按 level 截断 heading_stack 父路径，追加新标题作为 block；
+    3. 遇到页码标记：flush 旧 pending，更新 current_page；
+    4. 遇到空行：flush pending；
+    5. 其它行：append 到 pending；表格与普通段落在跨类型时强制 flush；
+    6. 文档结束 flush 最后一段 pending。
+    """
     blocks: list[ParsedBlock] = []
     heading_stack: list[str] = []
     current_page: int | None = None
@@ -110,6 +129,7 @@ def parse_markdown_document(md_text: str, meta: DocumentMeta) -> list[ParsedBloc
 
 
 def helper_page_span(text: str, fallback: int | None) -> tuple[int | None, int | None]:
+    """从 text 中提取页码标记的最小 / 最大值；无标记时回退 fallback。"""
     pages = [int(group) for match in PAGE_RE.finditer(text or "") for group in match.groups() if group]
     if pages:
         return min(pages), max(pages)
@@ -117,4 +137,5 @@ def helper_page_span(text: str, fallback: int | None) -> tuple[int | None, int |
 
 
 def helper_meta_payload(meta: DocumentMeta) -> dict[str, str | None]:
+    """把 DocumentMeta 转为 dict 作为 ParsedBlock.metadata，便于序列化。"""
     return asdict(meta)

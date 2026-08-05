@@ -1,3 +1,11 @@
+# MCP 工具调用的 JSONL 审计日志。
+#
+# 关键设计：
+# - 每条调用追加 1 行 JSON 到 logs/mcp_calls.jsonl（含 call_id / timestamp / tool / payload / result / duration）；
+# - 敏感字段（password / token / api_key 等）写入前替换为 '***'；
+# - 字符串按 MCP_CALL_LOG_MAX_*_STRING_CHARS 截断，列表按 *_LIST_ITEMS 截断；
+# - result_mode = summary / full / none：full 写 result 全量，summary 只写 result_summary，none 不写 result；
+# - 业务异常必须原样重新抛出，审计写入失败不能中断主调用链路。
 """JSONL call logging for MCP tool invocations."""
 
 from __future__ import annotations
@@ -9,6 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
+
 from src.mcp.server_common import (
     env_bool as helper_env_bool,
     env_int as helper_env_int,
@@ -17,16 +26,18 @@ from src.mcp.server_common import (
 
 ResultT = TypeVar("ResultT")
 
+# 写入审计前会被替换为 '***' 的敏感字段名（lowercase 比较）。
 SENSITIVE_KEYS = {"password", "passwd", "secret", "token", "api_key", "apikey", "authorization"}
+
+# 默认日志截断阈值；可被同名环境变量覆盖（payload/result 各一套）。
 DEFAULT_MAX_STRING_CHARS = 700
 DEFAULT_MAX_RESULT_STRING_CHARS = 8000
 DEFAULT_MAX_LIST_ITEMS = 20
 DEFAULT_MAX_RESULT_LIST_ITEMS = 50
 
 
-
-
 def helper_env_int_from(names: list[str], default: int) -> int:
+    """按顺序尝试读多个环境变量名，第一个非 None 即返回其 int 值。"""
     for name in names:
         if os.environ.get(name) is not None:
             return helper_env_int(name, default)
@@ -34,6 +45,7 @@ def helper_env_int_from(names: list[str], default: int) -> int:
 
 
 def helper_log_path() -> Path:
+    """计算审计日志路径：MCP_CALL_LOG_PATH > RAG_DATA_DIR/logs/mcp_calls.jsonl。"""
     configured = os.environ.get("MCP_CALL_LOG_PATH")
     if configured:
         return Path(configured)
@@ -42,6 +54,10 @@ def helper_log_path() -> Path:
 
 
 def helper_truncate_string(value: str, limit: int, compact: bool = False) -> str:
+    """字符串截断 + 标记省略长度（limit ≤ 0 时不截断）。
+
+    compact=True 时先压缩连续空白（避免行内换行被算字符）。
+    """
     if compact:
         value = " ".join(value.split())
     if limit <= 0:
@@ -54,6 +70,7 @@ def helper_truncate_string(value: str, limit: int, compact: bool = False) -> str
 
 
 def helper_sanitize(value: Any, max_string_chars: int, max_list_items: int, compact_strings: bool) -> Any:
+    """递归脱敏 + 截断：dict 跳过敏感键、list 限制长度、str 截断、其它 str() 后截断。"""
     if isinstance(value, dict):
         sanitized: dict[str, Any] = {}
         for key, item in value.items():
@@ -78,6 +95,7 @@ def helper_sanitize(value: Any, max_string_chars: int, max_list_items: int, comp
 
 
 def helper_result_summary(result: Any, max_list_items: int) -> dict[str, Any]:
+    """构造 result 的轻量摘要（避免在 result_mode=summary 时写全量）。"""
     if isinstance(result, list):
         ids = []
         for item in result[:max_list_items]:
@@ -99,6 +117,7 @@ def helper_result_summary(result: Any, max_list_items: int) -> dict[str, Any]:
 
 
 def helper_write_record(record: dict[str, Any]) -> None:
+    """追加一条 JSONL 审计记录；写盘失败必须 silently 吞掉（不影响主调用）。"""
     if not helper_env_bool("MCP_CALL_LOG_ENABLED", True):
         return
     try:
@@ -112,9 +131,14 @@ def helper_write_record(record: dict[str, Any]) -> None:
 
 
 def log_mcp_call(tool_name: str, backend: str, payload: dict[str, Any], call: Callable[[], ResultT]) -> ResultT:
-    """Execute an MCP tool call and append one JSONL audit record."""
-    # 参数与结果分别脱敏和截断；业务异常写入审计记录后必须原样重新抛出。
+    """执行 MCP 工具调用并追加 1 条 JSONL 审计记录。
 
+    行为：
+    - 自动加 call_id (uuid4) / timestamp (UTC) / duration_ms 等元字段；
+    - payload 与 result 都经 helper_sanitize 脱敏 + 截断；
+    - result_mode ∈ {full, summary, summary_only, none, off}：full 写 result；summary/ summary_only 写 result_summary；none/ off 不写 result；
+    - 业务异常会被记录（status=error, error_type, error）后原样 re-raise，不吞错。
+    """
     payload_max_string_chars = helper_env_int_from(
         ["MCP_CALL_LOG_MAX_PAYLOAD_STRING_CHARS", "MCP_CALL_LOG_MAX_STRING_CHARS"],
         DEFAULT_MAX_STRING_CHARS,

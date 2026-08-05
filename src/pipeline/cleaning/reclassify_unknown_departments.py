@@ -1,3 +1,8 @@
+# 谨慎地把当前仍标为未分类（clinical_department == "未分类"）的文档重新归类。
+#
+# 设计动机：clinical_department 通常由 doc 级规则引擎给出，但部分文档因标题歧义
+# 或 front-matter 缺失被默认到"未分类"；本模块基于"标题高精度信号"做二次归类。
+# 仅以标题为信号、避免引入摘要正文扩大科室范围（摘要常常跨学科），保证保守。
 """Conservatively reclassify documents whose department is still unknown."""
 
 from __future__ import annotations
@@ -15,6 +20,8 @@ from src.utils.front_matter import dump_front_matter, parse_front_matter
 from src.utils.io import DATA_DIR, read_jsonl
 
 
+# 科室 → 正则；flags=IGNORECASE。中英文双语词表，便于中文指南 + 英文文献兼容。
+# 顺序：高频科室在前；正则宁可漏掉也不要误伤（保守策略的代价是覆盖率）。
 RULES: tuple[tuple[str, str], ...] = (
     ("肿瘤科", r"癌|肿瘤|胶质瘤|转移瘤|间质瘤|carcinoma|cancer|malignan|neoplasm|tumo(?:u)?r|metastasi"),
     ("呼吸内科", r"呼吸|肺炎|肺功能|慢性阻塞性肺|哮喘|支气管|pulmonary|pneumonia|asthma|\bcopd\b|chronic obstructive|lung disease"),
@@ -59,7 +66,10 @@ RULES: tuple[tuple[str, str], ...] = (
     ("检验科", r"临床检验|实验室医学|laboratory medicine|clinical laboratory"),
 )
 
+# 预编译所有正则：避免每次 classify 都重编译，单条记录成本可忽略但大批量很可观。
 COMPILED_RULES = tuple((department, re.compile(pattern, re.IGNORECASE)) for department, pattern in RULES)
+
+# 排除掉明显不是指南标题的"杂项"：图表、FAQ、勘误等，避免误命中规则。
 ARTIFACT_TITLE = re.compile(
     r"^(?:figures?|tables?(?:\s+\d.*)?|frequently asked questions|faq|coming soon|loading|"
     r"position statement|resumen|whereas.*|measure scoring sheet|pdsa worksheet.*|"
@@ -69,17 +79,29 @@ ARTIFACT_TITLE = re.compile(
 
 
 def identify_departments(title: str) -> tuple[list[str], str]:
-    """仅依据标题中的高精度信号重新分类，避免摘要中的跨科室描述扩大标签。"""
+    """仅依据标题高精度信号归类，避免摘要中跨学科描述扩大标签。
 
+    返回 (按规则命中的去重科室列表, 命中原因)。
+    原因：
+    - "title_rule"：至少命中一条规则
+    - "artifact_or_generic_title"：标题属于排除词（图表/FAQ 等）
+    - "no_precise_signal"：标题正常但无规则命中
+    """
     normalized_title = unicodedata.normalize("NFKC", title or "").strip()
     if not normalized_title or ARTIFACT_TITLE.fullmatch(normalized_title):
         return [], "artifact_or_generic_title"
     text = normalized_title
+    # dict.fromkeys 保序去重：保留 RULES 中定义的优先级（高频科室在前）。
     labels = [department for department, pattern in COMPILED_RULES if pattern.search(text)]
     return list(dict.fromkeys(labels)), "title_rule" if labels else "no_precise_signal"
 
 
 def rewrite_jsonl(path: Path, updates: dict[str, list[str]]) -> int:
+    """原地重写 JSONL，按 doc_id 更新 clinical_departments 字段。
+
+    返回实际改写的行数；其它行原样写回。
+    失败时 unlink 临时文件保留原文件。
+    """
     if not path.exists():
         return 0
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -97,6 +119,7 @@ def rewrite_jsonl(path: Path, updates: dict[str, list[str]]) -> int:
                 if labels:
                     record["clinical_departments"] = labels
                     record["clinical_department"] = labels[0]
+                    # 多个科室时记为 compositive（composite scope）；单科为 single。
                     record["department_scope"] = "compositive" if len(labels) > 1 else "single"
                     changed += 1
                 target.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -108,6 +131,10 @@ def rewrite_jsonl(path: Path, updates: dict[str, list[str]]) -> int:
 
 
 def rewrite_markdown(paths: set[Path], updates: dict[str, list[str]]) -> int:
+    """同步修改 Markdown front-matter 中的科室字段。
+
+    仅处理文档级 front-matter，不动正文；保证与 JSONL manifest 保持一致。
+    """
     changed = 0
     for path in sorted(paths):
         if not path.exists():
@@ -125,7 +152,13 @@ def rewrite_markdown(paths: set[Path], updates: dict[str, list[str]]) -> int:
 
 
 def reclassify_unknown(data_dir: str | Path = DATA_DIR, apply: bool = False) -> dict[str, Any]:
-    # 默认只生成审查报告；仅在 apply 明确开启时同步改写文档和派生产物。
+    """识别当前仍为"未分类"的文档，按标题规则给出建议科室。
+
+    关键安全：
+    - 默认 dry-run（apply=False），仅生成 reports/unknown_department_reclassification.jsonl；
+    - apply=True 时才同步改 documents.jsonl / documents_raw.jsonl 与对应 Markdown；
+    - 输出统计：unknown_before / identified / unresolved / multi_department / 分布等。
+    """
     data_path = Path(data_dir)
     documents_path = data_path / "documents.jsonl"
     unknown: list[dict[str, Any]] = []
@@ -147,6 +180,7 @@ def reclassify_unknown(data_dir: str | Path = DATA_DIR, apply: bool = False) -> 
             "method": reason,
         })
         if identified:
+            # 仅收集命中的文档的 markdown 路径，未命中的不写。
             for key in ("markdown_clean_path", "markdown_raw_path"):
                 if record.get(key):
                     markdown_paths.add(Path(str(record[key])))
@@ -179,6 +213,7 @@ def reclassify_unknown(data_dir: str | Path = DATA_DIR, apply: bool = False) -> 
 
 
 def main() -> None:
+    """CLI 入口：默认 dry-run；--apply 才改写。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=str(DATA_DIR))
     parser.add_argument("--apply", action="store_true")
