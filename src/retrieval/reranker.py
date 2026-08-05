@@ -19,7 +19,7 @@ from src.utils.records import (
 )
 
 
-DEFAULT_BGE_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+DEFAULT_BGE_RERANKER_MODEL = "Qwen/Qwen3-Reranker-4B"
 GUIDE_RE = re.compile(r"(guideline|guidelines|consensus|recommendations?|\u6307\u5357|\u5171\u8bc6)", re.I)
 OCR_UNRESOLVED_STATUSES = {"needed_unavailable", "needed_not_applied", "needed_but_disabled", "failed"}
 OCR_REVIEW_STATUSES = {"applied_needs_review"}
@@ -196,12 +196,21 @@ def helper_load_cross_encoder(owner: Any) -> Any:
     try:
         from sentence_transformers import CrossEncoder  # type: ignore
 
+        # Qwen3-Reranker 等大模型可通过环境变量指定加载精度/attention 实现，避免默认 fp32 爆显存。
+        model_kwargs: dict[str, Any] = {}
+        dtype = os.getenv("BGE_RERANKER_DTYPE", "").strip()
+        if dtype:
+            model_kwargs["torch_dtype"] = dtype
+        attn = os.getenv("BGE_RERANKER_ATTN", "").strip()
+        if attn:
+            model_kwargs["attn_implementation"] = attn
         owner._model = CrossEncoder(
             owner.model_name,
             device=owner.device,
             local_files_only=owner.local_files_only,
             max_length=owner.max_length,
             trust_remote_code=True,
+            model_kwargs=model_kwargs or None,
         )
         return owner._model
     except Exception as exc:  # pragma: no cover - 依赖本地模型缓存
@@ -395,7 +404,7 @@ def default_document_reranker(recency_boost: bool = False) -> DocumentReranker:
     if mode in {"rule", "rules", "rule_based"}:
         return helper_cached_rule_document_reranker(recency_boost)
     local_only = os.getenv("BGE_RERANKER_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
-    batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "16"))
+    batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "8"))
     max_length = int(os.getenv("BGE_RERANKER_MAX_LENGTH", "1024"))
     return helper_cached_bge_document_reranker(
         os.getenv("BGE_RERANKER_MODEL", DEFAULT_BGE_RERANKER_MODEL),
@@ -416,7 +425,7 @@ def default_chunk_reranker() -> ChunkReranker:
     if mode in {"rule", "rules", "rule_based"}:
         return helper_cached_rule_chunk_reranker()
     local_only = os.getenv("BGE_RERANKER_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
-    batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "16"))
+    batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "8"))
     max_length = int(os.getenv("BGE_RERANKER_MAX_LENGTH", "1024"))
     return helper_cached_bge_chunk_reranker(
         os.getenv("BGE_RERANKER_MODEL", DEFAULT_BGE_RERANKER_MODEL),

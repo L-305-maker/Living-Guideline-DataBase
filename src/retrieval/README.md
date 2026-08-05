@@ -9,7 +9,7 @@
 | `common.py` | 时间范围解析、query term 提取、chunk 元数据补齐和来源上下文拼接 |
 | `chunk_normalizer.py` | 将旧版和新版 chunk JSONL 收敛为 PostgreSQL 入库契约 |
 | `rrf.py` | Reciprocal Rank Fusion 和加权 RRF |
-| `reranker.py` | 文档级和 chunk 级重排接口、规则 fallback 和 BGE-M3 cross-encoder |
+| `reranker.py` | 文档级和 chunk 级重排接口、规则 fallback 和 Qwen3-Reranker cross-encoder |
 | `document_repr/` | 文档 card 与多视图表示构建 |
 
 ## 检索约定
@@ -21,12 +21,13 @@
 
 ## Reranker 配置
 
-默认 reranker 使用 `BAAI/bge-reranker-v2-m3`，本地缓存优先。可用环境变量切换：
+默认 reranker 使用 `Qwen/Qwen3-Reranker-4B`，本地缓存优先。可用环境变量切换：
 
 - `DOCUMENT_RERANKER`：`bge_m3`、`rule` 或 `none`。
 - `CHUNK_RERANKER` 或 `RERANKER`：`bge_m3`、`rule` 或 `none`。
 - `BGE_RERANKER_MODEL`、`BGE_RERANKER_DEVICE`、`BGE_RERANKER_BATCH_SIZE`、`BGE_RERANKER_MAX_LENGTH`。
 - `BGE_RERANKER_LOCAL_ONLY=1` 时只读本地 Hugging Face 缓存。
+- `BGE_RERANKER_DTYPE`、`BGE_RERANKER_ATTN`：传给 CrossEncoder 的 `torch_dtype`/`attn_implementation`（大模型建议 `BGE_RERANKER_DTYPE=bfloat16`）。
 
 ## 验证
 
