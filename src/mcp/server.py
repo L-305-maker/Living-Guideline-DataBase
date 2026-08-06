@@ -17,6 +17,7 @@ from src.mcp.call_logger import log_mcp_call
 from src.mcp.api_pg import read_pg as read_api
 from src.mcp.api_pg import retrieve_pg as retrieve_api
 from src.mcp.api_pg import search_pg as search_api
+from src.mcp.concurrency import acquire_slot
 from src.mcp.server_common import (
     env_bool as helper_env_bool,
     env_int as helper_env_int,
@@ -55,8 +56,16 @@ mcp = (
 
 
 def helper_call_api(tool_name: str, api: Any, payload: dict[str, Any]) -> Any:
-    """统一包装：所有 MCP 工具都走 log_mcp_call 审计 + 异常透传。"""
-    return log_mcp_call(tool_name, BACKEND, payload, lambda: api(payload))
+    """统一包装: 所有 MCP 工具都走 log_mcp_call 审计 + 并发限流 + 异常透传。
+
+    限流顺序: 先拿并发槽位, 再进 log_mcp_call。
+    - acquire_slot 超时 (默认 MCP_ACQUIRE_TIMEOUT=30s) 时抛 RuntimeError,
+      让 FastMCP 把这个当 ResourceExhausted 返回给上游, 而不是让 worker 卡住。
+    - call_id 由 log_mcp_call 内部用 uuid4 生成, 这里用 sentinel "pre" 占位:
+      acquire_slot 自身只用于显示/埋点, 不参与去重逻辑。
+    """
+    with acquire_slot(tool_name, "pre"):
+        return log_mcp_call(tool_name, BACKEND, payload, lambda: api(payload))
 
 
 if mcp is not None:

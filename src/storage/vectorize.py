@@ -16,7 +16,7 @@ import argparse
 import json
 from typing import Any
 
-from src.storage.postgres_store import connect
+from src.storage.postgres_store import PooledConn,get_pool
 from src.storage.query_embedding import (
     DEFAULT_MODEL,
     encode_with_model as _encode_with_model,
@@ -33,7 +33,7 @@ def ensure_vector_schema(dsn: str | None = None) -> None:
     """
     from src.storage.postgres_store import VECTOR_SCHEMA_SQL
 
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(VECTOR_SCHEMA_SQL)
         conn.commit()
@@ -71,7 +71,7 @@ def helper_fetch_document_cards(
     if limit:
         sql += " LIMIT %s"
         params.append(limit)
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
@@ -104,7 +104,7 @@ def helper_fetch_document_views(
     if limit:
         sql += " LIMIT %s"
         params.append(limit)
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
@@ -133,7 +133,7 @@ def helper_fetch_chunks(dsn: str | None, limit: int | None, offset: int, missing
     if limit:
         sql += " LIMIT %s"
         params.append(limit)
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
@@ -168,7 +168,7 @@ def helper_vectorize_rows(
         model = helper_load_model(model_name)
         print(f"[vectorize] model loaded on {getattr(model, 'device', 'unknown')}", flush=True)
     inserted = 0
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             for start in range(0, len(rows), batch_size):
                 batch = rows[start : start + batch_size]

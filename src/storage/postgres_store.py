@@ -21,7 +21,8 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Iterable, Iterator
-
+from psycopg_pool import ConnectionPool
+import threading
 from src.retrieval.chunk_normalizer import iter_normalized_chunks
 from src.storage.query_embedding import DEFAULT_MODEL
 from src.utils.io import DATA_DIR, read_jsonl
@@ -31,6 +32,8 @@ from src.utils.records import (
     truthy as helper_truthy,
 )
 
+POOL = None
+POOL_LOCK = threading.Lock()
 
 # 5 张主表 + 16 个普通/全文索引。
 # 全文索引使用 GIN(content_tsv)；其中 content_tsv 是 PG 自动生成的 GENERATED 列，
@@ -245,14 +248,12 @@ CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_cosine
 
 
 def get_dsn(cli_dsn: str | None = None) -> str:
-    """按优先级解析 PostgreSQL DSN（最高优先级在前）。
-
-    解析顺序：
-      1. CLI 参数 --dsn（最优先，常用于测试或多环境切换）
-      2. 环境变量 POSTGRES_DSN / DATABASE_URL（远程部署默认走这里）
-      3. 拆分式环境变量 PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD（云厂商托管 PG 常用）
-    任一命中即返回，否则抛 RuntimeError，避免悄悄连到错误库。
-    """
+    #按优先级解析 PostgreSQL DSN（最高优先级在前）。
+    #解析顺序：
+    # 1. CLI 参数 --dsn（最优先，常用于测试或多环境切换）
+    # 2. 环境变量 POSTGRES_DSN / DATABASE_URL（远程部署默认走这里）
+    # 3. 拆分式环境变量 PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD（云厂商托管 PG 常用）
+    #任一命中即返回，否则抛 RuntimeError，避免悄悄连到错误库。
     if cli_dsn:
         return cli_dsn
     for name in ["POSTGRES_DSN", "DATABASE_URL"]:
@@ -270,38 +271,68 @@ def get_dsn(cli_dsn: str | None = None) -> str:
     raise RuntimeError("PostgreSQL DSN not configured. Set POSTGRES_DSN or DATABASE_URL.")
 
 
-def connect(dsn: str | None = None):
-    """建立 psycopg 连接，DSN 解析失败时抛出明确错误（避免用错驱动类型）。
+def get_pool(dsn=None):
+    global POOL
+    if POOL is not None:
+        return POOL
+    with POOL_LOCK:
+        if POOL is None:
+            POOL = ConnectionPool(
+                conninfo=get_dsn(dsn),
+                min_size=int(os.getenv("PG_POOL_MIN", "2")),
+                max_size=int(os.getenv("PG_POOL_MAX", "16")),
+                timeout=30.0,
+                kwargs={"options": "-c statement_timeout=8000"},
+                open=False,                   # 延迟开
+                name="mcp-pg-pool",
+            )
+            POOL.open(wait=True, timeout=10.0)
+    return POOL
 
-    psycopg v3 是同步驱动，所有函数都通过 with connect(dsn) as conn: 管理连接生命周期。
-    """
-    try:
-        import psycopg
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("psycopg is required: python -m pip install 'psycopg[binary]>=3.2'") from exc
-    return psycopg.connect(get_dsn(dsn))
 
+class PooledConn:
+    def __init__(self, pool): self._pool = pool; self._conn = None
 
+    def __enter__(self):
+        self._conn = self._pool.getconn(timeout=10)
+        return self._conn
+    
+    def __exit__(self, *a):
+        try:
+            if a[0] is not None:
+                self._conn.rollback()
+        finally:
+            self._pool.putconn(self._conn)
+            self._conn = None
 
+"""
+def connect(dsn=None):
+    import psycopg
+
+    conn = psycopg.connect(get_dsn(dsn),
+
+        options=f"-c statement_timeout={int(os.getenv('PG_STATEMENT_TIMEOUT_MS', '8000'))}"
+                 f" -c idle_in_transaction_session_timeout=10s"
+                 f" -c lock_timeout={int(os.getenv('PG_LOCK_TIMEOUT_MS', '3000'))}")
+    # 一个慢 query 不再卡死 worker
+    return conn
+"""
 
 def serialize_json(value: Any) -> str:
-    """将 Python 对象序列化为 JSON 字符串（ensure_ascii=False 保留中文字符）。
+    # 将 Python 对象序列化为 JSON 字符串（ensure_ascii=False 保留中文字符）。
 
-    主要用于向 PG 的 JSONB 列传值：JSONB 列接受字符串并自动 parse，
-    ensure_ascii=False 让存储原文可读，便于 pg_dump / 查询时直接阅读。
-    """
+    # 主要用于向 PG 的 JSONB 列传值：JSONB 列接受字符串并自动 parse，
+    # ensure_ascii=False 让存储原文可读，便于 pg_dump / 查询时直接阅读。
     return json.dumps(value, ensure_ascii=False)
 
 
-
-
 def init_schema(dsn: str | None = None, with_vector: bool = False) -> dict[str, Any]:
-    """幂等创建主表 + pg_trgm 扩展；可选创建向量表。
+    # 幂等创建主表 + pg_trgm 扩展；可选创建向量表。
 
-    pg_trgm 用于 ILIKE 模糊匹配的 GIN 索引加速（如 source_institution ILIKE '%xxx%'）。
-    向量表与扩展只在 with_vector=True 时创建，便于分阶段建库（先文本后向量）。
-    """
-    with connect(dsn) as conn:
+    # pg_trgm 用于 ILIKE 模糊匹配的 GIN 索引加速（如 source_institution ILIKE '%xxx%'）。
+    # 向量表与扩展只在 with_vector=True 时创建，便于分阶段建库（先文本后向量）。
+    
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
             cur.execute(SCHEMA_SQL)
@@ -312,13 +343,13 @@ def init_schema(dsn: str | None = None, with_vector: bool = False) -> dict[str, 
 
 
 def create_vector_indexes(dsn: str | None = None) -> dict[str, Any]:
-    """建 IVFFlat 向量索引 + ANALYZE 收集统计信息。
+    # 建 IVFFlat 向量索引 + ANALYZE 收集统计信息。
 
-    调用时机：所有 embedding 行写入完成之后立即执行。
-    - IVFFlat 索引是必须的，否则向量召回是顺序扫描，性能不可接受；
-    - ANALYZE 让查询规划器知道表大小与数据分布，避免向量召回选择错误的执行计划。
-    """
-    with connect(dsn) as conn:
+    # 调用时机：所有 embedding 行写入完成之后立即执行。
+    # - IVFFlat 索引是必须的，否则向量召回是顺序扫描，性能不可接受；
+    # - ANALYZE 让查询规划器知道表大小与数据分布，避免向量召回选择错误的执行计划。
+    
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(VECTOR_INDEX_SQL)
             for table in ("document_card_embeddings", "document_view_embeddings", "chunk_embeddings"):
@@ -328,15 +359,15 @@ def create_vector_indexes(dsn: str | None = None) -> dict[str, Any]:
 
 
 def reset_schema(dsn: str | None = None, with_vector: bool = False) -> dict[str, Any]:
-    """DROP 所有 9 张表（先 embeddings 再主表，避开外键依赖）后调用 init_schema 重建。
+    # DROP 所有 9 张表（先 embeddings 再主表，避开外键依赖）后调用 init_schema 重建。
 
-    DROP 顺序（重要）：
-      chunk_embeddings → document_view_embeddings → document_card_embeddings
-      → document_embeddings（预留位，当前未使用但保留 DROP）
-      → chunks → sections → document_views → document_cards → documents
-    必须在有外键依赖的子表（embeddings）先于主表 DROP，否则 PG 会拒绝。
-    """
-    with connect(dsn) as conn:
+    # DROP 顺序（重要）：
+    #  chunk_embeddings → document_view_embeddings → document_card_embeddings
+    #  → document_embeddings（预留位，当前未使用但保留 DROP）
+    #  → chunks → sections → document_views → document_cards → documents
+    # 必须在有外键依赖的子表（embeddings）先于主表 DROP，否则 PG 会拒绝。
+    
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS chunk_embeddings")
             cur.execute("DROP TABLE IF EXISTS document_view_embeddings")
@@ -354,30 +385,25 @@ def reset_schema(dsn: str | None = None, with_vector: bool = False) -> dict[str,
 
 
 def helper_data_artifact_path(data_dir: Path, stored_path: str | None, folder: str, doc_id: str) -> Path:
-    """解析 Markdown 工件路径，兼容"JSONL 中的路径来自其他机器"的情况。
+    # 解析 Markdown 工件路径，兼容"JSONL 中的路径来自其他机器"的情况。
+    # 优先级：
+    #  1. stored_path 指向的文件确实存在 → 直接使用；
+    #  2. 否则回退到 data_dir/folder/<doc_id>.md（本地约定的标准布局）。
+    # 这一兼容层让多机器协作时 JSONL 携带的旧路径不会让 ingest 失败。
 
-    优先级：
-      1. stored_path 指向的文件确实存在 → 直接使用；
-      2. 否则回退到 data_dir/folder/<doc_id>.md（本地约定的标准布局）。
-
-    这一兼容层让多机器协作时 JSONL 携带的旧路径不会让 ingest 失败。
-    """
     path = Path(stored_path or "")
     if stored_path and path.is_file():
         return path
     return data_dir / folder / f"{doc_id}.md"
 
 
-def iter_document_rows(
-    data_dir: Path, allowed_doc_ids: set[str] | None = None
-) -> Iterator[tuple[Any, ...]]:
-    """流式产出 documents 表的入库行（行序与 INSERT 列定义严格对齐）。
-
-    行为要点：
-    - 跳过不在 allowed_doc_ids 集合中的 doc_id（增量/筛选场景）；
-    - clean_path 缺失即抛 FileNotFoundError，避免写入半残数据；
-    - content_md 字段直接读 markdown_clean 全文（用于 read_document_pg 返回正文）。
-    """
+def iter_document_rows(data_dir: Path, allowed_doc_ids: set[str] | None = None) -> Iterator[tuple[Any, ...]]:
+    # 流式产出 documents 表的入库行（行序与 INSERT 列定义严格对齐）。
+    # 行为要点：
+    # - 跳过不在 allowed_doc_ids 集合中的 doc_id（增量/筛选场景）；
+    # - clean_path 缺失即抛 FileNotFoundError，避免写入半残数据；
+    # - content_md 字段直接读 markdown_clean 全文（用于 read_document_pg 返回正文）。
+    
     for rec in read_jsonl(data_dir / "documents.jsonl"):
         doc_id = rec["doc_id"]
         if allowed_doc_ids is not None and doc_id not in allowed_doc_ids:
@@ -404,18 +430,17 @@ def iter_document_rows(
 
 
 def helper_document_rows(data_dir: Path) -> list[tuple[Any, ...]]:
-    """把 iter_document_rows 物化为 list；仅供一次性内存场景使用。"""
+    # 把 iter_document_rows 物化为 list；仅供一次性内存场景使用。
     return list(iter_document_rows(data_dir))
 
 
 def iter_document_card_rows(data_dir: Path, allowed_doc_ids: set[str] | None = None) -> Iterator[tuple[Any, ...]]:
-    """流式产出 document_cards 表的入库行（含 OCR 元信息与清洗审计字段）。
-
-    与 documents 入库的区别：
-    - 继承 documents 的 OCR / 清洗字段以支持按 document_kind 检索时的过滤；
-    - 过滤条件为 allowed_doc_ids（增量模式下只入库目标集合）；
-    - fields_json 字段以 JSONB 写入，承载 JSONL 中的 fields 富字段。
-    """
+    # 流式产出 document_cards 表的入库行（含 OCR 元信息与清洗审计字段）。
+    # 与 documents 入库的区别：
+    # - 继承 documents 的 OCR / 清洗字段以支持按 document_kind 检索时的过滤；
+    # - 过滤条件为 allowed_doc_ids（增量模式下只入库目标集合）；
+    # - fields_json 字段以 JSONB 写入，承载 JSONL 中的 fields 富字段。
+    
     path = data_dir / "document_cards.jsonl"
     if not path.exists():
         return
@@ -449,12 +474,11 @@ def iter_document_card_rows(data_dir: Path, allowed_doc_ids: set[str] | None = N
 
 
 def iter_document_view_rows(data_dir: Path, allowed_doc_ids: set[str | None] = None) -> Iterator[tuple[Any, ...]]:
-    """流式产出 document_views 表的入库行。
+    # 流式产出 document_views 表的入库行。
+    # 关键差异：
+    # - 视图行继承文档级质量信息，但保留独立 view_id、view_type 和 priority；
+    # - view_id 缺失时由 "<doc_id>__<view_type>" 回填，保证主键非空且唯一。
 
-    关键差异：
-    - 视图行继承文档级质量信息，但保留独立 view_id、view_type 和 priority；
-    - view_id 缺失时由 "<doc_id>__<view_type>" 回填，保证主键非空且唯一。
-    """
     path = data_dir / "document_views.jsonl"
     if not path.exists():
         return
@@ -489,13 +513,10 @@ def iter_document_view_rows(data_dir: Path, allowed_doc_ids: set[str | None] = N
         )
 
 
-def iter_section_rows(
-    data_dir: Path, allowed_doc_ids: set[str] | None = None
-) -> Iterator[tuple[Any, ...]]:
-    """流式产出 sections 表的入库行，遍历 sections/*.jsonl 各文件并按文件内顺序索引。
-
-    section_index 是文件内序号（从 0 起），与 (doc_id, section_index) 唯一约束对齐。
-    """
+def iter_section_rows(data_dir: Path, allowed_doc_ids: set[str] | None = None) -> Iterator[tuple[Any, ...]]:
+    # 流式产出 sections 表的入库行，遍历 sections/*.jsonl 各文件并按文件内顺序索引。
+    # section_index 是文件内序号（从 0 起），与 (doc_id, section_index) 唯一约束对齐。
+    
     for path in sorted((data_dir / "sections").glob("*.jsonl")):
         for index, rec in enumerate(read_jsonl(path)):
             if allowed_doc_ids is not None and rec["doc_id"] not in allowed_doc_ids:
@@ -518,16 +539,13 @@ def iter_section_rows(
             )
 
 
-def iter_chunk_rows(
-    data_dir: Path, allowed_doc_ids: set[str] | None = None
-) -> Iterator[tuple[Any, ...]]:
-    """流式产出 chunks 表的入库行；通过 iter_normalized_chunks 收敛字段版本。
-
-    关键兼容点：
-    - 使用 chunk_normalizer 把不同阶段的 chunk 字段统一为单一契约；
-    - text_for_embedding / retrieval_text / content 的优先级 fallback 也在 normalizer 内处理；
-    - section_path_text 由 list 拼接得到，供 content_tsv 加权检索。
-    """
+def iter_chunk_rows(data_dir: Path, allowed_doc_ids: set[str] | None = None) -> Iterator[tuple[Any, ...]]:
+    # 流式产出 chunks 表的入库行；通过 iter_normalized_chunks 收敛字段版本。
+    # 关键兼容点：
+    # - 使用 chunk_normalizer 把不同阶段的 chunk 字段统一为单一契约；
+    # - text_for_embedding / retrieval_text / content 的优先级 fallback 也在 normalizer 内处理；
+    # - section_path_text 由 list 拼接得到，供 content_tsv 加权检索。
+    
     for rec in iter_normalized_chunks(data_dir):
         if allowed_doc_ids is not None and rec["doc_id"] not in allowed_doc_ids:
             continue
@@ -557,39 +575,29 @@ def iter_chunk_rows(
 
 
 def helper_document_card_rows(data_dir: Path, allowed_doc_ids: set[str] | None = None) -> list[tuple[Any, ...]]:
-    """物化卡片行；用于外部脚本调试或单次全量场景。"""
+    # 物化卡片行；用于外部脚本调试或单次全量场景。
     return list(iter_document_card_rows(data_dir, allowed_doc_ids))
 
-
 def helper_document_view_rows(data_dir: Path, allowed_doc_ids: set[str] | None = None) -> list[tuple[Any, ...]]:
-    """物化视图行。"""
+    # 物化视图行。
     return list(iter_document_view_rows(data_dir, allowed_doc_ids))
 
-
 def helper_section_rows(data_dir: Path) -> list[tuple[Any, ...]]:
-    """物化章节行。"""
+    # 物化章节行。
     return list(iter_section_rows(data_dir))
 
-
 def helper_chunk_rows(data_dir: Path) -> list[tuple[Any, ...]]:
-    """物化分块行。"""
+    # 物化分块行。
     return list(iter_chunk_rows(data_dir))
 
 
-def helper_insert_batches(
-    conn: Any,
-    sql: str,
-    rows: Iterable[tuple[Any, ...]],
-    batch_size: int,
-    commit_each_batch: bool = True,
-) -> int:
-    """把 rows 按 batch_size 切片执行 executemany，返回累计插入行数。
-
-    关键设计：
-    - 每批 executemany 后可选 commit（默认 commit），限制单事务大小；
-    - 最后一批 < batch_size 也会被 flush，避免遗漏；
-    - cur.rowcount 在 psycopg v3 对 executemany 返回值不稳定，回退到 batch 长度计数。
-    """
+def helper_insert_batches(conn: Any,sql: str,rows: Iterable[tuple[Any, ...]],batch_size: int,commit_each_batch: bool = True,) -> int:
+    # 把 rows 按 batch_size 切片执行 executemany，返回累计插入行数。
+    # 关键设计：
+    # - 每批 executemany 后可选 commit（默认 commit），限制单事务大小；
+    # - 最后一批 < batch_size 也会被 flush，避免遗漏；
+    # - cur.rowcount 在 psycopg v3 对 executemany 返回值不稳定，回退到 batch 长度计数。
+    
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     count = 0
@@ -612,31 +620,25 @@ def helper_insert_batches(
     return count
 
 
-def ingest_data(
-    dsn: str | None = None,
-    data_dir: str | Path = DATA_DIR,
-    batch_size: int = 500,
-    incremental: bool = False,
-) -> dict[str, Any]:
-    """将 5 张主表的 JSONL 流式入库 PostgreSQL。
+def ingest_data(dsn: str | None = None,data_dir: str | Path = DATA_DIR,batch_size: int = 500,incremental: bool = False,) -> dict[str, Any]:
+    # 将 5 张主表的 JSONL 流式入库 PostgreSQL。
 
-    两种模式：
-    - 全量（默认）：DELETE FROM 5 张表后 INSERT；批量提交，断点处可能产生空快照。
-      因为 DELETE 不在同一事务内，最后一个 commit 之后 SELECT 会看到空数据。
-    - 增量（--incremental）：对 documents 加 SHARE ROW EXCLUSIVE MODE 锁，
-      用 ON CONFLICT DO NOTHING 跳过已存在的 doc_id，整批完成后再统一 commit。
+    # 两种模式：
+    # - 全量（默认）：DELETE FROM 5 张表后 INSERT；批量提交，断点处可能产生空快照。
+    #   因为 DELETE 不在同一事务内，最后一个 commit 之后 SELECT 会看到空数据。
+    # - 增量（--incremental）：对 documents 加 SHARE ROW EXCLUSIVE MODE 锁，
+    #   用 ON CONFLICT DO NOTHING 跳过已存在的 doc_id，整批完成后再统一 commit。
+    # 边界：
+    # - documents.jsonl 出现重复 doc_id 直接抛 ValueError，避免静默吞掉；
+    # - INSERT 列顺序与各 iter_*_rows 函数 yield 的元组严格对应，重构时必须同步改两边。
 
-    边界：
-    - documents.jsonl 出现重复 doc_id 直接抛 ValueError，避免静默吞掉；
-    - INSERT 列顺序与各 iter_*_rows 函数 yield 的元组严格对应，重构时必须同步改两边。
-    """
     data_path = Path(data_dir)
     input_doc_ids = [rec["doc_id"] for rec in read_jsonl(data_path / "documents.jsonl")]
     allowed_doc_ids = set(input_doc_ids)
     if len(allowed_doc_ids) != len(input_doc_ids):
         raise ValueError("documents.jsonl contains duplicate doc_id values")
 
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         existing_doc_ids: set[str] = set()
         if incremental:
             if allowed_doc_ids:
@@ -742,24 +744,19 @@ def ingest_data(
     return counts
 
 
-def ingest_sections(
-    dsn: str | None = None,
-    data_dir: str | Path = DATA_DIR,
-    batch_size: int = 500,
-) -> dict[str, int]:
-    """仅入库 sections 表，常用于 sections 重建（不影响 documents/cards/views/chunks）。
+def ingest_sections(dsn: str | None = None,data_dir: str | Path = DATA_DIR,batch_size: int = 500,) -> dict[str, int]:
+    # 仅入库 sections 表，常用于 sections 重建（不影响 documents/cards/views/chunks）。
+    # 安全策略：
+    #  - 仅入库 documents 表中已存在的 doc_id 对应的 sections（用 existing_doc_ids 限定）；
+    #  - 使用 ON CONFLICT DO NOTHING，跳过重复 (doc_id, section_index)，允许多次执行而不出错。
 
-    安全策略：
-    - 仅入库 documents 表中已存在的 doc_id 对应的 sections（用 existing_doc_ids 限定）；
-    - 使用 ON CONFLICT DO NOTHING，跳过重复 (doc_id, section_index)，允许多次执行而不出错。
-    """
     data_path = Path(data_dir)
     input_doc_ids = [rec["doc_id"] for rec in read_jsonl(data_path / "documents.jsonl")]
     allowed_doc_ids = set(input_doc_ids)
     if len(allowed_doc_ids) != len(input_doc_ids):
         raise ValueError("documents.jsonl contains duplicate doc_id values")
 
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         existing_doc_ids: set[str] = set()
         if allowed_doc_ids:
             with conn.cursor() as cur:
@@ -783,11 +780,10 @@ def ingest_sections(
 
 
 def helper_kind_counts(cur: Any, table: str) -> dict[str, int]:
-    """统计某张表按 document_kind 分布的行数（guideline / consensus 等）。
-
-    对 documents 直接 GROUP BY；其它表需 JOIN documents 取 document_kind 字段。
-    用于 verify / stats 子命令检查数据完整性。
-    """
+    # 统计某张表按 document_kind 分布的行数（guideline / consensus 等）。
+    # 对 documents 直接 GROUP BY；其它表需 JOIN documents 取 document_kind 字段。
+    # 用于 verify / stats 子命令检查数据完整性。
+    
     if table == "documents":
         cur.execute("SELECT document_kind, count(*) FROM documents GROUP BY document_kind ORDER BY document_kind")
     else:
@@ -804,12 +800,11 @@ def helper_kind_counts(cur: Any, table: str) -> dict[str, int]:
 
 
 def database_stats(dsn: str | None = None) -> dict[str, Any]:
-    """汇总当前数据库的表行数、按 document_kind 分布、source 分布等统计信息。
-
-    向量表用 to_regclass() 检查存在性（可能在 with_vector=False 时未建），
-    仅对存在的表读 count(*)，避免 SQL 报错。
-    """
-    with connect(dsn) as conn:
+    # 汇总当前数据库的表行数、按 document_kind 分布、source 分布等统计信息。
+    # 向量表用 to_regclass() 检查存在性（可能在 with_vector=False 时未建），
+    # 仅对存在的表读 count(*)，避免 SQL 报错。
+    
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             result: dict[str, Any] = {}
             for table in ["documents", "document_cards", "document_views", "sections", "chunks"]:
@@ -837,16 +832,14 @@ def database_stats(dsn: str | None = None) -> dict[str, Any]:
 
 
 def verify_retrieval_snapshot(dsn: str | None = None, model_name: str | None = None) -> dict[str, Any]:
-    """校验检索快照完整性，任何不匹配立即抛 RuntimeError。
-
-    检查项：
-    1. documents 中至少存在 guideline 与 consensus 两种 document_kind；
-    2. document_cards / document_views / sections / chunks 对应每种 document_kind 都非空；
-    3. 三张源表的行数 == 对应 embedding 表按 model 过滤后的行数。
-       按 model 过滤是关键：换模型后旧向量记录不会被误判为已完成。
-
-    返回值：包含 by_document_kind（各表按 kind 分布）和 vectors（源表 vs embedding 行数）的字典。
-    """
+    # 校验检索快照完整性，任何不匹配立即抛 RuntimeError。
+    # 检查项：
+    # 1. documents 中至少存在 guideline 与 consensus 两种 document_kind；
+    # 2. document_cards / document_views / sections / chunks 对应每种 document_kind 都非空；
+    # 3. 三张源表的行数 == 对应 embedding 表按 model 过滤后的行数。
+    #    按 model 过滤是关键：换模型后旧向量记录不会被误判为已完成。
+    # 返回值：包含 by_document_kind（各表按 kind 分布）和 vectors（源表 vs embedding 行数）的字典。
+    
     if model_name is None:
         model_name = DEFAULT_MODEL
     artifact_tables = ("documents", "document_cards", "document_views", "sections", "chunks")
@@ -855,7 +848,7 @@ def verify_retrieval_snapshot(dsn: str | None = None, model_name: str | None = N
         ("document_views", "document_view_embeddings"),
         ("chunks", "chunk_embeddings"),
     )
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             by_kind = {table: helper_kind_counts(cur, table) for table in artifact_tables}
             for kind in ("guideline", "consensus"):
@@ -885,16 +878,14 @@ def verify_retrieval_snapshot(dsn: str | None = None, model_name: str | None = N
 
 
 def helper_time_filter_sql(time_range: str | dict[str, str] | None, params: list[Any]) -> str:
-    """把 time_range（'YYYY-YYYY' / dict / 自由字符串）展开成 SQL 片段与 params。
-
-    解析规则：
-    - dict：取 start/start_date 与 end/end_date；
-    - 'YYYY-YYYY' 或 'YYYY:YYYY'（含 - ~ : 分隔）：自动补齐为 '-01-01' / '-12-31'；
-    - 其它字符串：作为单边 start。
-
-    返回形如 ' AND publication_date >= %s AND publication_date <= %s'。
-    多个过滤组合时由调用方在 WHERE 后用 AND 直接拼接。
-    """
+    # 把 time_range（'YYYY-YYYY' / dict / 自由字符串）展开成 SQL 片段与 params。
+    # 解析规则：
+    # - dict：取 start/start_date 与 end/end_date；
+    # - 'YYYY-YYYY' 或 'YYYY:YYYY'（含 - ~ : 分隔）：自动补齐为 '-01-01' / '-12-31'；
+    # - 其它字符串：作为单边 start。
+    # 返回形如 ' AND publication_date >= %s AND publication_date <= %s'。
+    # 多个过滤组合时由调用方在 WHERE 后用 AND 直接拼接。
+    
     if not time_range:
         return ""
     if isinstance(time_range, dict):
@@ -915,17 +906,15 @@ def helper_time_filter_sql(time_range: str | dict[str, str] | None, params: list
 
 
 def helper_fuse_document_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
-    """对多通道文档召回结果做 RRF 融合，取 topk。
+    # 对多通道文档召回结果做 RRF 融合，取 topk。
+    # RRF（Reciprocal Rank Fusion）公式：score = Σ 1/(60 + rank)
+    # - k=60 是经验常数，平滑高分项的极端权重；
+    # - 多通道按 doc_id 求和，分数与通道数无关；
+    # - 同分时按 doc_id 字典序稳定排序。
+    # 关键点：
+    # - by_id 取最先出现的项作为代表记录，避免被后续通道覆盖；
+    # - channels 记录每个 doc_id 命中过的通道名（text_channel），便于溯源。
 
-    RRF（Reciprocal Rank Fusion）公式：score = Σ 1/(60 + rank)
-    - k=60 是经验常数，平滑高分项的极端权重；
-    - 多通道按 doc_id 求和，分数与通道数无关；
-    - 同分时按 doc_id 字典序稳定排序。
-
-    关键点：
-    - by_id 取最先出现的项作为代表记录，避免被后续通道覆盖；
-    - channels 记录每个 doc_id 命中过的通道名（text_channel），便于溯源。
-    """
     scores: dict[str, float] = {}
     by_id: dict[str, dict[str, Any]] = {}
     channels: dict[str, set[str]] = {}
@@ -957,11 +946,10 @@ def search_document_cards_pg(
     topk: int = 50,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """基于全文索引的卡片级 BM25-like 检索。
-
-    排序策略：score DESC, publication_date DESC —— 同分时优先最新发布的指南。
-    ILIKE 模糊匹配 source_institution / clinical_department 配合 GIN-trgm 索引加速。
-    """
+    # 基于全文索引的卡片级 BM25-like 检索。
+    # 排序策略：score DESC, publication_date DESC —— 同分时优先最新发布的指南。
+    # ILIKE 模糊匹配 source_institution / clinical_department 配合 GIN-trgm 索引加速。
+    
     params: list[Any] = [query, query]
     where = ["websearch_to_tsquery('simple', %s) @@ dc.content_tsv"]
     if source_institution:
@@ -987,7 +975,7 @@ def search_document_cards_pg(
         LIMIT %s
     """
     params.append(topk)
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -1016,13 +1004,12 @@ def search_document_views_pg(
     topk: int = 50,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """基于全文索引的视图级 BM25-like 检索。
-
-    排序：score DESC, priority DESC, publication_date DESC
-    - priority 来自 builder，重要视图（recommendation_summary=1.35）排在前面；
-    - 同一文档可能有多个视图，先扩大候选池（max(topk*3, topk)），
-      再在 Python 端按 doc_id 去重至 topk，避免视图数挤占文档数。
-    """
+    # 基于全文索引的视图级 BM25-like 检索。
+    # 排序：score DESC, priority DESC, publication_date DESC
+    # - priority 来自 builder，重要视图（recommendation_summary=1.35）排在前面；
+    # - 同一文档可能有多个视图，先扩大候选池（max(topk*3, topk)），
+    #   再在 Python 端按 doc_id 去重至 topk，避免视图数挤占文档数。
+    
     params: list[Any] = [query, query]
     where = ["websearch_to_tsquery('simple', %s) @@ v.content_tsv"]
     if source_institution:
@@ -1048,7 +1035,7 @@ def search_document_views_pg(
         LIMIT %s
     """
     params.append(max(topk * 3, topk))
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -1077,20 +1064,11 @@ def search_document_views_pg(
     return results
 
 
-def search_documents_pg(
-    query: str,
-    dsn: str | None = None,
-    source_institution: str | None = None,
-    clinical_department: str | None = None,
-    time_range: str | dict[str, str] | None = None,
-    publication_date: str | None = None,
-    topk: int = 10,
-) -> list[dict[str, Any]]:
-    """文档级融合检索：cards 通道 + views 通道 → RRF 融合 → topk。
-
-    pool_size = max(50, topk)：单通道召回至少 50 个候选，留足融合空间。
-    实际调用方通常使用 search_documents_hybrid_pg（混合 BM25 + 向量）。
-    """
+def search_documents_pg(query: str,dsn: str, source_institution: str, clinical_department: str, time_range: str | dict[str, str] | None = None, publication_date: str | None = None, topk: int = 10,) -> list[dict[str, Any]]:
+    # 文档级融合检索：cards 通道 + views 通道 → RRF 融合 → topk。
+    # pool_size = max(50, topk)：单通道召回至少 50 个候选，留足融合空间。
+    # 实际调用方通常使用 search_documents_hybrid_pg（混合 BM25 + 向量）。
+    
     pool_size = max(50, topk)
     cards = search_document_cards_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, pool_size)
     views = search_document_views_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, pool_size)
@@ -1107,11 +1085,10 @@ def retrieve_chunks_pg(
     topk: int = 5,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """基于全文索引的分块级 BM25-like 检索。
-
-    SQL 层硬性排除 is_reference_section=true 的块（参考文献列表对召回噪声大）；
-    返回字段保留全部追踪字段（section_path / chunk_type / source_file 等），供 MCP 返回原文引用。
-    """
+    # 基于全文索引的分块级 BM25-like 检索。
+    # SQL 层硬性排除 is_reference_section=true 的块（参考文献列表对召回噪声大）；
+    # 返回字段保留全部追踪字段（section_path / chunk_type / source_file 等），供 MCP 返回原文引用。
+    
     params: list[Any] = [query, query]
     where = ["websearch_to_tsquery('simple', %s) @@ c.content_tsv", "c.is_reference_section = false"]
     if source_institution:
@@ -1139,7 +1116,7 @@ def retrieve_chunks_pg(
         LIMIT %s
     """
     params.append(topk)
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -1165,23 +1142,17 @@ def retrieve_chunks_pg(
     ]
 
 
-def read_document_pg(
-    doc_id: str | None = None,
-    dsn: str | None = None,
-    title: str | None = None,
-    max_chars: int | None = None,
-) -> dict[str, Any]:
-    """按 doc_id 或 title 读取单篇文档正文。
-
-    - 必须传 doc_id 或 title 之一，否则 ValueError；
-    - title 模式优先精确匹配，再退到 ILIKE '%title%' 模糊匹配；
-      排序优先级：精确匹配 > publication_date DESC > 标题长度 ASC，
-      保证选择最具体且最新的文档。
-    - max_chars > 0 时截断 content，避免返回超长文档撑爆 MCP 响应。
-    """
+def read_document_pg(doc_id: str | None = None,dsn: str | None = None,title: str | None = None,max_chars: int | None = None,) -> dict[str, Any]:
+    # 按 doc_id 或 title 读取单篇文档正文。
+    # - 必须传 doc_id 或 title 之一，否则 ValueError；
+    # - title 模式优先精确匹配，再退到 ILIKE '%title%' 模糊匹配；
+    #   排序优先级：精确匹配 > publication_date DESC > 标题长度 ASC，
+    #   保证选择最具体且最新的文档。
+    # - max_chars > 0 时截断 content，避免返回超长文档撑爆 MCP 响应。
+    
     if not doc_id and not title:
         raise ValueError("read_document_pg requires either doc_id or title")
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             if doc_id:
                 cur.execute(
@@ -1226,7 +1197,7 @@ def read_document_pg(
 
 
 def main() -> None:
-    """CLI 入口：python -m src.storage.postgres_store <command> [flags]。
+    """CLI 入口: python -m src.storage.postgres_store <command> [flags]。
 
     子命令一览：
       init              建主表（可选 --with-vector 加 pgvector 与三张 embedding 表）
@@ -1237,7 +1208,7 @@ def main() -> None:
       stats             打印行数 / 按 document_kind 分布 / embedding 表状态
       verify            校验主表与 embedding 表行数一致（按 model 过滤），失败抛 RuntimeError
 
-    注意：reset 会删除所有数据，调用前确认已经备份或接受数据丢失。
+    注意: reset 会删除所有数据，调用前确认已经备份或接受数据丢失。
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["init", "reset", "ingest", "ingest-sections", "index-vectors", "stats", "verify"])

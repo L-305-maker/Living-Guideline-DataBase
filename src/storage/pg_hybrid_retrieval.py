@@ -33,7 +33,8 @@ from src.retrieval.rrf import rrf_fusion
 from src.storage.query_embedding import DEFAULT_MODEL, query_vector_literal
 from src.storage.postgres_store import (
     helper_time_filter_sql,
-    connect,
+    get_pool,
+    PooledConn,
     retrieve_chunks_pg,
     search_document_cards_pg,
     search_document_views_pg,
@@ -45,35 +46,32 @@ LOGGER = logging.getLogger(__name__)
 
 
 def helper_query_vector(query: str, model_name: str) -> str:
-    """对查询文本做向量化并返回 pgvector 字面量字符串（SQL 直传）。
+    # 对查询文本做向量化并返回 pgvector 字面量字符串（SQL 直传）。
+    # 转发到 query_embedding.query_vector_literal，保证与数据库向量化使用同一模型与归一化设置。
 
-    转发到 query_embedding.query_vector_literal，保证与数据库向量化使用同一模型与归一化设置。
-    """
     return query_vector_literal(query, model_name)
 
 
 def pg_vector_retrieval_required() -> bool:
-    """读取环境变量 PG_VECTOR_RETRIEVAL_REQUIRED；为真时强制向量通道不可缺失。
-
-    业务意义：开启后若向量缺失或查询异常，检索直接抛错而不是悄悄降级，
-    避免"声称混合检索但实际只有 BM25"的隐性回退。
-    """
+    # 读取环境变量 PG_VECTOR_RETRIEVAL_REQUIRED；为真时强制向量通道不可缺失。
+    # 业务意义：开启后若向量缺失或查询异常，检索直接抛错而不是悄悄降级，
+    # 避免"声称混合检索但实际只有 BM25"的隐性回退。
+    
     return os.getenv("PG_VECTOR_RETRIEVAL_REQUIRED", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 
 @lru_cache(maxsize=4)
 def helper_assert_pg_vectors_ready(dsn: str | None, model_name: str) -> None:
-    """校验 3 张源表的行数 == 对应 embedding 表按 model 过滤的行数，否则抛错。
-
-    用 (dsn, model_name) 作缓存键：同一连接同一模型只校验一次，避免每次请求都跑 SQL。
-    仅校验文档 cards / views / chunks 三层；不涉及 sections 与主 documents 表。
-    """
+    # 校验 3 张源表的行数 == 对应 embedding 表按 model 过滤的行数，否则抛错。
+    # 用 (dsn, model_name) 作缓存键：同一连接同一模型只校验一次，避免每次请求都跑 SQL。
+    # 仅校验文档 cards / views / chunks 三层；不涉及 sections 与主 documents 表。
+    
     targets = (
         ("document_cards", "document_card_embeddings"),
         ("document_views", "document_view_embeddings"),
         ("chunks", "chunk_embeddings"),
     )
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             for source_table, embedding_table in targets:
                 # 源表条数是当前数据快照应具备的向量基线。
@@ -101,12 +99,11 @@ def vector_search_document_cards_pg(
     model_name: str = DEFAULT_MODEL,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """向量通道：document_card_embeddings 上的余弦相似度检索。
-
-    - 余弦距离 <=> 越小越相似；1 - distance 转为相似度，可与其它通道统一按降序解释；
-    - 必须 WHERE e.model = %s 保证只查当前模型（兼容历史模型记录）；
-    - time_sql 把 publication_date 改成 dc.publication_date，消除 cards JOIN documents 后的列歧义。
-    """
+    # 向量通道：document_card_embeddings 上的余弦相似度检索。
+    # - 余弦距离 <=> 越小越相似；1 - distance 转为相似度，可与其它通道统一按降序解释；
+    # - 必须 WHERE e.model = %s 保证只查当前模型（兼容历史模型记录）；
+    # - time_sql 把 publication_date 改成 dc.publication_date，消除 cards JOIN documents 后的列歧义。
+    
     vector = helper_query_vector(query, model_name)
     params: list[Any] = [vector, model_name]
     where = ["e.model = %s"]
@@ -134,7 +131,7 @@ def vector_search_document_cards_pg(
         LIMIT %s
     """
     params.extend([vector, topk])
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -164,12 +161,11 @@ def vector_search_document_views_pg(
     model_name: str = DEFAULT_MODEL,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """向量通道：document_view_embeddings 上的余弦相似度检索。
+    # 向量通道：document_view_embeddings 上的余弦相似度检索。
+    # 与 cards 通道差异：
+    # - 多取候选（max(topk*3, topk)），同一文档的多个视图都被召回后 Python 端按 doc_id 去重；
+    #   不预先在 SQL 里 DISTINCT 是为了保留优先级和分数用于融合。
 
-    与 cards 通道差异：
-    - 多取候选（max(topk*3, topk)），同一文档的多个视图都被召回后 Python 端按 doc_id 去重；
-      不预先在 SQL 里 DISTINCT 是为了保留优先级和分数用于融合。
-    """
     vector = helper_query_vector(query, model_name)
     params: list[Any] = [vector, model_name]
     where = ["e.model = %s"]
@@ -198,7 +194,7 @@ def vector_search_document_views_pg(
     """
     # 同一文档可命中多个语义视图，先过召回再按 doc_id 去重，避免视图数挤占文档数。
     params.extend([vector, max(topk * 3, topk)])
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -238,15 +234,13 @@ def vector_retrieve_chunks_pg(
     model_name: str = DEFAULT_MODEL,
     document_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """向量通道：chunk_embeddings 上的余弦相似度分块检索。
-
-    关键过滤：
-    - e.model = %s 锁定当前模型；
-    - c.is_reference_section = false 在 SQL 层排除参考文献（与 BM25 通道一致）。
-
-    返回保留完整追踪字段（chunk_id / doc_id / section_path / chunk_type 等），
-    便于后续 Reranker 与 MCP 返回引用。
-    """
+    # 向量通道：chunk_embeddings 上的余弦相似度分块检索。
+    # 关键过滤：
+    # - e.model = %s 锁定当前模型；
+    # - c.is_reference_section = false 在 SQL 层排除参考文献（与 BM25 通道一致）。
+    # 返回保留完整追踪字段（chunk_id / doc_id / section_path / chunk_type 等），
+    # 便于后续 Reranker 与 MCP 返回引用。
+    
     vector = helper_query_vector(query, model_name)
     params: list[Any] = [vector, model_name]
     where = ["e.model = %s", "c.is_reference_section = false"]
@@ -276,7 +270,7 @@ def vector_retrieve_chunks_pg(
         LIMIT %s
     """
     params.extend([vector, topk])
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -305,13 +299,12 @@ def vector_retrieve_chunks_pg(
 
 
 def helper_section_path_items(section_path: Any) -> list[Any]:
-    """把 section_path 规整为 list。
-
-    兼容三种来源：
-    - str（pgvector 入库前 JSON 字符串）：尝试 json.loads，失败时回退到 [str]；
-    - list：原样返回；
-    - 其它可迭代对象：list() 转换。
-    """
+    # 把 section_path 规整为 list。
+    # 兼容三种来源：
+    # - str（pgvector 入库前 JSON 字符串）：尝试 json.loads，失败时回退到 [str]；
+    # - list：原样返回；
+    # - 其它可迭代对象：list() 转换。
+    
     if isinstance(section_path, str):
         try:
             value = json.loads(section_path)
@@ -324,25 +317,23 @@ def helper_section_path_items(section_path: Any) -> list[Any]:
 
 
 def helper_section_path_json(section_path: Any) -> str:
-    """把 section_path 序列化为紧凑 JSON 字符串（用于 PG jsonb 字段）。"""
+    # 把 section_path 序列化为紧凑 JSON 字符串（用于 PG jsonb 字段）。
     return json.dumps(helper_section_path_items(section_path), ensure_ascii=False, separators=(",", ":"))
 
 
 def helper_enrich_chunk_context_pg(dsn: str | None, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """给每个 chunk 补充其所属 section 的 heading 与 char_start/char_end。
-
-    行为：
-    - 通过 doc_id + section_path 查找对应 section 行（按 section_index 取第一条）；
-    - 找不到时回退使用 section_path 最后一项作为 heading 占位；
-    - 同时填 source_quote_context（用于 MCP 显示引用上下文）；
-    - char_span_kind 标记 section/document 跨度，便于前端区分引用粒度。
-
-    当前为 N+1 查询（每 chunk 一次），数据量大时可改为批量 IN 查询优化。
-    """
+    # 给每个 chunk 补充其所属 section 的 heading 与 char_start/char_end。
+    # 行为：
+    # - 通过 doc_id + section_path 查找对应 section 行（按 section_index 取第一条）；
+    # - 找不到时回退使用 section_path 最后一项作为 heading 占位；
+    # - 同时填 source_quote_context（用于 MCP 显示引用上下文）；
+    # - char_span_kind 标记 section/document 跨度，便于前端区分引用粒度。
+    # 当前为 N+1 查询（每 chunk 一次），数据量大时可改为批量 IN 查询优化。
+    
     if not items:
         return []
     enriched: list[dict[str, Any]] = []
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             for item in items:
                 heading = None
@@ -379,14 +370,12 @@ def helper_enrich_chunk_context_pg(dsn: str | None, items: list[dict[str, Any]])
 
 
 def helper_department_fields(item: dict[str, Any]) -> dict[str, Any]:
-    """把 PG 中的 clinical_department 单字符串（含 '|' 分隔的多科室）拆为 list。
-
-    例如：'呼吸内科|感染科' → clinical_departments=['呼吸内科','感染科']，
-    clinical_department='呼吸内科'（取第一个作为主科室），
-    department_scope='compositive'（>1 否则 'single'）。
-
-    该字段在 MCP 返回前由 MCP 层统一处理；本函数先在检索阶段补齐，便于排序与配额。
-    """
+    # 把 PG 中的 clinical_department 单字符串（含 '|' 分隔的多科室）拆为 list。
+    # 例如：'呼吸内科|感染科' → clinical_departments=['呼吸内科','感染科']，
+    # clinical_department='呼吸内科'（取第一个作为主科室），
+    # department_scope='compositive'（>1 否则 'single'）。
+    # 该字段在 MCP 返回前由 MCP 层统一处理；本函数先在检索阶段补齐，便于排序与配额。
+    
     labels = [label for label in str(item.get("clinical_department") or "").split("|") if label] or ["未分类"]
     item = dict(item)
     item.update(
@@ -398,13 +387,11 @@ def helper_department_fields(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def helper_route_documents_pg(items: list[dict[str, Any]], clinical_department: str | None) -> list[dict[str, Any]]:
-    """当用户传入 clinical_department 过滤时，按单科/多科配额重组候选。
-
-    配额：45 个单科室 + 5 个多科室（共 50），剩余位置按原顺序补齐去重。
-    这样既能保证相关性强的单科室文档优先，又保留少量多科室覆盖。
-
-    不传临床科室过滤时直接取前 50，不做配额（避免过度限制无过滤场景）。
-    """
+    # 当用户传入 clinical_department 过滤时，按单科/多科配额重组候选。
+    # 配额：45 个单科室 + 5 个多科室（共 50），剩余位置按原顺序补齐去重。
+    # 这样既能保证相关性强的单科室文档优先，又保留少量多科室覆盖。
+    # 不传临床科室过滤时直接取前 50，不做配额（避免过度限制无过滤场景）。
+    
     if not clinical_department:
         return items[:50]
     single = [item for item in items if "|" not in str(item.get("clinical_department") or "")][:45]
@@ -417,17 +404,16 @@ def helper_route_documents_pg(items: list[dict[str, Any]], clinical_department: 
 
 
 def helper_route_chunks_pg(items: list[dict[str, Any]], dsn: str | None, clinical_department: str | None) -> list[dict[str, Any]]:
-    """与 helper_route_documents_pg 类似但作用在 chunk 上。
-
-    配额：91 个单科室 + 9 个多科室（共 100）。
-    单/多科室需要查 documents 表（因为 chunks 表只有单数字段），先批量取一次避免 N+1。
-    """
+    # 与 helper_route_documents_pg 类似但作用在 chunk 上。
+    # 配额：91 个单科室 + 9 个多科室（共 100）。
+    # 单/多科室需要查 documents 表（因为 chunks 表只有单数字段），先批量取一次避免 N+1。
+    
     if not clinical_department:
         return items[:100]
     doc_ids = list(dict.fromkeys(item["doc_id"] for item in items))
     scopes: dict[str, str] = {}
     if doc_ids:
-        with connect(dsn) as conn:
+        with PooledConn(get_pool(dsn)) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT doc_id, clinical_department FROM documents WHERE doc_id = ANY(%s)", (doc_ids,))
                 scopes = {row[0]: ("compositive" if "|" in str(row[1] or "") else "single") for row in cur.fetchall()}
@@ -447,13 +433,12 @@ def helper_optional_vector_channel(
     *args: Any,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
-    """执行可选向量通道；按 required 决定失败时是抛错还是降级为空结果。
-
-    设计动机：4 个向量通道分别捕获 cards / views / chunks 的异常，集中处理避免在
-    search_*_hybrid_pg 内重复 try/except。required 为真时（PG_VECTOR_RETRIEVAL_REQUIRED=1）
-    异常直接上抛，符合"强制向量就绪"的业务诉求；否则记 warning 后返回空列表，
-    由后续 RRF 融合自然回退为纯文本检索。
-    """
+    # 执行可选向量通道；按 required 决定失败时是抛错还是降级为空结果。
+    # 设计动机：4 个向量通道分别捕获 cards / views / chunks 的异常，集中处理避免在
+    # search_*_hybrid_pg 内重复 try/except。required 为真时（PG_VECTOR_RETRIEVAL_REQUIRED=1）
+    # 异常直接上抛，符合"强制向量就绪"的业务诉求；否则记 warning 后返回空列表，
+    # 由后续 RRF 融合自然回退为纯文本检索。
+    
     try:
         return search(*args, **kwargs)
     except Exception:
@@ -469,15 +454,14 @@ def search_documents_hybrid_pg(
     publication_date: str | None = None, topk: int = 20, pool_size: int = 50,
     model_name: str = DEFAULT_MODEL, reranker: DocumentReranker | None = None, document_kind: str = "guideline",
 ) -> list[dict[str, Any]]:
-    """文档级混合检索：BM25 + Dense 双通道 → RRF → Reranker → topk。
-
-    流程：
-    1. 若 PG_VECTOR_RETRIEVAL_REQUIRED=1，先校验 3 张 embedding 表与源表行数一致；
-    2. 四路召回（card_text / view_text / card_dense / view_dense）各取 pool_size 条；
-    3. 仅保留非空通道做 RRF（空通道不影响融合分数）；
-    4. 临床科室配额（helper_route_documents_pg）筛选出至多 50 个候选；
-    5. 默认 DocumentReranker 重排至 topk（封顶 20）。
-    """
+    # 文档级混合检索：BM25 + Dense 双通道 → RRF → Reranker → topk。
+    # 流程：
+    # 1. 若 PG_VECTOR_RETRIEVAL_REQUIRED=1，先校验 3 张 embedding 表与源表行数一致；
+    # 2. 四路召回（card_text / view_text / card_dense / view_dense）各取 pool_size 条；
+    # 3. 仅保留非空通道做 RRF（空通道不影响融合分数）；
+    # 4. 临床科室配额（helper_route_documents_pg）筛选出至多 50 个候选；
+    # 5. 默认 DocumentReranker 重排至 topk（封顶 20）。
+    
     require_vector = pg_vector_retrieval_required()
     if require_vector:
         helper_assert_pg_vectors_ready(dsn, model_name)
@@ -528,16 +512,15 @@ def retrieve_chunks_hybrid_pg(
     publication_date: str | None = None, topk: int = 30, pool_size: int = 100,
     model_name: str = DEFAULT_MODEL, reranker: ChunkReranker | None = None, document_kind: str = "guideline",
 ) -> list[dict[str, Any]]:
-    """分块级混合检索：BM25 + Dense 双通道 → RRF → 路由 → 上下文增强 → Reranker → topk。
-
-    流程：
-    1. 强制向量就绪校验（可选）；
-    2. 两路召回（text_ranked / vector_ranked）各取 pool_size；
-    3. RRF 融合（按 chunk_id 而非 doc_id）；
-    4. helper_route_chunks_pg 按 91/9 配额重组；
-    5. helper_enrich_chunk_context_pg 补充 section heading 与 char_span；
-    6. 默认 ChunkReranker 重排至 topk（封顶 30）。
-    """
+    # 分块级混合检索：BM25 + Dense 双通道 → RRF → 路由 → 上下文增强 → Reranker → topk。
+    # 流程：
+    # 1. 强制向量就绪校验（可选）；
+    # 2. 两路召回（text_ranked / vector_ranked）各取 pool_size；
+    # 3. RRF 融合（按 chunk_id 而非 doc_id）；
+    # 4. helper_route_chunks_pg 按 91/9 配额重组；
+    # 5. helper_enrich_chunk_context_pg 补充 section heading 与 char_span；
+    # 6. 默认 ChunkReranker 重排至 topk（封顶 30）。
+    
     require_vector = pg_vector_retrieval_required()
     if require_vector:
         helper_assert_pg_vectors_ready(dsn, model_name)
@@ -574,16 +557,15 @@ def retrieve_chunks_hybrid_pg(
 def helper_attach_document_views_pg(
     items: list[dict[str, Any]], dsn: str | None = None,
 ) -> list[dict[str, Any]]:
-    """批量回填每个文档的 view_type → text 映射，供前端展示摘要/目录等。
-
-    - dict.fromkeys 保序去重：保持 item 中 doc_id 首次出现顺序；
-    - views_by_doc[view_type] 取首次出现的视图文本（同一 type 多个 view 时第一条优先）。
-    """
+    # 批量回填每个文档的 view_type → text 映射，供前端展示摘要/目录等。
+    # - dict.fromkeys 保序去重：保持 item 中 doc_id 首次出现顺序；
+    # - views_by_doc[view_type] 取首次出现的视图文本（同一 type 多个 view 时第一条优先）。
+    
     if not items:
         return []
     doc_ids = list(dict.fromkeys(item["doc_id"] for item in items))
     views_by_doc: dict[str, dict[str, str]] = {doc_id: {} for doc_id in doc_ids}
-    with connect(dsn) as conn:
+    with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -607,11 +589,10 @@ def search_documents_with_consensus_fallback_pg(
     clinical_department: str | None = None, time_range: str | dict[str, str] | None = None,
     publication_date: str | None = None, topk: int = 20, reranker: DocumentReranker | None = None,
 ) -> list[dict[str, Any]]:
-    """文档检索 + consensus 兜底：先用 guideline 集合，缺额时按缺口量补充 consensus。
-
-    wanted = min(topk, 20)：与 search_documents_hybrid_pg 的封顶 20 保持一致，
-    避免 fallback 调用传入过大的 topk 导致 helper_fuse 截断后再被二次拉满。
-    """
+    # 文档检索 + consensus 兜底：先用 guideline 集合，缺额时按缺口量补充 consensus。
+    # wanted = min(topk, 20)：与 search_documents_hybrid_pg 的封顶 20 保持一致，
+    # 避免 fallback 调用传入过大的 topk 导致 helper_fuse 截断后再被二次拉满。
+    
     wanted = min(topk, 20)
     guidelines = search_documents_hybrid_pg(
         query, dsn, source_institution, clinical_department, time_range, publication_date,
@@ -633,12 +614,11 @@ def retrieve_chunks_with_consensus_fallback_pg(
     clinical_department: str | None = None, time_range: str | dict[str, str] | None = None,
     publication_date: str | None = None, topk: int = 30, reranker: ChunkReranker | None = None,
 ) -> list[dict[str, Any]]:
-    """分块检索 + consensus 兜底：先用 guideline 集合，缺额时按缺口量补充 consensus。
-
-    wanted = min(topk, 30)：与 retrieve_chunks_hybrid_pg 封顶一致。
-    注意分块 consensus 兜底可能在补充出的 chunk 上下文信息（如 char_span）不完整，
-    实际使用中 guideline 集合已能覆盖大部分医学问题。
-    """
+    # 分块检索 + consensus 兜底：先用 guideline 集合，缺额时按缺口量补充 consensus。
+    # wanted = min(topk, 30)：与 retrieve_chunks_hybrid_pg 封顶一致。
+    # 注意分块 consensus 兜底可能在补充出的 chunk 上下文信息（如 char_span）不完整，
+    # 实际使用中 guideline 集合已能覆盖大部分医学问题。
+    
     wanted = min(topk, 30)
     guidelines = retrieve_chunks_hybrid_pg(
         query, dsn, source_institution, clinical_department, time_range, publication_date,
