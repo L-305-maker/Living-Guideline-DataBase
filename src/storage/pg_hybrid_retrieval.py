@@ -328,44 +328,74 @@ def helper_enrich_chunk_context_pg(dsn: str | None, items: list[dict[str, Any]])
     # - 找不到时回退使用 section_path 最后一项作为 heading 占位；
     # - 同时填 source_quote_context（用于 MCP 显示引用上下文）；
     # - char_span_kind 标记 section/document 跨度，便于前端区分引用粒度。
-    # 当前为 N+1 查询（每 chunk 一次），数据量大时可改为批量 IN 查询优化。
-    
+    # 性能说明（高并发 N+1 → 单次 IN）：
+    # - 老实现每 chunk 一次 SQL（topk=30 → 30 次往返），高并发下直接放大延迟；
+    # - 新实现 1 次往返：UNNEST 两条数组 (doc_id[], section_path[]),
+    #   JOIN sections + DISTINCT ON (doc_id, section_path) 取 section_index 最小的行；
+    # - 字典 (doc_id, section_path_json) -> section, Python 端按 items 原顺序合并,
+    #   行为与原循环完全一致, 仅减少墙钟。
     if not items:
         return []
-    enriched: list[dict[str, Any]] = []
+    # 1) 去重 (doc_id, section_path_json) 以避免 unnest 数组里有重复项
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        key = (item["doc_id"], helper_section_path_json(item.get("section_path")))
+        if key not in seen:
+            keys.append(key)
+            seen.add(key)
+    if not keys:
+        return []
+    doc_id_array = [k[0] for k in keys]
+    path_array = [k[1] for k in keys]  # 已经是 JSON 字符串, jsonb[] 直接接受
+
+    # 2) 单次 SQL: DISTINCT ON 取每个 (doc_id, section_path) 的 section_index 最小行
+    section_index: dict[tuple[str, str], dict[str, Any]] = {}
     with PooledConn(get_pool(dsn)) as conn:
         with conn.cursor() as cur:
-            for item in items:
-                heading = None
-                section_char_start = None
-                section_char_end = None
-                section_path_json = helper_section_path_json(item.get("section_path"))
-                cur.execute(
-                    """
-                    SELECT heading, char_start, char_end
-                    FROM sections
-                    WHERE doc_id=%s AND section_path=%s::jsonb
-                    ORDER BY section_index
-                    LIMIT 1
-                    """,
-                    (item["doc_id"], section_path_json),
-                )
-                section = cur.fetchone()
-                if section:
-                    heading = section[0]
-                    section_char_start = section[1]
-                    section_char_end = section[2]
+            cur.execute(
+                """
+                SELECT DISTINCT ON (s.doc_id, s.section_path)
+                       s.doc_id, s.section_path, s.heading, s.char_start, s.char_end
+                FROM sections s
+                JOIN unnest(%s::text[], %s::jsonb[]) AS u(doc_id, section_path)
+                  ON u.doc_id = s.doc_id AND u.section_path = s.section_path
+                ORDER BY s.doc_id, s.section_path, s.section_index ASC
+                """,
+                (doc_id_array, path_array),
+            )
+            for row in cur.fetchall():
+                row_doc_id, row_section_path, heading, char_start, char_end = row
+                key = (row_doc_id, helper_section_path_json(row_section_path))
+                section_index[key] = {
+                    "heading": heading,
+                    "char_start": char_start,
+                    "char_end": char_end,
+                }
 
-                section_path_items = helper_section_path_items(item.get("section_path"))
-                updated = dict(item)
-                updated["heading"] = heading or ((section_path_items or [None])[-1])
-                updated["prev_chunk_id"] = None
-                updated["next_chunk_id"] = None
-                updated["char_start"] = section_char_start
-                updated["char_end"] = section_char_end
-                updated["char_span_kind"] = "section" if section_char_start is not None or section_char_end is not None else None
-                updated["source_quote_context"] = helper_source_quote_context("", item.get("content", ""), "")
-                enriched.append(updated)
+    # 3) 按 items 原顺序填充, 与老实现一致 (找不到时退化到 section_path 末项)
+    enriched: list[dict[str, Any]] = []
+    for item in items:
+        key = (item["doc_id"], helper_section_path_json(item.get("section_path")))
+        section = section_index.get(key)
+        if section is not None:
+            heading = section["heading"]
+            section_char_start = section["char_start"]
+            section_char_end = section["char_end"]
+        else:
+            heading = None
+            section_char_start = None
+            section_char_end = None
+        section_path_items = helper_section_path_items(item.get("section_path"))
+        updated = dict(item)
+        updated["heading"] = heading or ((section_path_items or [None])[-1])
+        updated["prev_chunk_id"] = None
+        updated["next_chunk_id"] = None
+        updated["char_start"] = section_char_start
+        updated["char_end"] = section_char_end
+        updated["char_span_kind"] = "section" if section_char_start is not None or section_char_end is not None else None
+        updated["source_quote_context"] = helper_source_quote_context("", item.get("content", ""), "")
+        enriched.append(updated)
     return enriched
 
 
@@ -468,8 +498,45 @@ def search_documents_hybrid_pg(
     if pool_size < 1:
         raise ValueError("pool_size must be positive")
     recall_n = max(pool_size, topk)
-    card_text = search_document_cards_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
-    view_text = search_document_views_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
+
+    # P1.2 高并发改造: text 2 路 (cards/views) 并发, dense 2 路仍串行。
+    # 动机:
+    # - text 通道是纯 PG 网络往返 (TSVector + 多个索引), 没有共享资源,
+    #   ThreadPoolExecutor 并发可省一半墙钟;
+    # - dense 通道要进 SentenceTransformer.encode, 模型非线程安全,
+    #   需要独立 GPU queue 才能并发 (留到 P2, 本期 dense 串行保留)。
+    # 故障语义: text 任一路抛错即整体抛错 (与原行为一致),
+    # dense 沿用 helper_optional_vector_channel 决定抛错还是降级为空列表。
+    _logger_level = os.getenv("PG_RECALL_LOG", "0").strip().lower() in {"1", "true", "yes", "y"}
+    text_workers = max(1, int(os.getenv("PG_RECALL_TEXT_WORKERS", "2")))
+    import concurrent.futures as _cf
+    card_text: list[dict[str, Any]] = []
+    view_text: list[dict[str, Any]] = []
+    with _cf.ThreadPoolExecutor(max_workers=text_workers, thread_name_prefix="mcp-text-recall") as _ex:
+        _futures = {
+            _ex.submit(
+                search_document_cards_pg,
+                query, dsn, source_institution, clinical_department, time_range, publication_date,
+                recall_n, document_kind=document_kind,
+            ): "card_text",
+            _ex.submit(
+                search_document_views_pg,
+                query, dsn, source_institution, clinical_department, time_range, publication_date,
+                recall_n, document_kind=document_kind,
+            ): "view_text",
+        }
+        for fut in _cf.as_completed(_futures):
+            name = _futures[fut]
+            try:
+                if name == "card_text":
+                    card_text = fut.result()
+                else:
+                    view_text = fut.result()
+            except Exception as _exc:
+                if _logger_level:
+                    LOGGER.warning("召回通道 %s 失败: %s", name, _exc, exc_info=True)
+                raise
+
     card_dense = helper_optional_vector_channel(
         "document_cards",
         require_vector,

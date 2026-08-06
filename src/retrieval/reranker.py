@@ -33,11 +33,16 @@ from src.utils.records import (
 )
 
 
-DEFAULT_BGE_RERANKER_MODEL = "Qwen/Qwen3-Reranker-4B"  # 默认 BGE Reranker 模型：Qwen3-Reranker-4B（4B 参数），可通过环境变量 BGE_RERANKER_MODEL 覆盖。
-GUIDE_RE = re.compile(r"(guideline|guidelines|consensus|recommendations?|\u6307\u5357|\u5171\u8bc6)", re.I)  # 指南/共识/推荐类关键词，用于检测候选是否为指南文档。
-OCR_UNRESOLVED_STATUSES = {"needed_unavailable", "needed_not_applied", "needed_but_disabled", "failed"}  # OCR 状态中视为『未解决』的取值集合，触发质量扣分。
-OCR_REVIEW_STATUSES = {"applied_needs_review"}  # OCR 已应用但需人工 review 的状态，轻度扣分。
-HIGH_RISK_CLEANING_FLAGS = {"likely_ocr_failure", "low_text_signal", "noisy_ocr_lines", "pdf_text_mojibake"}  # 高风险清洗标记：OCR 失败 / 低文本信号 / 噪声行 / 文本乱码，触发重度扣分。
+DEFAULT_BGE_RERANKER_MODEL = "Qwen/Qwen3-Reranker-4B"
+  # 默认 BGE Reranker 模型：Qwen3-Reranker-4B（4B 参数），可通过环境变量 BGE_RERANKER_MODEL 覆盖。
+GUIDE_RE = re.compile(r"(guideline|guidelines|consensus|recommendations?|\u6307\u5357|\u5171\u8bc6)", re.I)
+  # 指南/共识/推荐类关键词，用于检测候选是否为指南文档。
+OCR_UNRESOLVED_STATUSES = {"needed_unavailable", "needed_not_applied", "needed_but_disabled", "failed"}
+  # OCR 状态中视为『未解决』的取值集合，触发质量扣分。
+OCR_REVIEW_STATUSES = {"applied_needs_review"}
+  # OCR 已应用但需人工 review 的状态，轻度扣分。
+HIGH_RISK_CLEANING_FLAGS = {"likely_ocr_failure", "low_text_signal", "noisy_ocr_lines", "pdf_text_mojibake"}
+  # 高风险清洗标记：OCR 失败 / 低文本信号 / 噪声行 / 文本乱码，触发重度扣分。
 
 
 class DocumentReranker(Protocol):
@@ -236,6 +241,22 @@ def helper_load_cross_encoder(owner: Any) -> Any:
         raise RuntimeError(owner._load_error) from exc
 
 
+def _gpu_predict_via_queue(pairs: list, owner: Any) -> Any:
+    """单点收口: 优先走 GPUQueue 跨 producer 共享 GPU, 失败回退到 model.predict 直调。
+
+    返回 raw_scores 列表 (与 CrossEncoder.predict 同构)。
+    返回值类型略带 union; runtime 由 caller 走 [float(score) for score in ...]。
+    """
+    try:
+        from src.mcp.gpu_queue import get_gpu_queue  # 延迟导入避免环依赖
+        gq = get_gpu_queue()
+        if gq.is_registered(owner.model_name, "predict"):
+            return gq.submit_predict_pairs(owner.model_name, pairs)
+    except RuntimeError:
+        pass
+    return owner._model.predict(pairs, batch_size=owner.batch_size, show_progress_bar=False)
+
+
 class BgeM3DocumentReranker:
     """Embedding-first cross-encoder reranker backed by BGE reranker v2 m3."""
 
@@ -273,7 +294,11 @@ class BgeM3DocumentReranker:
         try:
             model = helper_load_cross_encoder(self)
             pairs = [(query, helper_candidate_rerank_text(candidate, query)) for candidate in fallback_ranked]
-            raw_scores = model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
+            # P2 高并发: 走 GPUQueue 让 predict 与跨 producer 共享 GPU 调用,
+            # 避免多线程交叉访问 CrossEncoder (非线程安全, 触发 CUDA 上下文冲突)。
+            # 这里 batch 已经攒好 (pairs 列表), submit_predict_pairs 一次提交;
+            # 跨请求合并见 submit_predict_one。
+            raw_scores = _gpu_predict_via_queue(pairs, self)
         except Exception:
             return self.helper_mark_fallback(fallback_ranked[:topk])
 
@@ -360,7 +385,8 @@ class BgeM3ChunkReranker:
         try:
             model = helper_load_cross_encoder(self)
             pairs = [(query, helper_chunk_rerank_text(candidate)) for candidate in fallback_ranked]
-            raw_scores = model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
+            # P2 高并发: 同 BgeM3Document 走 GPUQueue, 避免多线程交叉访问 CrossEncoder。
+            raw_scores = _gpu_predict_via_queue(pairs, self)
         except Exception:
             return self.helper_mark_fallback(fallback_ranked[:topk])
 
@@ -413,6 +439,73 @@ class BgeM3ChunkReranker:
             updated["match_reason"] = reason
             output.append(updated)
         return output
+
+
+def _register_gpu_queue_runner(model_name: str = DEFAULT_BGE_RERANKER_MODEL) -> None:
+    """在 GPUQueue 注册 (model_name, "predict") runner。
+
+    把多个 rerank 请求的 pairs 列表合并到一次 CrossEncoder.predict,
+    避免多线程交叉访问模型。
+    注意: CrossEncoder 实例在 runner 第一次被调用时 lazy 创建一次,
+    之后所有 producer 共享同一个实例 (放在模块级闭包变量里)。
+    """
+    try:
+        from src.mcp.gpu_queue import get_gpu_queue
+        gq = get_gpu_queue()
+        if gq.is_registered(model_name, "predict"):
+            return
+
+        model_holder: dict[str, Any] = {}
+
+        def ensure_model() -> Any:
+            # lazy + 进程级单例 CrossEncoder; 模块级闭包变量做 cache, 避免重复加载。
+            if model_holder.get("model") is not None:
+                return model_holder["model"]
+            try:
+                from sentence_transformers import CrossEncoder  # type: ignore
+            except ImportError:
+                raise RuntimeError("sentence-transformers 未安装, reranker GPU queue 不可用")
+            model_kwargs: dict[str, Any] = {}
+            dtype = os.getenv("BGE_RERANKER_DTYPE", "").strip()
+            if dtype:
+                model_kwargs["torch_dtype"] = dtype
+            attn = os.getenv("BGE_RERANKER_ATTN", "").strip()
+            if attn:
+                model_kwargs["attn_implementation"] = attn
+            local_only = os.getenv("BGE_RERANKER_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
+            max_length = int(os.getenv("BGE_RERANKER_MAX_LENGTH", "1024"))
+            model_holder["model"] = CrossEncoder(
+                model_name,
+                local_files_only=local_only,
+                max_length=max_length,
+                trust_remote_code=True,
+                model_kwargs=model_kwargs or None,
+            )
+            return model_holder["model"]
+
+        def runner(payloads: list[list[tuple[str, str]]]) -> list[list[float]]:
+            """payloads: 每个 producer 是 pairs 列表 (list[tuple[str, str]])。
+
+            返回 list[list[float]]: 每个 producer 对应一个 score 列表,
+            GPUQueue 框架要求与 payloads 等长。
+            """
+            model = ensure_model()
+            batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "8"))
+            out: list[list[float]] = []
+            for pairs in payloads:
+                raw = model.predict(pairs, batch_size=batch_size, show_progress_bar=False)
+                out.append([float(s) for s in raw])
+            return out
+
+        gq.register(model_name, "predict", runner)
+    except Exception:
+        pass
+
+
+try:
+    _register_gpu_queue_runner()
+except Exception:
+    pass
 
 
 def default_document_reranker(recency_boost: bool = False) -> DocumentReranker:

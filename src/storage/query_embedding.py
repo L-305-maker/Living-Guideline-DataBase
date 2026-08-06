@@ -102,9 +102,54 @@ def vector_literal(values: Iterable[float]) -> str:
 def query_vector_literal(query: str, model_name: str = DEFAULT_MODEL) -> str:
     """将单条查询文本编码为可直接嵌入 SQL 的 pgvector 字面量字符串。
 
-    与建库时使用的 encode_with_model 完全对齐：相同的 normalize_embeddings、
-    相同的 matryoshka_dim，保证查询向量与库内向量在同一向量空间中可计算余弦距离。
+    与建库时使用的 encode_with_model 完全对齐: 相同的 normalize_embeddings、
+    相同的 matryoshka_dim, 保证查询向量与库内向量在同一向量空间中可计算余弦距离。
+
+    高并发 (P2): 默认走 GPUQueue 单 producer 入口, 跨请求合并成 batch 一次调
+    SentenceTransformer.encode; 仅在 GPUQueue 缺席时 (如 env GPU_QUEUE_DISABLED=1)
+    回退到直接 model.encode([query])。
     """
+    try:
+        from src.mcp.gpu_queue import get_gpu_queue  # 延迟导入避免环依赖
+        gq = get_gpu_queue()
+        if gq.is_registered(model_name, "embed"):
+            vec = gq.submit_embed(model_name, query)
+            return vector_literal(vec)
+    except RuntimeError:
+        # GPUQueue 未注册或禁用, 直接调 model (与原行为一致)
+        pass
     model = load_model(model_name)
     embedding = encode_with_model(model, [query], model_name=model_name)[0]
     return vector_literal(embedding)
+
+
+def _register_gpu_queue_runner(model_name: str = DEFAULT_MODEL) -> None:
+    """在 GPUQueue 上注册 (model_name, "embed") runner。
+
+    把多个 producer 的单条 query 合并成一次 model.encode(batch),
+    拆结果按请求顺序回填。会在以下时机调用:
+    - 模块顶部 lazy 注册 (首次 import 时, 仅在 sentence-transformers 可用);
+    - 失败时 caller 回退到直接 model.encode, 不再尝试 queue。
+    """
+    try:
+        from src.mcp.gpu_queue import get_gpu_queue
+        gq = get_gpu_queue()
+        if gq.is_registered(model_name, "embed"):
+            return  # 已注册
+
+        def runner(payloads: list[str]) -> list[list[float]]:
+            model = load_model(model_name)
+            arr = encode_with_model(model, payloads, model_name=model_name)
+            return [list(map(float, row)) for row in arr]
+
+        gq.register(model_name, "embed", runner)
+    except Exception:
+        # 任何注册失败都吞掉: 实际 producer 在 submit 时仍会感知
+        # 并回退直接调用 model.encode, 不影响主调用链。
+        pass
+
+
+try:
+    _register_gpu_queue_runner()  # 模块顶层一次性注册默认模型
+except Exception:
+    pass
