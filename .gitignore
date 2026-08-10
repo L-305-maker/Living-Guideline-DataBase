@@ -22,7 +22,8 @@ deploy/pdf-markdown-rag-mcp.service
 .venv
 .venv-mineru/
 .venv-mineru-gpu/
-information/
+*_cache/
+.venv*/
 tests/
 .reasonix/
 reasonix.toml

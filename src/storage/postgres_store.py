@@ -639,6 +639,8 @@ def ingest_data(dsn: str | None = None,data_dir: str | Path = DATA_DIR,batch_siz
         raise ValueError("documents.jsonl contains duplicate doc_id values")
 
     with PooledConn(get_pool(dsn)) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = 0")
         existing_doc_ids: set[str] = set()
         if incremental:
             if allowed_doc_ids:
