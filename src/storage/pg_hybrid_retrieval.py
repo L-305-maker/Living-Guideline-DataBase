@@ -20,9 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from functools import lru_cache
 from collections.abc import Callable
 from typing import Any
+from psycopg.rows import dict_row
 
 from src.retrieval.reranker import ChunkReranker, DocumentReranker, default_chunk_reranker, default_document_reranker
 from src.retrieval.common import (
@@ -32,9 +32,12 @@ from src.retrieval.common import (
 from src.retrieval.rrf import rrf_fusion
 from src.storage.query_embedding import DEFAULT_MODEL, query_vector_literal
 from src.storage.postgres_store import (
+    VECTOR_TARGETS,
+    helper_search_filters,
+    helper_search_results,
     helper_time_filter_sql,
+    helper_unique_documents,
     get_pool,
-    PooledConn,
     retrieve_chunks_pg,
     search_document_cards_pg,
     search_document_views_pg,
@@ -45,13 +48,6 @@ from src.storage.postgres_store import (
 LOGGER = logging.getLogger(__name__)
 
 
-def helper_query_vector(query: str, model_name: str) -> str:
-    # 对查询文本做向量化并返回 pgvector 字面量字符串（SQL 直传）。
-    # 转发到 query_embedding.query_vector_literal，保证与数据库向量化使用同一模型与归一化设置。
-
-    return query_vector_literal(query, model_name)
-
-
 def pg_vector_retrieval_required() -> bool:
     # 读取环境变量 PG_VECTOR_RETRIEVAL_REQUIRED；为真时强制向量通道不可缺失。
     # 业务意义：开启后若向量缺失或查询异常，检索直接抛错而不是悄悄降级，
@@ -60,20 +56,14 @@ def pg_vector_retrieval_required() -> bool:
     return os.getenv("PG_VECTOR_RETRIEVAL_REQUIRED", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 
-@lru_cache(maxsize=4)
 def helper_assert_pg_vectors_ready(dsn: str | None, model_name: str) -> None:
     # 校验 3 张源表的行数 == 对应 embedding 表按 model 过滤的行数，否则抛错。
-    # 用 (dsn, model_name) 作缓存键：同一连接同一模型只校验一次，避免每次请求都跑 SQL。
+    # 每次强制检查都读取当前快照，避免重新入库后沿用过期结果。
     # 仅校验文档 cards / views / chunks 三层；不涉及 sections 与主 documents 表。
     
-    targets = (
-        ("document_cards", "document_card_embeddings"),
-        ("document_views", "document_view_embeddings"),
-        ("chunks", "chunk_embeddings"),
-    )
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
-            for source_table, embedding_table in targets:
+            for source_table, embedding_table in VECTOR_TARGETS:
                 # 源表条数是当前数据快照应具备的向量基线。
                 cur.execute(f"SELECT count(*) FROM {source_table}")
                 source_count = int(cur.fetchone()[0])
@@ -84,7 +74,7 @@ def helper_assert_pg_vectors_ready(dsn: str | None, model_name: str) -> None:
                     raise RuntimeError(
                         f"pgvector is not ready for {source_table}: expected {source_count} embeddings for "
                         f"model {model_name!r}, found {embedding_count}. Run the matching "
-                        "src.storage.bge_m3_vectorize command, then postgres_store index-vectors."
+                        "src.storage.vectorize command, then postgres_store index-vectors."
                     )
 
 
@@ -104,22 +94,20 @@ def vector_search_document_cards_pg(
     # - 必须 WHERE e.model = %s 保证只查当前模型（兼容历史模型记录）；
     # - time_sql 把 publication_date 改成 dc.publication_date，消除 cards JOIN documents 后的列歧义。
     
-    vector = helper_query_vector(query, model_name)
+    vector = query_vector_literal(query, model_name)
     params: list[Any] = [vector, model_name]
-    where = ["e.model = %s"]
-    if source_institution:
-        where.append("dc.source_institution ILIKE %s")
-        params.append(f"%{source_institution}%")
-    if clinical_department:
-        where.append("dc.clinical_department ILIKE %s")
-        params.append(f"%{clinical_department}%")
-    if document_kind:
-        where.append("d.document_kind = %s")
-        params.append(document_kind)
-    if publication_date:
-        where.append("dc.publication_date = %s")
-        params.append(publication_date)
-    time_sql = helper_time_filter_sql(time_range, params).replace("publication_date", "dc.publication_date")
+    where = [
+        "e.model = %s",
+        *helper_search_filters(
+            "dc",
+            params,
+            source_institution=source_institution,
+            clinical_department=clinical_department,
+            publication_date=publication_date,
+            document_kind=document_kind,
+        ),
+    ]
+    time_sql = helper_time_filter_sql(time_range, params, "dc.publication_date")
     sql = f"""
         SELECT dc.doc_id, dc.title, d.abstract, dc.publication_date, dc.source_institution, dc.clinical_department,
                1 - (e.embedding <=> %s::vector) AS score
@@ -131,23 +119,11 @@ def vector_search_document_cards_pg(
         LIMIT %s
     """
     params.extend([vector, topk])
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
+    with get_pool(dsn).connection(timeout=10) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-    return [
-        {
-            "doc_id": row[0],
-            "title": row[1],
-            "abstract": row[2],
-            "publication_date": row[3],
-            "source_institution": row[4],
-            "clinical_department": row[5],
-            "score": float(row[6] or 0.0),
-            "vector_channel": "document_card",
-        }
-        for row in rows
-    ]
+    return helper_search_results(rows, "vector_channel", "document_card")
 
 
 def vector_search_document_views_pg(
@@ -166,22 +142,20 @@ def vector_search_document_views_pg(
     # - 多取候选（max(topk*3, topk)），同一文档的多个视图都被召回后 Python 端按 doc_id 去重；
     #   不预先在 SQL 里 DISTINCT 是为了保留优先级和分数用于融合。
 
-    vector = helper_query_vector(query, model_name)
+    vector = query_vector_literal(query, model_name)
     params: list[Any] = [vector, model_name]
-    where = ["e.model = %s"]
-    if source_institution:
-        where.append("v.source_institution ILIKE %s")
-        params.append(f"%{source_institution}%")
-    if clinical_department:
-        where.append("v.clinical_department ILIKE %s")
-        params.append(f"%{clinical_department}%")
-    if document_kind:
-        where.append("d.document_kind = %s")
-        params.append(document_kind)
-    if publication_date:
-        where.append("v.publication_date = %s")
-        params.append(publication_date)
-    time_sql = helper_time_filter_sql(time_range, params).replace("publication_date", "v.publication_date")
+    where = [
+        "e.model = %s",
+        *helper_search_filters(
+            "v",
+            params,
+            source_institution=source_institution,
+            clinical_department=clinical_department,
+            publication_date=publication_date,
+            document_kind=document_kind,
+        ),
+    ]
+    time_sql = helper_time_filter_sql(time_range, params, "v.publication_date")
     sql = f"""
         SELECT v.doc_id, v.title, d.abstract, v.publication_date, v.source_institution, v.clinical_department,
                v.view_id, v.view_type, 1 - (e.embedding <=> %s::vector) AS score
@@ -194,33 +168,13 @@ def vector_search_document_views_pg(
     """
     # 同一文档可命中多个语义视图，先过召回再按 doc_id 去重，避免视图数挤占文档数。
     params.extend([vector, max(topk * 3, topk)])
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
+    with get_pool(dsn).connection(timeout=10) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-    results = []
-    seen: set[str] = set()
-    for row in rows:
-        if row[0] in seen:
-            continue
-        seen.add(row[0])
-        results.append(
-            {
-                "doc_id": row[0],
-                "title": row[1],
-                "abstract": row[2],
-                "publication_date": row[3],
-                "source_institution": row[4],
-                "clinical_department": row[5],
-                "view_id": row[6],
-                "view_type": row[7],
-                "score": float(row[8] or 0.0),
-                "vector_channel": "document_view",
-            }
-        )
-        if len(results) >= topk:
-            break
-    return results
+    return helper_unique_documents(
+        helper_search_results(rows, "vector_channel", "document_view"), topk
+    )
 
 
 def vector_retrieve_chunks_pg(
@@ -241,22 +195,21 @@ def vector_retrieve_chunks_pg(
     # 返回保留完整追踪字段（chunk_id / doc_id / section_path / chunk_type 等），
     # 便于后续 Reranker 与 MCP 返回引用。
     
-    vector = helper_query_vector(query, model_name)
+    vector = query_vector_literal(query, model_name)
     params: list[Any] = [vector, model_name]
-    where = ["e.model = %s", "c.is_reference_section = false"]
-    if source_institution:
-        where.append("c.source_institution ILIKE %s")
-        params.append(f"%{source_institution}%")
-    if clinical_department:
-        where.append("c.clinical_department ILIKE %s")
-        params.append(f"%{clinical_department}%")
-    if document_kind:
-        where.append("d.document_kind = %s")
-        params.append(document_kind)
-    if publication_date:
-        where.append("c.publication_date = %s")
-        params.append(publication_date)
-    time_sql = helper_time_filter_sql(time_range, params).replace("publication_date", "c.publication_date")
+    where = [
+        "e.model = %s",
+        "c.is_reference_section = false",
+        *helper_search_filters(
+            "c",
+            params,
+            source_institution=source_institution,
+            clinical_department=clinical_department,
+            publication_date=publication_date,
+            document_kind=document_kind,
+        ),
+    ]
+    time_sql = helper_time_filter_sql(time_range, params, "c.publication_date")
     sql = f"""
         SELECT c.chunk_id, c.doc_id, c.content, c.title, c.publication_date, c.source_institution,
                c.clinical_department, c.section_path, c.chunk_index, c.source_file, c.markdown_clean_path,
@@ -270,30 +223,11 @@ def vector_retrieve_chunks_pg(
         LIMIT %s
     """
     params.extend([vector, topk])
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
+    with get_pool(dsn).connection(timeout=10) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-    return [
-        {
-            "chunk_id": row[0],
-            "doc_id": row[1],
-            "content": row[2],
-            "title": row[3],
-            "publication_date": row[4],
-            "source_institution": row[5],
-            "clinical_department": row[6],
-            "section_path": row[7],
-            "chunk_index": row[8],
-            "source_file": row[9],
-            "markdown_clean_path": row[10],
-            "chunk_type": row[11],
-            "retrieval_text": row[12],
-            "score": float(row[13] or 0.0),
-            "retrieval_key": row[14],
-        }
-        for row in rows
-    ]
+    return helper_search_results(rows)
 
 
 
@@ -351,7 +285,7 @@ def helper_enrich_chunk_context_pg(dsn: str | None, items: list[dict[str, Any]])
 
     # 2) 单次 SQL: DISTINCT ON 取每个 (doc_id, section_path) 的 section_index 最小行
     section_index: dict[tuple[str, str], dict[str, Any]] = {}
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -443,7 +377,7 @@ def helper_route_chunks_pg(items: list[dict[str, Any]], dsn: str | None, clinica
     doc_ids = list(dict.fromkeys(item["doc_id"] for item in items))
     scopes: dict[str, str] = {}
     if doc_ids:
-        with PooledConn(get_pool(dsn)) as conn:
+        with get_pool(dsn).connection(timeout=10) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT doc_id, clinical_department FROM documents WHERE doc_id = ANY(%s)", (doc_ids,))
                 scopes = {row[0]: ("compositive" if "|" in str(row[1] or "") else "single") for row in cur.fetchall()}
@@ -632,7 +566,7 @@ def helper_attach_document_views_pg(
         return []
     doc_ids = list(dict.fromkeys(item["doc_id"] for item in items))
     views_by_doc: dict[str, dict[str, str]] = {doc_id: {} for doc_id in doc_ids}
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """

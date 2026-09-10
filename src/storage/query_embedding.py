@@ -15,23 +15,8 @@ from typing import Any, Iterable
 # 注意：换模型必须重新向量化，否则旧向量记录不会被使用，但 PG 中仍会残留。
 DEFAULT_MODEL = os.getenv("PG_VECTOR_MODEL", "Qwen/Qwen3-Embedding-8B")
 
-# 默认向量维度 1024，必须与 postgres_store.py VECTOR_SCHEMA_SQL 中的 vector(1024) 保持一致。
-DEFAULT_DIM = 1024
-
-
-def _parse_matryoshka_dim() -> int:
-    # Matryoshka 表示学习允许从单一模型按子集维度输出向量。
-    # 此处解析环境变量，解析失败回退到 1024 以保证与建库时的表结构兼容。
-    raw = os.getenv("PG_VECTOR_MATRYOSHKA_DIM", "1024")
-    try:
-        return int(raw)
-    except ValueError:
-        return 1024
-
-
-# Qwen3-Embedding 支持 MRL，可输出 32-4096 维；默认 1024 与 vector(1024) 列定义一致。
-# 调整此值后必须同步修改 postgres_store.py 中三处 embedding vector(N) 列宽并重建表。
-DEFAULT_MATRYOSHKA_DIM = _parse_matryoshka_dim()
+# PostgreSQL 的 vector 列与编码器共同使用这一固定维度。
+EMBEDDING_DIM = 1024
 
 # 远程服务器稳定运行后通常只读本地缓存；首次部署或换模型需要联网拉权重。
 # 用环境变量 PG_VECTOR_LOCAL_ONLY=1 切换，避免每次启动都触发网络请求。
@@ -80,12 +65,12 @@ def encode_with_model(model: Any, texts: list[str], *, model_name: str = DEFAULT
     - normalize_embeddings=True：输出 L2 归一化向量，使余弦距离退化为内积，
       与 pgvector 的 vector_cosine_ops 索引计算口径一致。
     - convert_to_numpy=True：返回 numpy.ndarray，方便后续写入 pgvector。
-    - matryoshka_dim：仅当模型为 Qwen3-Embedding 或环境变量显式覆盖时才传入；
-      非 MRL 模型传此参数会被底层库报错，因此严格按条件分支处理。
+    - truncate_dim：Qwen3-Embedding 固定输出数据库列要求的 1024 维；
+      非 MRL 模型不传此参数。
     """
     kwargs: dict[str, Any] = dict(normalize_embeddings=True, convert_to_numpy=True)
-    if "Qwen3-Embedding" in model_name or os.getenv("PG_VECTOR_MATRYOSHKA_DIM"):
-        kwargs["truncate_dim"] = DEFAULT_MATRYOSHKA_DIM
+    if "Qwen3-Embedding" in model_name:
+        kwargs["truncate_dim"] = EMBEDDING_DIM
     return model.encode(texts, **kwargs)
 
 
@@ -103,7 +88,7 @@ def query_vector_literal(query: str, model_name: str = DEFAULT_MODEL) -> str:
     """将单条查询文本编码为可直接嵌入 SQL 的 pgvector 字面量字符串。
 
     与建库时使用的 encode_with_model 完全对齐: 相同的 normalize_embeddings、
-    相同的 matryoshka_dim, 保证查询向量与库内向量在同一向量空间中可计算余弦距离。
+    相同的 truncate_dim，保证查询向量与库内向量在同一向量空间中可计算余弦距离。
 
     高并发 (P2): 默认走 GPUQueue 单 producer 入口, 跨请求合并成 batch 一次调
     SentenceTransformer.encode; 仅在 GPUQueue 缺席时 (如 env GPU_QUEUE_DISABLED=1)

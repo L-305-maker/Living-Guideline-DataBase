@@ -1,4 +1,4 @@
-"""Run PostgreSQL ingestion and BGE-M3 vectorization on a remote host over SSH."""
+"""Run PostgreSQL ingestion and embedding vectorization on a remote host over SSH."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ if [ "$skip_ingest" = "0" ]; then
     "$python_bin" -m src.storage.postgres_store ingest --data-dir "$data_dir" --batch-size "$ingest_batch_size"
 fi
 for target in document_cards document_views chunks; do
-    "$python_bin" -m src.storage.bge_m3_vectorize "$target" \
+    "$python_bin" -m src.storage.vectorize "$target" \
         --model "$model_name" \
         --batch-size "$vector_batch_size" \
         --page-size "$page_size"
@@ -85,7 +85,7 @@ def build_ssh_command(args: argparse.Namespace) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Use local SSH configuration to run remote PostgreSQL ingestion and BGE-M3 vectorization."
+        description="Use local SSH configuration to run remote PostgreSQL ingestion and embedding vectorization."
     )
     parser.add_argument("ssh_target", help="SSH config alias or user@host")
     parser.add_argument("--project-dir", default="/home/lhj/project/evidence_generation")

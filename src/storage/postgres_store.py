@@ -20,11 +20,12 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
+from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 import threading
 from src.retrieval.chunk_normalizer import iter_normalized_chunks
-from src.storage.query_embedding import DEFAULT_MODEL
+from src.storage.query_embedding import DEFAULT_MODEL, EMBEDDING_DIM
 from src.utils.io import DATA_DIR, read_jsonl
 from src.utils.records import (
     department_text as helper_department_text,
@@ -32,10 +33,15 @@ from src.utils.records import (
     truthy as helper_truthy,
 )
 
-POOL = None
-POOL_LOCK = threading.Lock()
+POOLS: dict[str, ConnectionPool] = {}
+POOLS_LOCK = threading.Lock()
+VECTOR_TARGETS = (
+    ("document_cards", "document_card_embeddings"),
+    ("document_views", "document_view_embeddings"),
+    ("chunks", "chunk_embeddings"),
+)
 
-# 5 张主表 + 16 个普通/全文索引。
+# 5 张主表及其普通、trigram 与全文索引。
 # 全文索引使用 GIN(content_tsv)；其中 content_tsv 是 PG 自动生成的 GENERATED 列，
 # 由 title(A) + section_path_text(B) + clinical_department(B) + retrieval_text/content(C)
 # 加权拼接，便于在 BM25-like 检索中区分关键字段的贡献度。
@@ -172,26 +178,34 @@ CREATE TABLE IF NOT EXISTS chunks (
 ALTER TABLE documents
     ADD COLUMN IF NOT EXISTS document_kind TEXT NOT NULL DEFAULT 'guideline';
 
-CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_institution);
-CREATE INDEX IF NOT EXISTS idx_documents_department ON documents(clinical_department);
+DROP INDEX IF EXISTS idx_documents_source;
+DROP INDEX IF EXISTS idx_documents_department;
+CREATE INDEX IF NOT EXISTS idx_documents_source_trgm ON documents USING gin(source_institution gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_documents_department_trgm ON documents USING gin(clinical_department gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_documents_kind_department ON documents(document_kind, clinical_department);
 CREATE INDEX IF NOT EXISTS idx_documents_publication_date ON documents(publication_date);
 CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(publication_year);
-CREATE INDEX IF NOT EXISTS idx_document_cards_source ON document_cards(source_institution);
-CREATE INDEX IF NOT EXISTS idx_document_cards_department ON document_cards(clinical_department);
+DROP INDEX IF EXISTS idx_document_cards_source;
+DROP INDEX IF EXISTS idx_document_cards_department;
+CREATE INDEX IF NOT EXISTS idx_document_cards_source_trgm ON document_cards USING gin(source_institution gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_document_cards_department_trgm ON document_cards USING gin(clinical_department gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_document_cards_date ON document_cards(publication_date);
 CREATE INDEX IF NOT EXISTS idx_document_cards_content_tsv ON document_cards USING gin(content_tsv);
 CREATE INDEX IF NOT EXISTS idx_document_views_doc ON document_views(doc_id);
 CREATE INDEX IF NOT EXISTS idx_document_views_type ON document_views(view_type);
-CREATE INDEX IF NOT EXISTS idx_document_views_source ON document_views(source_institution);
-CREATE INDEX IF NOT EXISTS idx_document_views_department ON document_views(clinical_department);
+DROP INDEX IF EXISTS idx_document_views_source;
+DROP INDEX IF EXISTS idx_document_views_department;
+CREATE INDEX IF NOT EXISTS idx_document_views_source_trgm ON document_views USING gin(source_institution gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_document_views_department_trgm ON document_views USING gin(clinical_department gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_document_views_date ON document_views(publication_date);
 CREATE INDEX IF NOT EXISTS idx_document_views_content_tsv ON document_views USING gin(content_tsv);
 CREATE INDEX IF NOT EXISTS idx_sections_doc ON sections(doc_id);
 CREATE INDEX IF NOT EXISTS idx_sections_department ON sections(clinical_department);
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_institution);
-CREATE INDEX IF NOT EXISTS idx_chunks_department ON chunks(clinical_department);
+DROP INDEX IF EXISTS idx_chunks_source;
+DROP INDEX IF EXISTS idx_chunks_department;
+CREATE INDEX IF NOT EXISTS idx_chunks_source_trgm ON chunks USING gin(source_institution gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_chunks_department_trgm ON chunks USING gin(clinical_department gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_chunks_publication_date ON chunks(publication_date);
 CREATE INDEX IF NOT EXISTS idx_chunks_year ON chunks(publication_year);
 CREATE INDEX IF NOT EXISTS idx_chunks_content_tsv ON chunks USING gin(content_tsv);
@@ -201,14 +215,14 @@ CREATE INDEX IF NOT EXISTS idx_chunks_content_tsv ON chunks USING gin(content_ts
 # pgvector 扩展和 3 张 embedding 表。
 # 主键 (业务ID, model)：允许同一文档对应多套向量（不同模型/不同 MRL 维度）。
 # dim 列记录实际维度，便于混合维度向量的诊断（实际业务统一 1024）。
-VECTOR_SCHEMA_SQL = """
+VECTOR_SCHEMA_SQL = f"""
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS document_card_embeddings (
     doc_id TEXT NOT NULL REFERENCES document_cards(doc_id) ON DELETE CASCADE,
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,
-    embedding vector(1024) NOT NULL,
+    embedding vector({EMBEDDING_DIM}) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (doc_id, model)
 );
@@ -217,7 +231,7 @@ CREATE TABLE IF NOT EXISTS document_view_embeddings (
     view_id TEXT NOT NULL REFERENCES document_views(view_id) ON DELETE CASCADE,
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,
-    embedding vector(1024) NOT NULL,
+    embedding vector({EMBEDDING_DIM}) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (view_id, model)
 );
@@ -226,7 +240,7 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
     chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,
-    embedding vector(1024) NOT NULL,
+    embedding vector({EMBEDDING_DIM}) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (chunk_id, model)
 );
@@ -271,14 +285,13 @@ def get_dsn(cli_dsn: str | None = None) -> str:
     raise RuntimeError("PostgreSQL DSN not configured. Set POSTGRES_DSN or DATABASE_URL.")
 
 
-def get_pool(dsn=None):
-    global POOL
-    if POOL is not None:
-        return POOL
-    with POOL_LOCK:
-        if POOL is None:
-            POOL = ConnectionPool(
-                conninfo=get_dsn(dsn),
+def get_pool(dsn: str | None = None) -> ConnectionPool:
+    conninfo = get_dsn(dsn)
+    with POOLS_LOCK:
+        pool = POOLS.get(conninfo)
+        if pool is None:
+            pool = ConnectionPool(
+                conninfo=conninfo,
                 min_size=int(os.getenv("PG_POOL_MIN", "2")),
                 max_size=int(os.getenv("PG_POOL_MAX", "16")),
                 timeout=30.0,
@@ -286,37 +299,9 @@ def get_pool(dsn=None):
                 open=False,                   # 延迟开
                 name="mcp-pg-pool",
             )
-            POOL.open(wait=True, timeout=10.0)
-    return POOL
-
-
-class PooledConn:
-    def __init__(self, pool): self._pool = pool; self._conn = None
-
-    def __enter__(self):
-        self._conn = self._pool.getconn(timeout=10)
-        return self._conn
-    
-    def __exit__(self, *a):
-        try:
-            if a[0] is not None:
-                self._conn.rollback()
-        finally:
-            self._pool.putconn(self._conn)
-            self._conn = None
-
-"""
-def connect(dsn=None):
-    import psycopg
-
-    conn = psycopg.connect(get_dsn(dsn),
-
-        options=f"-c statement_timeout={int(os.getenv('PG_STATEMENT_TIMEOUT_MS', '8000'))}"
-                 f" -c idle_in_transaction_session_timeout=10s"
-                 f" -c lock_timeout={int(os.getenv('PG_LOCK_TIMEOUT_MS', '3000'))}")
-    # 一个慢 query 不再卡死 worker
-    return conn
-"""
+            pool.open(wait=True, timeout=10.0)
+            POOLS[conninfo] = pool
+        return pool
 
 def serialize_json(value: Any) -> str:
     # 将 Python 对象序列化为 JSON 字符串（ensure_ascii=False 保留中文字符）。
@@ -332,7 +317,7 @@ def init_schema(dsn: str | None = None, with_vector: bool = False) -> dict[str, 
     # pg_trgm 用于 ILIKE 模糊匹配的 GIN 索引加速（如 source_institution ILIKE '%xxx%'）。
     # 向量表与扩展只在 with_vector=True 时创建，便于分阶段建库（先文本后向量）。
     
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
             cur.execute(SCHEMA_SQL)
@@ -349,10 +334,10 @@ def create_vector_indexes(dsn: str | None = None) -> dict[str, Any]:
     # - IVFFlat 索引是必须的，否则向量召回是顺序扫描，性能不可接受；
     # - ANALYZE 让查询规划器知道表大小与数据分布，避免向量召回选择错误的执行计划。
     
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute(VECTOR_INDEX_SQL)
-            for table in ("document_card_embeddings", "document_view_embeddings", "chunk_embeddings"):
+            for _, table in VECTOR_TARGETS:
                 cur.execute(f"ANALYZE {table}")
         conn.commit()
     return {"ok": True, "vector_indexes": "created"}
@@ -367,11 +352,10 @@ def reset_schema(dsn: str | None = None, with_vector: bool = False) -> dict[str,
     #  → chunks → sections → document_views → document_cards → documents
     # 必须在有外键依赖的子表（embeddings）先于主表 DROP，否则 PG 会拒绝。
     
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS chunk_embeddings")
-            cur.execute("DROP TABLE IF EXISTS document_view_embeddings")
-            cur.execute("DROP TABLE IF EXISTS document_card_embeddings")
+            for _, table in reversed(VECTOR_TARGETS):
+                cur.execute(f"DROP TABLE IF EXISTS {table}")
             cur.execute("DROP TABLE IF EXISTS document_embeddings")
             cur.execute("DROP TABLE IF EXISTS chunks")
             cur.execute("DROP TABLE IF EXISTS sections")
@@ -638,7 +622,7 @@ def ingest_data(dsn: str | None = None,data_dir: str | Path = DATA_DIR,batch_siz
     if len(allowed_doc_ids) != len(input_doc_ids):
         raise ValueError("documents.jsonl contains duplicate doc_id values")
 
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = 0")
         existing_doc_ids: set[str] = set()
@@ -758,7 +742,7 @@ def ingest_sections(dsn: str | None = None,data_dir: str | Path = DATA_DIR,batch
     if len(allowed_doc_ids) != len(input_doc_ids):
         raise ValueError("documents.jsonl contains duplicate doc_id values")
 
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         existing_doc_ids: set[str] = set()
         if allowed_doc_ids:
             with conn.cursor() as cur:
@@ -806,7 +790,7 @@ def database_stats(dsn: str | None = None) -> dict[str, Any]:
     # 向量表用 to_regclass() 检查存在性（可能在 with_vector=False 时未建），
     # 仅对存在的表读 count(*)，避免 SQL 报错。
     
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             result: dict[str, Any] = {}
             for table in ["documents", "document_cards", "document_views", "sections", "chunks"]:
@@ -823,7 +807,7 @@ def database_stats(dsn: str | None = None) -> dict[str, Any]:
             result["unknown_publication_date_documents"] = int(cur.fetchone()[0])
             cur.execute("SELECT count(*) FROM chunks WHERE publication_date='unknown'")
             result["unknown_publication_date_chunks"] = int(cur.fetchone()[0])
-            for table in ["document_card_embeddings", "document_view_embeddings", "chunk_embeddings"]:
+            for _, table in VECTOR_TARGETS:
                 cur.execute("SELECT to_regclass(%s) IS NOT NULL", (table,))
                 exists = bool(cur.fetchone()[0])
                 result[f"{table}_table"] = exists
@@ -845,12 +829,7 @@ def verify_retrieval_snapshot(dsn: str | None = None, model_name: str | None = N
     if model_name is None:
         model_name = DEFAULT_MODEL
     artifact_tables = ("documents", "document_cards", "document_views", "sections", "chunks")
-    vector_targets = (
-        ("document_cards", "document_card_embeddings"),
-        ("document_views", "document_view_embeddings"),
-        ("chunks", "chunk_embeddings"),
-    )
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             by_kind = {table: helper_kind_counts(cur, table) for table in artifact_tables}
             for kind in ("guideline", "consensus"):
@@ -864,7 +843,7 @@ def verify_retrieval_snapshot(dsn: str | None = None, model_name: str | None = N
                         raise RuntimeError(f"No {kind} rows were ingested into {table}")
 
             vectors: dict[str, dict[str, int]] = {}
-            for source_table, embedding_table in vector_targets:
+            for source_table, embedding_table in VECTOR_TARGETS:
                 cur.execute(f"SELECT count(*) FROM {source_table}")
                 source_count = int(cur.fetchone()[0])
                 # WHERE model=%s：避免把旧模型的向量记录误判为当前模型已完成。
@@ -879,7 +858,11 @@ def verify_retrieval_snapshot(dsn: str | None = None, model_name: str | None = N
     return {"status": "ok", "model": model_name, "by_document_kind": by_kind, "vectors": vectors}
 
 
-def helper_time_filter_sql(time_range: str | dict[str, str] | None, params: list[Any]) -> str:
+def helper_time_filter_sql(
+    time_range: str | dict[str, str] | None,
+    params: list[Any],
+    column: str = "publication_date",
+) -> str:
     # 把 time_range（'YYYY-YYYY' / dict / 自由字符串）展开成 SQL 片段与 params。
     # 解析规则：
     # - dict：取 start/start_date 与 end/end_date；
@@ -899,43 +882,65 @@ def helper_time_filter_sql(time_range: str | dict[str, str] | None, params: list
         end = f"{match.group(2)}-12-31" if match else None
     clauses = []
     if start:
-        clauses.append("publication_date >= %s")
+        clauses.append(f"{column} >= %s")
         params.append(start)
     if end:
-        clauses.append("publication_date <= %s")
+        clauses.append(f"{column} <= %s")
         params.append(end)
     return " AND " + " AND ".join(clauses) if clauses else ""
 
 
-def helper_fuse_document_results(result_lists: list[list[dict[str, Any]]], topk: int) -> list[dict[str, Any]]:
-    # 对多通道文档召回结果做 RRF 融合，取 topk。
-    # RRF（Reciprocal Rank Fusion）公式：score = Σ 1/(60 + rank)
-    # - k=60 是经验常数，平滑高分项的极端权重；
-    # - 多通道按 doc_id 求和，分数与通道数无关；
-    # - 同分时按 doc_id 字典序稳定排序。
-    # 关键点：
-    # - by_id 取最先出现的项作为代表记录，避免被后续通道覆盖；
-    # - channels 记录每个 doc_id 命中过的通道名（text_channel），便于溯源。
+def helper_search_filters(
+    alias: str,
+    params: list[Any],
+    *,
+    source_institution: str | None,
+    clinical_department: str | None,
+    publication_date: str | None,
+    document_kind: str | None,
+) -> list[str]:
+    """构造各检索表共享的可选过滤条件。"""
+    clauses: list[str] = []
+    for column, value in (
+        ("source_institution", source_institution),
+        ("clinical_department", clinical_department),
+    ):
+        if value:
+            clauses.append(f"{alias}.{column} ILIKE %s")
+            params.append(f"%{value}%")
+    if document_kind:
+        clauses.append("d.document_kind = %s")
+        params.append(document_kind)
+    if publication_date:
+        clauses.append(f"{alias}.publication_date = %s")
+        params.append(publication_date)
+    return clauses
 
-    scores: dict[str, float] = {}
-    by_id: dict[str, dict[str, Any]] = {}
-    channels: dict[str, set[str]] = {}
-    for results in result_lists:
-        for rank, item in enumerate(results, start=1):
-            doc_id = item["doc_id"]
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (60 + rank)
-            by_id.setdefault(doc_id, item)
-            channel = item.get("text_channel")
-            if channel:
-                channels.setdefault(doc_id, set()).add(channel)
-    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:topk]
-    output = []
-    for doc_id, score in ranked:
-        item = dict(by_id[doc_id])
-        item["score"] = score
-        item["retrieval_channels"] = sorted(channels.get(doc_id, set()))
-        output.append(item)
-    return output
+
+def helper_search_results(
+    rows: Iterable[Mapping[str, Any]],
+    channel_key: str | None = None,
+    channel: str | None = None,
+) -> list[dict[str, Any]]:
+    results = [dict(row) for row in rows]
+    for item in results:
+        item["score"] = float(item.get("score") or 0.0)
+        if channel_key:
+            item[channel_key] = channel
+    return results
+
+
+def helper_unique_documents(items: Iterable[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        if item["doc_id"] in seen:
+            continue
+        seen.add(item["doc_id"])
+        results.append(item)
+        if len(results) >= topk:
+            break
+    return results
 
 
 def search_document_cards_pg(
@@ -953,20 +958,18 @@ def search_document_cards_pg(
     # ILIKE 模糊匹配 source_institution / clinical_department 配合 GIN-trgm 索引加速。
     
     params: list[Any] = [query, query]
-    where = ["websearch_to_tsquery('simple', %s) @@ dc.content_tsv"]
-    if source_institution:
-        where.append("dc.source_institution ILIKE %s")
-        params.append(f"%{source_institution}%")
-    if clinical_department:
-        where.append("dc.clinical_department ILIKE %s")
-        params.append(f"%{clinical_department}%")
-    if document_kind:
-        where.append("d.document_kind = %s")
-        params.append(document_kind)
-    if publication_date:
-        where.append("dc.publication_date = %s")
-        params.append(publication_date)
-    time_sql = helper_time_filter_sql(time_range, params).replace("publication_date", "dc.publication_date")
+    where = [
+        "websearch_to_tsquery('simple', %s) @@ dc.content_tsv",
+        *helper_search_filters(
+            "dc",
+            params,
+            source_institution=source_institution,
+            clinical_department=clinical_department,
+            publication_date=publication_date,
+            document_kind=document_kind,
+        ),
+    ]
+    time_sql = helper_time_filter_sql(time_range, params, "dc.publication_date")
     sql = f"""
         SELECT dc.doc_id, dc.title, d.abstract, dc.publication_date, dc.source_institution, dc.clinical_department,
                ts_rank_cd(dc.content_tsv, websearch_to_tsquery('simple', %s)) AS score
@@ -977,23 +980,11 @@ def search_document_cards_pg(
         LIMIT %s
     """
     params.append(topk)
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
+    with get_pool(dsn).connection(timeout=10) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-    return [
-        {
-            "doc_id": row[0],
-            "title": row[1],
-            "abstract": row[2],
-            "publication_date": row[3],
-            "source_institution": row[4],
-            "clinical_department": row[5],
-            "score": float(row[6] or 0.0),
-            "text_channel": "document_card_text",
-        }
-        for row in rows
-    ]
+    return helper_search_results(rows, "text_channel", "document_card_text")
 
 
 def search_document_views_pg(
@@ -1013,20 +1004,18 @@ def search_document_views_pg(
     #   再在 Python 端按 doc_id 去重至 topk，避免视图数挤占文档数。
     
     params: list[Any] = [query, query]
-    where = ["websearch_to_tsquery('simple', %s) @@ v.content_tsv"]
-    if source_institution:
-        where.append("v.source_institution ILIKE %s")
-        params.append(f"%{source_institution}%")
-    if clinical_department:
-        where.append("v.clinical_department ILIKE %s")
-        params.append(f"%{clinical_department}%")
-    if document_kind:
-        where.append("d.document_kind = %s")
-        params.append(document_kind)
-    if publication_date:
-        where.append("v.publication_date = %s")
-        params.append(publication_date)
-    time_sql = helper_time_filter_sql(time_range, params).replace("publication_date", "v.publication_date")
+    where = [
+        "websearch_to_tsquery('simple', %s) @@ v.content_tsv",
+        *helper_search_filters(
+            "v",
+            params,
+            source_institution=source_institution,
+            clinical_department=clinical_department,
+            publication_date=publication_date,
+            document_kind=document_kind,
+        ),
+    ]
+    time_sql = helper_time_filter_sql(time_range, params, "v.publication_date")
     sql = f"""
         SELECT v.doc_id, v.title, d.abstract, v.publication_date, v.source_institution, v.clinical_department,
                v.view_id, v.view_type, ts_rank_cd(v.content_tsv, websearch_to_tsquery('simple', %s)) AS score
@@ -1037,44 +1026,13 @@ def search_document_views_pg(
         LIMIT %s
     """
     params.append(max(topk * 3, topk))
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
+    with get_pool(dsn).connection(timeout=10) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-    results = []
-    seen: set[str] = set()
-    for row in rows:
-        if row[0] in seen:
-            continue
-        seen.add(row[0])
-        results.append(
-            {
-                "doc_id": row[0],
-                "title": row[1],
-                "abstract": row[2],
-                "publication_date": row[3],
-                "source_institution": row[4],
-                "clinical_department": row[5],
-                "view_id": row[6],
-                "view_type": row[7],
-                "score": float(row[8] or 0.0),
-                "text_channel": "document_view_text",
-            }
-        )
-        if len(results) >= topk:
-            break
-    return results
-
-
-def search_documents_pg(query: str,dsn: str, source_institution: str, clinical_department: str, time_range: str | dict[str, str] | None = None, publication_date: str | None = None, topk: int = 10,) -> list[dict[str, Any]]:
-    # 文档级融合检索：cards 通道 + views 通道 → RRF 融合 → topk。
-    # pool_size = max(50, topk)：单通道召回至少 50 个候选，留足融合空间。
-    # 实际调用方通常使用 search_documents_hybrid_pg（混合 BM25 + 向量）。
-    
-    pool_size = max(50, topk)
-    cards = search_document_cards_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, pool_size)
-    views = search_document_views_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, pool_size)
-    return helper_fuse_document_results([cards, views], topk)
+    return helper_unique_documents(
+        helper_search_results(rows, "text_channel", "document_view_text"), topk
+    )
 
 
 def retrieve_chunks_pg(
@@ -1092,20 +1050,19 @@ def retrieve_chunks_pg(
     # 返回字段保留全部追踪字段（section_path / chunk_type / source_file 等），供 MCP 返回原文引用。
     
     params: list[Any] = [query, query]
-    where = ["websearch_to_tsquery('simple', %s) @@ c.content_tsv", "c.is_reference_section = false"]
-    if source_institution:
-        where.append("c.source_institution ILIKE %s")
-        params.append(f"%{source_institution}%")
-    if clinical_department:
-        where.append("c.clinical_department ILIKE %s")
-        params.append(f"%{clinical_department}%")
-    if document_kind:
-        where.append("d.document_kind = %s")
-        params.append(document_kind)
-    if publication_date:
-        where.append("c.publication_date = %s")
-        params.append(publication_date)
-    time_sql = helper_time_filter_sql(time_range, params).replace("publication_date", "c.publication_date")
+    where = [
+        "websearch_to_tsquery('simple', %s) @@ c.content_tsv",
+        "c.is_reference_section = false",
+        *helper_search_filters(
+            "c",
+            params,
+            source_institution=source_institution,
+            clinical_department=clinical_department,
+            publication_date=publication_date,
+            document_kind=document_kind,
+        ),
+    ]
+    time_sql = helper_time_filter_sql(time_range, params, "c.publication_date")
     sql = f"""
         SELECT c.chunk_id, c.doc_id, c.content, c.title, c.publication_date, c.source_institution, c.clinical_department, c.section_path,
                c.chunk_index, c.source_file, c.markdown_clean_path, c.chunk_type, c.retrieval_text,
@@ -1118,30 +1075,11 @@ def retrieve_chunks_pg(
         LIMIT %s
     """
     params.append(topk)
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
+    with get_pool(dsn).connection(timeout=10) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-    return [
-        {
-            "chunk_id": row[0],
-            "doc_id": row[1],
-            "content": row[2],
-            "title": row[3],
-            "publication_date": row[4],
-            "source_institution": row[5],
-            "clinical_department": row[6],
-            "section_path": row[7],
-            "chunk_index": row[8],
-            "source_file": row[9],
-            "markdown_clean_path": row[10],
-            "chunk_type": row[11],
-            "retrieval_text": row[12],
-            "score": float(row[13] or 0.0),
-            "retrieval_key": row[14],
-        }
-        for row in rows
-    ]
+    return helper_search_results(rows)
 
 
 def read_document_pg(doc_id: str | None = None,dsn: str | None = None,title: str | None = None,max_chars: int | None = None,) -> dict[str, Any]:
@@ -1154,8 +1092,8 @@ def read_document_pg(doc_id: str | None = None,dsn: str | None = None,title: str
     
     if not doc_id and not title:
         raise ValueError("read_document_pg requires either doc_id or title")
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
+    with get_pool(dsn).connection(timeout=10) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
             if doc_id:
                 cur.execute(
                     """
@@ -1182,20 +1120,12 @@ def read_document_pg(doc_id: str | None = None,dsn: str | None = None,title: str
             row = cur.fetchone()
     if not row:
         raise KeyError(f"Document not found: {doc_id or title}")
-    content = row[8]
+    result = dict(row)
+    content = result.pop("content_md")
     if max_chars and max_chars > 0:
         content = content[:max_chars]
-    return {
-        "doc_id": row[0],
-        "title": row[1],
-        "publication_date": row[2],
-        "source_institution": row[3],
-        "clinical_department": row[4],
-        "document_kind": row[5],
-        "source_file": row[6],
-        "markdown_clean_path": row[7],
-        "content": content,
-    }
+    result["content"] = content
+    return result
 
 
 def main() -> None:

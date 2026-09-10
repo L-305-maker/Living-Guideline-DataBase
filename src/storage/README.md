@@ -5,7 +5,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `postgres_store.py` | 建表、全量入库、统计、PostgreSQL 全文检索和向量索引创建 |
-| `bge_m3_vectorize.py` | 读取卡片、视图、分块，使用 Qwen3-Embedding-8B（matryoshka_dim=1024）编码并写入 pgvector 表 |
+| `vectorize.py` | 读取卡片、视图、分块，使用 Qwen3-Embedding-8B（1024 维）编码并写入 pgvector 表 |
 | `query_embedding.py` | 缓存查询模型并生成 pgvector 参数文本 |
 | `pg_hybrid_retrieval.py` | 融合 PostgreSQL 词法通道、pgvector 通道和重排结果 |
 
@@ -18,9 +18,9 @@
 ```powershell
 python -B -m src.storage.postgres_store init --with-vector
 python -B -m src.storage.postgres_store ingest
-python -B -m src.storage.bge_m3_vectorize document_cards
-python -B -m src.storage.bge_m3_vectorize document_views
-python -B -m src.storage.bge_m3_vectorize chunks
+python -B -m src.storage.vectorize document_cards
+python -B -m src.storage.vectorize document_views
+python -B -m src.storage.vectorize chunks
 python -B -m src.storage.postgres_store index-vectors
 python -B -m src.storage.postgres_store stats
 ```

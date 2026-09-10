@@ -199,7 +199,7 @@ python -B scripts/run_idsa_full_information.py --model-only --resume
 - 远端依次：
   1. `init --with-vector`（建表 + pgvector 扩展）
   2. `ingest --data-dir ... --batch-size 500`（JSONL → PostgreSQL，除非 `--skip-ingest`）
-  3. 三个 `bge_m3_vectorize`（document_cards / document_views / chunks，分页）
+  3. 三个 `vectorize` 目标（document_cards / document_views / chunks，分页）
   4. `index-vectors`（创建 IVFFlat）
   5. `verify --model Qwen/Qwen3-Embedding-8B`
 - 默认：项目目录 `/home/lhj/project/evidence_generation`、模型 `Qwen/Qwen3-Embedding-8B`、HF cache `/data/lhj/huggingface`、PG env `/etc/pdf-markdown-rag/postgres.env`

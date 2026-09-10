@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from typing import Any
 
-from src.storage.postgres_store import PooledConn,get_pool
+from src.storage.postgres_store import get_pool
 from src.storage.query_embedding import (
     DEFAULT_MODEL,
+    EMBEDDING_DIM,
     encode_with_model as _encode_with_model,
     load_model as helper_load_model,
     vector_literal as _vector_literal,
@@ -33,107 +35,65 @@ def ensure_vector_schema(dsn: str | None = None) -> None:
     """
     from src.storage.postgres_store import VECTOR_SCHEMA_SQL
 
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute(VECTOR_SCHEMA_SQL)
         conn.commit()
 
 
-def helper_fetch_document_cards(
+@dataclass(frozen=True)
+class VectorTarget:
+    source_table: str
+    alias: str
+    id_column: str
+    text_expression: str
+    embedding_table: str
+
+
+DOCUMENT_CARDS = VectorTarget(
+    "document_cards", "dc", "doc_id", "dc.card_text", "document_card_embeddings"
+)
+DOCUMENT_VIEWS = VectorTarget(
+    "document_views", "v", "view_id", "v.text", "document_view_embeddings"
+)
+CHUNKS = VectorTarget(
+    "chunks",
+    "c",
+    "chunk_id",
+    "coalesce(nullif(c.text_for_embedding, ''), nullif(c.retrieval_text, ''), c.content)",
+    "chunk_embeddings",
+)
+
+
+def helper_fetch_rows(
+    target: VectorTarget,
     dsn: str | None,
     limit: int | None,
     offset: int,
     missing_only: bool,
     model_name: str,
-    max_text_chars: int,
+    max_text_chars: int | None = None,
 ) -> list[tuple[str, str]]:
-    """从 document_cards 拉取待向量化的卡片文本。
-
-    关键逻辑：
-    - missing_only=True：通过 LEFT JOIN document_card_embeddings e 并过滤 e.doc_id IS NULL，
-      实现"对当前 model 还没生成向量的卡片"过滤。注意 JOIN 条件里 e.model=%s 限定当前模型，
-      否则会因旧模型已有向量而误判为已完成。
-    - text 用 left(card_text, max_text_chars) 截断，避免超长卡片把 GPU 显存撑爆；
-      cards 默认 max_text_chars=12000，与下方函数签名保持一致。
-    - ORDER BY dc.doc_id OFFSET %s：稳定排序 + 显式 OFFSET，分页重试可幂等。
-      如不加稳定排序，OFFSET 可能跳过或重复记录（重要）。
-    """
-    sql = """
-        SELECT dc.doc_id, left(dc.card_text, %s) AS content
-        FROM document_cards dc
-    """
-    params: list[Any] = [max_text_chars]
-    if missing_only:
-        sql += " LEFT JOIN document_card_embeddings e ON e.doc_id=dc.doc_id AND e.model=%s WHERE e.doc_id IS NULL"
-        params.append(model_name)
-    sql += " ORDER BY dc.doc_id OFFSET %s"
-    params.append(offset)
-    if limit:
-        sql += " LIMIT %s"
-        params.append(limit)
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-
-
-def helper_fetch_document_views(
-    dsn: str | None,
-    limit: int | None,
-    offset: int,
-    missing_only: bool,
-    model_name: str,
-    max_text_chars: int,
-) -> list[tuple[str, str]]:
-    """从 document_views 拉取待向量化的视图文本。
-
-    与 helper_fetch_document_cards 几乎相同，差异：
-    - 唯一键改用 view_id；
-    - 默认 max_text_chars=8000（视图文本通常比卡片短）。
-    """
-    sql = """
-        SELECT v.view_id, left(v.text, %s) AS content
-        FROM document_views v
-    """
-    params: list[Any] = [max_text_chars]
-    if missing_only:
-        sql += " LEFT JOIN document_view_embeddings e ON e.view_id=v.view_id AND e.model=%s WHERE e.view_id IS NULL"
-        params.append(model_name)
-    sql += " ORDER BY v.view_id OFFSET %s"
-    params.append(offset)
-    if limit:
-        sql += " LIMIT %s"
-        params.append(limit)
-    with PooledConn(get_pool(dsn)) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-
-
-def helper_fetch_chunks(dsn: str | None, limit: int | None, offset: int, missing_only: bool, model_name: str) -> list[tuple[str, str]]:
-    """从 chunks 拉取待向量化的分块文本。
-
-    文本优先级（重要）：
-      text_for_embedding > retrieval_text > content
-    三层 coalesce 是为了兼容不同阶段的 chunk 记录：
-    - 新版 chunk 由 chunk_normalizer 写入 text_for_embedding 字段；
-    - 早期版本只有 retrieval_text；
-    - 极端情况下两者都为空则退回 content（保证至少有内容可编码）。
-    """
-    sql = """
-        SELECT c.chunk_id, coalesce(nullif(c.text_for_embedding, ''), nullif(c.retrieval_text, ''), c.content) AS content
-        FROM chunks c
-    """
+    """按受信任的目标配置读取一页待向量化文本。"""
+    content = target.text_expression
     params: list[Any] = []
+    if max_text_chars is not None:
+        content = f"left({content}, %s)"
+        params.append(max_text_chars)
+    sql = f"SELECT {target.alias}.{target.id_column}, {content} AS content FROM {target.source_table} {target.alias}"
     if missing_only:
-        sql += " LEFT JOIN chunk_embeddings e ON e.chunk_id=c.chunk_id AND e.model=%s WHERE e.chunk_id IS NULL"
+        sql += (
+            f" LEFT JOIN {target.embedding_table} e"
+            f" ON e.{target.id_column}={target.alias}.{target.id_column} AND e.model=%s"
+            f" WHERE e.{target.id_column} IS NULL"
+        )
         params.append(model_name)
-    sql += " ORDER BY c.chunk_id OFFSET %s"
+    sql += f" ORDER BY {target.alias}.{target.id_column} OFFSET %s"
     params.append(offset)
     if limit:
         sql += " LIMIT %s"
         params.append(limit)
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
@@ -144,9 +104,7 @@ def helper_vectorize_rows(
     dsn: str | None,
     model_name: str,
     batch_size: int,
-    kind: str,
-    table: str,
-    id_column: str,
+    target: VectorTarget,
     model: Any | None = None,
 ) -> dict[str, Any]:
     """把已读入内存的行批量编码并 UPSERT 到指定 embedding 表。
@@ -154,36 +112,40 @@ def helper_vectorize_rows(
     流程：
     1. 模型按需懒加载（仅首次调用或显式传入 None 时加载），打印 device 便于调试。
     2. 按 batch_size 切片送入 model.encode；批量推理比逐条调用节省大量 CPU/GPU 调度开销。
-    3. payload 形如 [(id, model, dim, vector_literal), ...]，dim 从 embeddings.shape[1]
-       提取，避免硬编码 1024；换 MRL 维度后无需修改本函数。
+    3. 编码结果必须与数据库 vector 列的固定维度一致。
     4. 使用 executemany + ON CONFLICT (id_column, model) DO UPDATE：
        - 同一 (id, model) 已存在时刷新 dim/embedding/created_at；
        - 不存在时正常 INSERT；
        - 关键设计：换模型时旧记录自然不被更新，新记录按新 model 写入。
     5. 每批 commit 一次，避免长事务膨胀 WAL 并允许中途崩溃后断点续跑。
     """
-    print(f"[vectorize] selected {len(rows)} {kind}", flush=True)
+    print(f"[vectorize] selected {len(rows)} {target.source_table}", flush=True)
     if model is None:
         print(f"[vectorize] loading model {model_name}...", flush=True)
         model = helper_load_model(model_name)
         print(f"[vectorize] model loaded on {getattr(model, 'device', 'unknown')}", flush=True)
     inserted = 0
-    with PooledConn(get_pool(dsn)) as conn:
+    with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
             for start in range(0, len(rows), batch_size):
                 batch = rows[start : start + batch_size]
                 texts = [row[1] for row in batch]
-                print(f"[vectorize] encoding {kind} {start + 1}-{start + len(batch)}...", flush=True)
+                print(f"[vectorize] encoding {target.source_table} {start + 1}-{start + len(batch)}...", flush=True)
                 embeddings = _encode_with_model(model, texts, model_name=model_name)
+                dim = int(embeddings.shape[1])
+                if dim != EMBEDDING_DIM:
+                    raise ValueError(
+                        f"Embedding dimension mismatch: expected {EMBEDDING_DIM}, got {dim}"
+                    )
                 payload = [
-                    (row[0], model_name, int(embeddings.shape[1]), _vector_literal(embedding))
+                    (row[0], model_name, dim, _vector_literal(embedding))
                     for row, embedding in zip(batch, embeddings)
                 ]
                 cur.executemany(
                     f"""
-                    INSERT INTO {table} ({id_column}, model, dim, embedding)
+                    INSERT INTO {target.embedding_table} ({target.id_column}, model, dim, embedding)
                     VALUES (%s, %s, %s, %s::vector)
-                    ON CONFLICT ({id_column}, model) DO UPDATE SET
+                    ON CONFLICT ({target.id_column}, model) DO UPDATE SET
                         dim=EXCLUDED.dim,
                         embedding=EXCLUDED.embedding,
                         created_at=now()
@@ -192,23 +154,20 @@ def helper_vectorize_rows(
                 )
                 conn.commit()
                 inserted += len(payload)
-                print(f"[vectorize] upserted {kind} {inserted}/{len(rows)}", flush=True)
-    return {"kind": kind, "model": model_name, "selected": len(rows), "upserted": inserted}
+                print(f"[vectorize] upserted {target.source_table} {inserted}/{len(rows)}", flush=True)
+    return {"kind": target.source_table, "model": model_name, "selected": len(rows), "upserted": inserted}
 
 
 def helper_vectorize_pages(
-    fetch_rows: Any,
-    fetch_kwargs: dict[str, Any],
+    target: VectorTarget,
     dsn: str | None,
     model_name: str,
     batch_size: int,
-    kind: str,
-    table: str,
-    id_column: str,
     limit: int | None,
     offset: int,
     missing_only: bool,
     page_size: int,
+    max_text_chars: int | None = None,
 ) -> dict[str, Any]:
     """分页驱动 helper_vectorize_rows，覆盖大表向量化场景。
 
@@ -233,20 +192,22 @@ def helper_vectorize_pages(
         # missing_only 模式：每页都从同一 offset 开始查剩余缺失项；
         # 否则：每页推进 OFFSET 顺序扫描全表。
         page_offset = offset if missing_only else fetch_offset
-        rows = fetch_rows(dsn, fetch_limit, page_offset, missing_only, model_name, **fetch_kwargs)
+        rows = helper_fetch_rows(
+            target, dsn, fetch_limit, page_offset, missing_only, model_name, max_text_chars
+        )
         if not rows:
             break
         if model is None:
             print(f"[vectorize] loading model {model_name}...", flush=True)
             model = helper_load_model(model_name)
             print(f"[vectorize] model loaded on {getattr(model, 'device', 'unknown')}", flush=True)
-        result = helper_vectorize_rows(rows, dsn, model_name, batch_size, kind, table, id_column, model)
+        result = helper_vectorize_rows(rows, dsn, model_name, batch_size, target, model)
         total += int(result["upserted"])
         if not missing_only:
             fetch_offset += len(rows)
         if len(rows) < fetch_limit:
             break
-    return {"kind": kind, "model": model_name, "selected": total, "upserted": total}
+    return {"kind": target.source_table, "model": model_name, "selected": total, "upserted": total}
 
 
 def vectorize_document_cards(
@@ -267,18 +228,15 @@ def vectorize_document_cards(
     if not skip_schema:
         ensure_vector_schema(dsn)
     return helper_vectorize_pages(
-        helper_fetch_document_cards,
-        {"max_text_chars": max_text_chars},
+        DOCUMENT_CARDS,
         dsn,
         model_name,
         batch_size,
-        "document_cards",
-        "document_card_embeddings",
-        "doc_id",
         limit,
         offset,
         missing_only,
         page_size,
+        max_text_chars,
     )
 
 
@@ -297,18 +255,15 @@ def vectorize_document_views(
     if not skip_schema:
         ensure_vector_schema(dsn)
     return helper_vectorize_pages(
-        helper_fetch_document_views,
-        {"max_text_chars": max_text_chars},
+        DOCUMENT_VIEWS,
         dsn,
         model_name,
         batch_size,
-        "document_views",
-        "document_view_embeddings",
-        "view_id",
         limit,
         offset,
         missing_only,
         page_size,
+        max_text_chars,
     )
 
 
@@ -329,14 +284,10 @@ def vectorize_chunks(
     if not skip_schema:
         ensure_vector_schema(dsn)
     return helper_vectorize_pages(
-        helper_fetch_chunks,
-        {},
+        CHUNKS,
         dsn,
         model_name,
         batch_size,
-        "chunks",
-        "chunk_embeddings",
-        "chunk_id",
         limit,
         offset,
         missing_only,

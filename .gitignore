@@ -11,12 +11,13 @@ __pycache__/
 .vs/
 .ruff_cache/
 .codex/
-tests/
-!tests/
 tests/*
 !tests/__init__.py
-!tests/guideline_information/
-!tests/guideline_information/*.py
+!tests/test_chunk_normalizer.py
+!tests/test_p1_enrich_chunk_context_batch_in.py
+!tests/test_p1_hybrid_recall_concurrent.py
+!tests/test_pg_document_multiview_storage.py
+!tests/test_qwen_model_switch.py
 tmp/
 deploy/pdf-markdown-rag-mcp.service
 .venv
@@ -24,6 +25,5 @@ deploy/pdf-markdown-rag-mcp.service
 .venv-mineru-gpu/
 *_cache/
 .venv*/
-tests/
 .reasonix/
 reasonix.toml
