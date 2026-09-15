@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.storage import pg_hybrid_retrieval as ph  # noqa: E402
 from src.storage import postgres_store as ps  # noqa: E402
+from src.mcp.call_logger import log_mcp_call  # noqa: E402
 
 
 def _run_hybrid(monkey_patches: dict[str, object]) -> object:
@@ -73,6 +74,29 @@ class HybridRecallRuntime(unittest.TestCase):
         ids = {item["doc_id"] for item in result}
         # 不要求全出现 (RRF + topk 截断), 但至少 2 个
         self.assertGreaterEqual(len(ids), 2, f"结果应非空, got {result!r}")
+
+    def test_stage_timings_are_attached_to_call_log(self) -> None:
+        def cards(*a, **k): return [{"doc_id": "A"}]
+        def views(*a, **k): return [{"doc_id": "B"}]
+        def vcards(*a, **k): return [{"doc_id": "C"}]
+        def vviews(*a, **k): return [{"doc_id": "D"}]
+
+        patches = [
+            (ph, "search_document_cards_pg", cards),
+            (ph, "search_document_views_pg", views),
+            (ph, "vector_search_document_cards_pg", vcards),
+            (ph, "vector_search_document_views_pg", vviews),
+        ]
+        records = []
+        with patch("src.mcp.call_logger.helper_write_record", records.append), \
+             patch.object(ph, "DocumentReranker", _empty_reranker()):
+            log_mcp_call("search", "postgres", {"query": "q"}, lambda: _run_hybrid(patches))
+
+        timing = records[0]["retrieval_timing"]
+        self.assertEqual(1, timing["bm25.document_cards"]["calls"])
+        self.assertEqual(1, timing["bm25.document_views"]["calls"])
+        self.assertEqual(1, timing["fusion"]["calls"])
+        self.assertEqual(1, timing["rerank"]["calls"])
 
     # ---- text 异常应整体抛 ----
     def test_text_channel_failure_raises(self) -> None:

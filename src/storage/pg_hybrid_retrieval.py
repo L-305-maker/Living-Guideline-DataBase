@@ -30,6 +30,7 @@ from src.retrieval.common import (
     source_quote_context as helper_source_quote_context,
 )
 from src.retrieval.rrf import rrf_fusion
+from src.mcp.retrieval_timing import current_timing, timed, timed_call
 from src.storage.query_embedding import DEFAULT_MODEL, query_vector_literal
 from src.storage.postgres_store import (
     VECTOR_TARGETS,
@@ -94,7 +95,8 @@ def vector_search_document_cards_pg(
     # - 必须 WHERE e.model = %s 保证只查当前模型（兼容历史模型记录）；
     # - time_sql 把 publication_date 改成 dc.publication_date，消除 cards JOIN documents 后的列歧义。
     
-    vector = query_vector_literal(query, model_name)
+    with timed("embedding.document_cards"):
+        vector = query_vector_literal(query, model_name)
     params: list[Any] = [vector, model_name]
     where = [
         "e.model = %s",
@@ -119,10 +121,11 @@ def vector_search_document_cards_pg(
         LIMIT %s
     """
     params.extend([vector, topk])
-    with get_pool(dsn).connection(timeout=10) as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+    with timed("dense.document_cards"):
+        with get_pool(dsn).connection(timeout=10) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
     return helper_search_results(rows, "vector_channel", "document_card")
 
 
@@ -142,7 +145,8 @@ def vector_search_document_views_pg(
     # - 多取候选（max(topk*3, topk)），同一文档的多个视图都被召回后 Python 端按 doc_id 去重；
     #   不预先在 SQL 里 DISTINCT 是为了保留优先级和分数用于融合。
 
-    vector = query_vector_literal(query, model_name)
+    with timed("embedding.document_views"):
+        vector = query_vector_literal(query, model_name)
     params: list[Any] = [vector, model_name]
     where = [
         "e.model = %s",
@@ -168,10 +172,11 @@ def vector_search_document_views_pg(
     """
     # 同一文档可命中多个语义视图，先过召回再按 doc_id 去重，避免视图数挤占文档数。
     params.extend([vector, max(topk * 3, topk)])
-    with get_pool(dsn).connection(timeout=10) as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+    with timed("dense.document_views"):
+        with get_pool(dsn).connection(timeout=10) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
     return helper_unique_documents(
         helper_search_results(rows, "vector_channel", "document_view"), topk
     )
@@ -195,7 +200,8 @@ def vector_retrieve_chunks_pg(
     # 返回保留完整追踪字段（chunk_id / doc_id / section_path / chunk_type 等），
     # 便于后续 Reranker 与 MCP 返回引用。
     
-    vector = query_vector_literal(query, model_name)
+    with timed("embedding.chunks"):
+        vector = query_vector_literal(query, model_name)
     params: list[Any] = [vector, model_name]
     where = [
         "e.model = %s",
@@ -223,10 +229,11 @@ def vector_retrieve_chunks_pg(
         LIMIT %s
     """
     params.extend([vector, topk])
-    with get_pool(dsn).connection(timeout=10) as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+    with timed("dense.chunks"):
+        with get_pool(dsn).connection(timeout=10) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
     return helper_search_results(rows)
 
 
@@ -428,7 +435,7 @@ def search_documents_hybrid_pg(
     
     require_vector = pg_vector_retrieval_required()
     if require_vector:
-        helper_assert_pg_vectors_ready(dsn, model_name)
+        timed_call("vector_ready_check", helper_assert_pg_vectors_ready, dsn, model_name)
     if pool_size < 1:
         raise ValueError("pool_size must be positive")
     recall_n = max(pool_size, topk)
@@ -444,19 +451,20 @@ def search_documents_hybrid_pg(
     _logger_level = os.getenv("PG_RECALL_LOG", "0").strip().lower() in {"1", "true", "yes", "y"}
     text_workers = max(1, int(os.getenv("PG_RECALL_TEXT_WORKERS", "2")))
     import concurrent.futures as _cf
+    timing = current_timing()
     card_text: list[dict[str, Any]] = []
     view_text: list[dict[str, Any]] = []
     with _cf.ThreadPoolExecutor(max_workers=text_workers, thread_name_prefix="mcp-text-recall") as _ex:
         _futures = {
             _ex.submit(
-                search_document_cards_pg,
+                timed_call, "bm25.document_cards", search_document_cards_pg,
                 query, dsn, source_institution, clinical_department, time_range, publication_date,
-                recall_n, document_kind=document_kind,
+                recall_n, timing=timing, document_kind=document_kind,
             ): "card_text",
             _ex.submit(
-                search_document_views_pg,
+                timed_call, "bm25.document_views", search_document_views_pg,
                 query, dsn, source_institution, clinical_department, time_range, publication_date,
-                recall_n, document_kind=document_kind,
+                recall_n, timing=timing, document_kind=document_kind,
             ): "view_text",
         }
         for fut in _cf.as_completed(_futures):
@@ -497,14 +505,16 @@ def search_documents_hybrid_pg(
         "view_dense_rank": {row["doc_id"]: i for i, row in enumerate(view_dense, 1)},
     }
     candidates = []
-    for doc_id, score in rrf_fusion([[item["doc_id"] for item in ranked] for ranked in channels]):
+    fused = timed_call("fusion", rrf_fusion, [[item["doc_id"] for item in ranked] for ranked in channels])
+    for doc_id, score in fused:
         item = dict(by_id[doc_id])
         item["score"] = score
         item["retrieval_scores"] = {name: ranks.get(doc_id) for name, ranks in rank_maps.items()}
         candidates.append(item)
-    candidates = [{**helper_department_fields(item), "document_kind": document_kind} for item in helper_route_documents_pg(candidates, clinical_department)]
+    candidates = timed_call("route", helper_route_documents_pg, candidates, clinical_department)
+    candidates = [{**helper_department_fields(item), "document_kind": document_kind} for item in candidates]
     reranker = reranker or default_document_reranker()
-    return reranker.rerank(query, candidates, min(topk, 20))
+    return timed_call("rerank", reranker.rerank, query, candidates, min(topk, 20))
 
 
 def retrieve_chunks_hybrid_pg(
@@ -524,11 +534,14 @@ def retrieve_chunks_hybrid_pg(
     
     require_vector = pg_vector_retrieval_required()
     if require_vector:
-        helper_assert_pg_vectors_ready(dsn, model_name)
+        timed_call("vector_ready_check", helper_assert_pg_vectors_ready, dsn, model_name)
     if pool_size < 1:
         raise ValueError("pool_size must be positive")
     recall_n = max(pool_size, topk)
-    text_ranked = retrieve_chunks_pg(query, dsn, source_institution, clinical_department, time_range, publication_date, recall_n, document_kind=document_kind)
+    text_ranked = timed_call(
+        "bm25.chunks", retrieve_chunks_pg, query, dsn, source_institution,
+        clinical_department, time_range, publication_date, recall_n, document_kind=document_kind,
+    )
     vector_ranked = helper_optional_vector_channel(
         "chunks",
         require_vector,
@@ -544,15 +557,17 @@ def retrieve_chunks_hybrid_pg(
     bm25_ranks = {row["chunk_id"]: i for i, row in enumerate(text_ranked, 1)}
     vector_ranks = {row["chunk_id"]: i for i, row in enumerate(vector_ranked, 1)}
     candidates = []
-    for chunk_id, score in rrf_fusion([[item["chunk_id"] for item in ranked] for ranked in channels]):
+    fused = timed_call("fusion", rrf_fusion, [[item["chunk_id"] for item in ranked] for ranked in channels])
+    for chunk_id, score in fused:
         item = dict(by_id[chunk_id])
         item["score"] = score
         item["retrieval_scores"] = {"bm25_rank": bm25_ranks.get(chunk_id), "vector_rank": vector_ranks.get(chunk_id)}
         candidates.append(item)
-    candidates = [{**helper_department_fields(item), "document_kind": document_kind} for item in helper_route_chunks_pg(candidates, dsn, clinical_department)]
-    candidates = helper_enrich_chunk_context_pg(dsn, candidates)
+    candidates = timed_call("route", helper_route_chunks_pg, candidates, dsn, clinical_department)
+    candidates = [{**helper_department_fields(item), "document_kind": document_kind} for item in candidates]
+    candidates = timed_call("context_enrich", helper_enrich_chunk_context_pg, dsn, candidates)
     reranker = reranker or default_chunk_reranker()
-    return reranker.rerank(query, candidates, min(topk, 30))
+    return timed_call("rerank", reranker.rerank, query, candidates, min(topk, 30))
 
 
 def helper_attach_document_views_pg(
@@ -607,7 +622,7 @@ def search_documents_with_consensus_fallback_pg(
             topk=deficit, reranker=reranker, document_kind="consensus",
         ),
     )
-    return helper_attach_document_views_pg(output, dsn)
+    return timed_call("response_enrich", helper_attach_document_views_pg, output, dsn)
 
 
 def retrieve_chunks_with_consensus_fallback_pg(

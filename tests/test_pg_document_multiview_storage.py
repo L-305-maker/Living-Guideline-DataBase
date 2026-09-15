@@ -16,6 +16,7 @@ from src.storage.postgres_store import (
     helper_document_rows,
     helper_document_view_rows,
 )
+from src.mcp.retrieval_timing import start_timing, stop_timing
 
 
 class PgDocumentMultiviewStorageTest(unittest.TestCase):
@@ -150,18 +151,24 @@ class PgDocumentMultiviewStorageTest(unittest.TestCase):
             mock.patch.object(pg_hybrid_retrieval, "get_pool", return_value=pool),
             mock.patch.object(pg_hybrid_retrieval, "query_vector_literal", return_value="[0.1]"),
         ):
-            result = pg_hybrid_retrieval.vector_search_document_cards_pg(
-                "query",
-                source_institution="Org",
-                topk=2,
-                model_name="model",
-                document_kind="guideline",
-            )
+            timing, token = start_timing()
+            try:
+                result = pg_hybrid_retrieval.vector_search_document_cards_pg(
+                    "query",
+                    source_institution="Org",
+                    topk=2,
+                    model_name="model",
+                    document_kind="guideline",
+                )
+            finally:
+                stop_timing(token)
 
         _, params = cursor.execute.call_args.args
         self.assertEqual(["[0.1]", "model", "%Org%", "guideline", "[0.1]", 2], params)
         self.assertEqual("document_card", result[0]["vector_channel"])
         self.assertEqual(0.75, result[0]["score"])
+        self.assertEqual(1, timing.snapshot()["embedding.document_cards"]["calls"])
+        self.assertEqual(1, timing.snapshot()["dense.document_cards"]["calls"])
 
     def test_pg_vector_requirement_uses_explicit_environment_flag(self) -> None:
         previous = os.environ.get("PG_VECTOR_RETRIEVAL_REQUIRED")

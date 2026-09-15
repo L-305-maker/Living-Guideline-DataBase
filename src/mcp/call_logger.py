@@ -1,7 +1,7 @@
 # MCP 工具调用的 JSONL 审计日志。
 #
 # 关键设计：
-# - 每条调用追加 1 行 JSON 到 logs/mcp_calls.jsonl（含 call_id / timestamp / tool / payload / result / duration）；
+# - 每条调用追加 1 行 JSON 到 logs/mcp_calls.jsonl（含调用信息、总耗时和检索阶段耗时）；
 # - 敏感字段（password / token / api_key 等）写入前替换为 '***'；
 # - 字符串按 MCP_CALL_LOG_MAX_*_STRING_CHARS 截断，列表按 *_LIST_ITEMS 截断；
 # - result_mode = summary / full / none：full 写 result 全量，summary 只写 result_summary，none 不写 result；
@@ -27,6 +27,7 @@ from src.mcp.server_common import (
     env_bool as helper_env_bool,
     env_int as helper_env_int,
 )
+from src.mcp.retrieval_timing import start_timing, stop_timing
 
 
 ResultT = TypeVar("ResultT")
@@ -203,6 +204,7 @@ def log_mcp_call(tool_name: str, backend: str, payload: dict[str, Any], call: Ca
         "pid": os.getpid(),
         "payload": helper_sanitize(payload, payload_max_string_chars, payload_max_list_items, compact_strings=True),
     }
+    timing, timing_token = start_timing()
     try:
         result = call()
     except Exception as exc:
@@ -214,8 +216,11 @@ def log_mcp_call(tool_name: str, backend: str, payload: dict[str, Any], call: Ca
                 "error": helper_truncate_string(str(exc), payload_max_string_chars, compact=True),
             }
         )
+        record["retrieval_timing"] = timing.snapshot()
         helper_write_record(record)
         raise
+    finally:
+        stop_timing(timing_token)
 
     result_summary = helper_result_summary(result, result_max_list_items)
     record.update(
@@ -223,6 +228,7 @@ def log_mcp_call(tool_name: str, backend: str, payload: dict[str, Any], call: Ca
             "status": "ok",
             "duration_ms": round((time.perf_counter() - started) * 1000, 3),
             "result_summary": result_summary,
+            "retrieval_timing": timing.snapshot(),
         }
     )
     if result_mode not in {"summary", "summary_only", "none", "off"}:
