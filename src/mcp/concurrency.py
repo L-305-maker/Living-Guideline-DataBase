@@ -2,9 +2,19 @@
 import os, threading, contextvars
 from contextlib import contextmanager
 
-ACTIVE = threading.BoundedSemaphore(
-    int(os.getenv("MCP_MAX_CONCURRENT", "16"))
-)
+DB_CONNECTIONS_PER_SEARCH = 2
+
+
+def helper_max_concurrent() -> int:
+    """Keep concurrent searches within the PostgreSQL pool capacity."""
+    pool_max = max(1, int(os.getenv("PG_POOL_MAX", "16")))
+    pool_safe_limit = max(1, pool_max // DB_CONNECTIONS_PER_SEARCH)
+    configured = max(1, int(os.getenv("MCP_MAX_CONCURRENT", str(pool_safe_limit))))
+    return min(configured, pool_safe_limit)
+
+
+MAX_CONCURRENT = helper_max_concurrent()
+ACTIVE = threading.BoundedSemaphore(MAX_CONCURRENT)
 total = 0
 lock = threading.Lock()
 total_lock_seen = threading.Lock()
@@ -23,4 +33,3 @@ def acquire_slot(tool: str, call_id: str):
     finally:
         ACTIVE.release()
         # 用 logging 或 atomic counters, 别在热路径上做 I/O
-        

@@ -39,6 +39,10 @@ CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Reranker-4B \
 不要写入仓库。两个服务可共用 `VLLM_API_KEY`，也可分别设置
 `VLLM_EMBEDDING_API_KEY` 和 `VLLM_RERANKER_API_KEY`。
 
+文档检索会并行执行两条 PostgreSQL 召回 SQL，因此 `MCP_MAX_CONCURRENT` 不应超过
+`PG_POOL_MAX / 2`。示例服务使用 `PG_POOL_MAX=16` 与 `MCP_MAX_CONCURRENT=8`；程序也会
+在启动时自动将更大的 MCP 并发配置限制到该安全上限，避免请求在连接池内排队。
+
 ## 建库顺序
 
 先创建表，再导入数据，然后向量化 cards、views、chunks，最后执行 index-vectors 创建 IVFFlat 索引。服务设置 RAG_BACKEND=postgres 和 PG_VECTOR_RETRIEVAL_REQUIRED=1。

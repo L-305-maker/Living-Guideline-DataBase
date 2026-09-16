@@ -29,7 +29,7 @@ from psycopg.rows import dict_row
 from src.retrieval.reranker import ChunkReranker, DocumentReranker, default_chunk_reranker, default_document_reranker
 from src.retrieval.common import fill_consensus_fallback as helper_fill_consensus_fallback
 from src.retrieval.rrf import rrf_fusion
-from src.mcp.retrieval_timing import current_timing, timed, timed_call
+from src.mcp.retrieval_timing import RetrievalTiming, current_timing, timed, timed_call
 from src.storage.query_embedding import DEFAULT_MODEL, query_vector_literal
 from src.storage.postgres_store import (
     VECTOR_TARGETS,
@@ -111,6 +111,7 @@ def vector_search_document_cards_pg(
     model_name: str = DEFAULT_MODEL,
     document_kind: str | None = None,
     vector: str | None = None,
+    timing: RetrievalTiming | None = None,
 ) -> list[dict[str, Any]]:
     # 向量通道：document_card_embeddings 上的余弦相似度检索。
     # - 余弦距离 <=> 越小越相似；1 - distance 转为相似度，可与其它通道统一按降序解释；
@@ -144,7 +145,7 @@ def vector_search_document_cards_pg(
         LIMIT %s
     """
     params.extend([vector, topk])
-    with timed("dense.document_cards"):
+    with timed("dense.document_cards", timing):
         with get_pool(dsn).connection(timeout=10) as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, params)
@@ -163,6 +164,7 @@ def vector_search_document_views_pg(
     model_name: str = DEFAULT_MODEL,
     document_kind: str | None = None,
     vector: str | None = None,
+    timing: RetrievalTiming | None = None,
 ) -> list[dict[str, Any]]:
     # 向量通道：document_view_embeddings 上的余弦相似度检索。
     # 与 cards 通道差异：
@@ -197,7 +199,7 @@ def vector_search_document_views_pg(
     """
     # 同一文档可命中多个语义视图，先过召回再按 doc_id 去重，避免视图数挤占文档数。
     params.extend([vector, max(topk * 3, topk)])
-    with timed("dense.document_views"):
+    with timed("dense.document_views", timing):
         with get_pool(dsn).connection(timeout=10) as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, params)
@@ -519,13 +521,13 @@ def search_documents_hybrid_pg(
         with _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="mcp-document-dense") as _ex:
             _futures = {
                 _ex.submit(
-                    timed_call, "dense.document_cards", helper_optional_vector_channel,
+                    helper_optional_vector_channel,
                     "document_cards", require_vector, vector_search_document_cards_pg,
                     query, dsn, source_institution, clinical_department, time_range, publication_date,
                     recall_n, model_name, document_kind=document_kind, vector=query_vector, timing=timing,
                 ): "card_dense",
                 _ex.submit(
-                    timed_call, "dense.document_views", helper_optional_vector_channel,
+                    helper_optional_vector_channel,
                     "document_views", require_vector, vector_search_document_views_pg,
                     query, dsn, source_institution, clinical_department, time_range, publication_date,
                     recall_n, model_name, document_kind=document_kind, vector=query_vector, timing=timing,

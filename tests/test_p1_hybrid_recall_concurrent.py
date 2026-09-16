@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.storage import pg_hybrid_retrieval as ph  # noqa: E402
 from src.storage import postgres_store as ps  # noqa: E402
 from src.mcp.call_logger import log_mcp_call  # noqa: E402
+from src.mcp import concurrency  # noqa: E402
 
 
 def _run_hybrid(monkey_patches: dict[str, object]) -> object:
@@ -80,8 +81,12 @@ class HybridRecallRuntime(unittest.TestCase):
     def test_stage_timings_are_attached_to_call_log(self) -> None:
         def cards(*a, **k): return [{"doc_id": "A"}]
         def views(*a, **k): return [{"doc_id": "B"}]
-        def vcards(*a, **k): return [{"doc_id": "C"}]
-        def vviews(*a, **k): return [{"doc_id": "D"}]
+        def vcards(*a, **k):
+            with ph.timed("dense.document_cards", k.get("timing")):
+                return [{"doc_id": "C"}]
+        def vviews(*a, **k):
+            with ph.timed("dense.document_views", k.get("timing")):
+                return [{"doc_id": "D"}]
 
         patches = [
             (ph, "search_document_cards_pg", cards),
@@ -97,6 +102,8 @@ class HybridRecallRuntime(unittest.TestCase):
         timing = records[0]["retrieval_timing"]
         self.assertEqual(1, timing["bm25.document_cards"]["calls"])
         self.assertEqual(1, timing["bm25.document_views"]["calls"])
+        self.assertEqual(1, timing["dense.document_cards"]["calls"])
+        self.assertEqual(1, timing["dense.document_views"]["calls"])
         self.assertEqual(1, timing["fusion"]["calls"])
         self.assertEqual(1, timing["rerank"]["calls"])
 
@@ -210,6 +217,28 @@ class HybridRecallRuntime(unittest.TestCase):
             )
         # 整体墙钟: text 与编码并发 (~0.3s) + dense SQL 并发 (~0.3s) ≈ 0.6s。
         self.assertLess(wall, 0.95, f"总墙钟过长, 并发未生效: {wall:.3f}s")
+
+
+class McpConcurrencyCapacity(unittest.TestCase):
+    def test_default_limit_reserves_two_pool_connections_per_search(self) -> None:
+        with patch.dict(os.environ, {"PG_POOL_MAX": "16"}, clear=True):
+            self.assertEqual(8, concurrency.helper_max_concurrent())
+
+    def test_explicit_limit_cannot_exceed_pool_safe_capacity(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"PG_POOL_MAX": "16", "MCP_MAX_CONCURRENT": "16"},
+            clear=True,
+        ):
+            self.assertEqual(8, concurrency.helper_max_concurrent())
+
+    def test_lower_explicit_limit_is_preserved(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"PG_POOL_MAX": "16", "MCP_MAX_CONCURRENT": "4"},
+            clear=True,
+        ):
+            self.assertEqual(4, concurrency.helper_max_concurrent())
 
 
 if __name__ == "__main__":
