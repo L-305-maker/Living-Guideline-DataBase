@@ -9,7 +9,7 @@
 | `common.py` | 时间范围解析、query term 提取、chunk 元数据补齐和来源上下文拼接 |
 | `chunk_normalizer.py` | 将旧版和新版 chunk JSONL 收敛为 PostgreSQL 入库契约 |
 | `rrf.py` | Reciprocal Rank Fusion 和加权 RRF |
-| `reranker.py` | 文档级和 chunk 级重排接口、规则 fallback 和 Qwen3-Reranker cross-encoder |
+| `reranker.py` | 文档级和 chunk 级重排接口、规则 fallback 和 vLLM Qwen3-Reranker 客户端 |
 | `document_repr/` | 文档 card 与多视图表示构建 |
 
 ## 检索约定
@@ -21,13 +21,14 @@
 
 ## Reranker 配置
 
-默认 reranker 使用 `Qwen/Qwen3-Reranker-4B`，本地缓存优先。可用环境变量切换：
+默认 reranker 通过独立 vLLM 服务使用 `Qwen/Qwen3-Reranker-4B`。可用环境变量切换：
 
-- `DOCUMENT_RERANKER`：`bge_m3`、`rule` 或 `none`。
-- `CHUNK_RERANKER` 或 `RERANKER`：`bge_m3`、`rule` 或 `none`。
-- `BGE_RERANKER_MODEL`、`BGE_RERANKER_DEVICE`、`BGE_RERANKER_BATCH_SIZE`、`BGE_RERANKER_MAX_LENGTH`。
-- `BGE_RERANKER_LOCAL_ONLY=1` 时只读本地 Hugging Face 缓存。
-- `BGE_RERANKER_DTYPE`、`BGE_RERANKER_ATTN`：传给 CrossEncoder 的 `torch_dtype`/`attn_implementation`（大模型建议 `BGE_RERANKER_DTYPE=bfloat16`）。
+- `DOCUMENT_RERANKER`：`vllm`、`rule` 或 `none`。
+- `CHUNK_RERANKER` 或 `RERANKER`：`vllm`、`rule` 或 `none`。
+- `BGE_RERANKER_MODEL`：数据库审计信息使用的模型名。
+- `VLLM_RERANKER_BASE_URL`：vLLM 根地址，默认 `http://127.0.0.1:8002`。
+- `VLLM_RERANKER_MODEL`：vLLM 的 served model name，默认沿用 `BGE_RERANKER_MODEL`。
+- `VLLM_REQUEST_TIMEOUT_SECONDS`：推理读取超时，默认 120 秒。
 
 ## 验证
 

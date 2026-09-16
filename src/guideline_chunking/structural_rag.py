@@ -19,6 +19,7 @@ from typing import Any, Protocol
 from src.guideline_chunking.bm25_index import tokenize
 from src.guideline_chunking.markdown_parser import parse_markdown_document
 from src.guideline_chunking.models import DocumentMeta, ParsedBlock
+from src.models.vllm_client import embed_texts, rerank_texts
 from src.retrieval.rrf import rrf_fusion
 
 
@@ -121,19 +122,14 @@ class HashingTextEncoder:
 
 
 class SentenceTransformerEncoder:
-    def __init__(self, model_name: str = "BAAI/bge-m3", local_files_only: bool = True) -> None:
-        from sentence_transformers import SentenceTransformer  # type: ignore
+    """Backward-compatible encoder name; inference is served by vLLM."""
 
-        self.model = SentenceTransformer(model_name, local_files_only=local_files_only)
+    def __init__(self, model_name: str = "BAAI/bge-m3", local_files_only: bool = True) -> None:
+        self.model_name = model_name
+        _ = local_files_only
 
     def encode(self, texts: list[str]) -> list[list[float]]:
-        vectors = self.model.encode(
-            texts,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        return [[float(value) for value in vector] for vector in vectors]
+        return embed_texts(texts, model_name=self.model_name, dimensions=1024)
 
 
 class RuleBasedReranker:
@@ -177,6 +173,8 @@ class RuleBasedReranker:
 
 
 class CrossEncoderReranker:
+    """Backward-compatible reranker name; inference is served by vLLM."""
+
     def __init__(
         self,
         model_name: str = "BAAI/bge-reranker-v2-m3",
@@ -184,16 +182,14 @@ class CrossEncoderReranker:
         fallback: RuleBasedReranker | None = None,
     ) -> None:
         self.model_name = model_name
-        self.local_files_only = local_files_only
+        _ = local_files_only
         self.fallback = fallback or RuleBasedReranker()
-        self._model: Any | None = None
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
         fallback_ranked = self.fallback.rerank(query, candidates, len(candidates))
         try:
-            model = self.helper_load_model()
-            pairs = [(query, item["chunk"].text_for_embedding) for item in fallback_ranked]
-            raw_scores = [float(score) for score in model.predict(pairs, show_progress_bar=False)]
+            documents = [item["chunk"].text_for_embedding for item in fallback_ranked]
+            raw_scores = rerank_texts(query, documents, model_name=self.model_name)
         except Exception:
             return fallback_ranked[:top_k]
         normalized = helper_normalize_scores(raw_scores)
@@ -204,14 +200,6 @@ class CrossEncoderReranker:
             output.append(updated)
         output.sort(key=lambda item: (-float(item["score"]), item["chunk"].chunk_id))
         return output[:top_k]
-
-    def helper_load_model(self) -> Any:
-        if self._model is None:
-            from sentence_transformers import CrossEncoder  # type: ignore
-
-            self._model = CrossEncoder(self.model_name, local_files_only=self.local_files_only)
-        return self._model
-
 
 class StructuralBM25Index:
     def __init__(self, chunks: list[GuidelineChunk]) -> None:

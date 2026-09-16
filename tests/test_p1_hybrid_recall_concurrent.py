@@ -40,15 +40,16 @@ def _run_hybrid(monkey_patches: dict[str, object]) -> object:
             query="q",
             topk=2,
             pool_size=2,
+            reranker=_empty_reranker(),
             document_kind="guideline",
         )
 
 
 def _empty_reranker():
-    """Reranker 走不动也得跑通; 直接 mock DocumentReranker 类。"""
+    """隔离外部 reranker 服务，只验证召回通道并发。"""
     class _Noop:
-        def rerank(self, items, topk, query):
-            return items[:topk]
+        def rerank(self, query, candidates, topk):
+            return candidates[:topk]
     return _Noop()
 
 

@@ -22,21 +22,20 @@ Environment=MCP_CALL_LOG_RESULT_MODE=full
 Environment=MCP_CALL_LOG_MAX_PAYLOAD_STRING_CHARS=2000
 Environment=MCP_CALL_LOG_MAX_RESULT_STRING_CHARS=8000
 Environment=MCP_CALL_LOG_MAX_RESULT_LIST_ITEMS=50
-Environment=DOCUMENT_RERANKER=bge_m3
-Environment=CHUNK_RERANKER=bge_m3
+Environment=DOCUMENT_RERANKER=vllm
+Environment=CHUNK_RERANKER=vllm
 Environment=HF_HOME=/data/lhj/huggingface
 Environment=HF_HUB_CACHE=/data/lhj/huggingface/hub
 Environment=SENTENCE_TRANSFORMERS_HOME=/data/lhj/huggingface
 Environment=PG_VECTOR_RETRIEVAL_REQUIRED=1
 Environment=PG_VECTOR_MODEL=Qwen/Qwen3-Embedding-8B
-Environment=PG_VECTOR_LOCAL_ONLY=1
-# Qwen3-Embedding-8B 建议 bf16(需 Ampere+ GPU,不支持时去掉下面两行)
-Environment=PG_VECTOR_MODEL_DTYPE=bfloat16
+Environment=VLLM_EMBEDDING_BASE_URL=http://127.0.0.1:8001
+Environment=VLLM_EMBEDDING_MODEL=qwen3-embedding
 Environment=BGE_RERANKER_MODEL=Qwen/Qwen3-Reranker-4B
-Environment=BGE_RERANKER_LOCAL_ONLY=1
-Environment=BGE_RERANKER_BATCH_SIZE=8
-Environment=BGE_RERANKER_MAX_LENGTH=2048
-Environment=BGE_RERANKER_DTYPE=bfloat16
+Environment=VLLM_RERANKER_BASE_URL=http://127.0.0.1:8002
+Environment=VLLM_RERANKER_MODEL=qwen3-reranker
+Environment=VLLM_CONNECT_TIMEOUT_SECONDS=5
+Environment=VLLM_REQUEST_TIMEOUT_SECONDS=120
 ExecStart=/home/lhj/project/evidence_generation/.venv/bin/python -m src.mcp
 Restart=on-failure
 RestartSec=5

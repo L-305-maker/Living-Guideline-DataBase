@@ -13,6 +13,32 @@ sudo chown lhj:lhj /etc/pdf-markdown-rag/postgres.env
 sudo chmod 600 /etc/pdf-markdown-rag/postgres.env
 ~~~
 
+## vLLM 模型服务
+
+MCP 进程不再加载模型，需在同一台 48GB GPU 服务器上分别启动 embedding 和 reranker 服务：
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Embedding-8B \
+  --runner pooling \
+  --served-model-name qwen3-embedding \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.50 \
+  --port 8001
+
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Reranker-4B \
+  --runner pooling \
+  --served-model-name qwen3-reranker \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.30 \
+  --hf_overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
+  --port 8002
+~~~
+
+生产环境应将二者配置为独立守护服务。MCP 使用 `VLLM_EMBEDDING_BASE_URL` 和
+`VLLM_RERANKER_BASE_URL` 连接它们；若启用了 vLLM API key，只通过环境变量提供，
+不要写入仓库。两个服务可共用 `VLLM_API_KEY`，也可分别设置
+`VLLM_EMBEDDING_API_KEY` 和 `VLLM_RERANKER_API_KEY`。
+
 ## 建库顺序
 
 先创建表，再导入数据，然后向量化 cards、views、chunks，最后执行 index-vectors 创建 IVFFlat 索引。服务设置 RAG_BACKEND=postgres 和 PG_VECTOR_RETRIEVAL_REQUIRED=1。

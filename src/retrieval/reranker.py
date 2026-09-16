@@ -21,6 +21,8 @@ import os
 import re
 from functools import lru_cache
 from typing import Any, Protocol
+
+from src.models.vllm_client import rerank_texts
 from src.retrieval.common import (
     clip_text as helper_clip_text,
     compact_text as helper_compact,
@@ -204,80 +206,23 @@ class RuleBasedChunkReranker:
         return ranked[:topk]
 
 
-def helper_load_cross_encoder(owner: Any) -> Any:
-    """按实例配置延迟加载 CrossEncoder，并缓存成功模型或失败原因。"""
-
-    if owner._model is not None:
-        return owner._model
-    if owner._load_error:
-        raise RuntimeError(owner._load_error)
-    try:
-        from sentence_transformers import CrossEncoder  # type: ignore
-
-        # Qwen3-Reranker 等大模型可通过环境变量指定加载精度/attention 实现，避免默认 fp32 爆显存。
-        model_kwargs: dict[str, Any] = {}
-        dtype = os.getenv("BGE_RERANKER_DTYPE", "").strip()
-        if dtype:
-            model_kwargs["torch_dtype"] = dtype
-        attn = os.getenv("BGE_RERANKER_ATTN", "").strip()
-        if attn:
-            model_kwargs["attn_implementation"] = attn
-        owner._model = CrossEncoder(
-            owner.model_name,
-            device=owner.device,
-            local_files_only=owner.local_files_only,
-            max_length=owner.max_length,
-            trust_remote_code=True,
-            model_kwargs=model_kwargs or None,
-        )
-        return owner._model
-    except Exception as exc:  # pragma: no cover - 依赖本地模型缓存
-        owner._load_error = str(exc)
-        raise RuntimeError(owner._load_error) from exc
-
-
-def _gpu_predict_via_queue(pairs: list, owner: Any) -> Any:
-    """单点收口: 优先走 GPUQueue 跨 producer 共享 GPU, 失败回退到 model.predict 直调。
-
-    返回 raw_scores 列表 (与 CrossEncoder.predict 同构)。
-    返回值类型略带 union; runtime 由 caller 走 [float(score) for score in ...]。
-    """
-    try:
-        from src.mcp.gpu_queue import get_gpu_queue  # 延迟导入避免环依赖
-        gq = get_gpu_queue()
-        if gq.is_registered(owner.model_name, "predict"):
-            return gq.submit_predict_pairs(owner.model_name, pairs)
-    except RuntimeError:
-        pass
-    return owner._model.predict(pairs, batch_size=owner.batch_size, show_progress_bar=False)
-
-
 class BgeM3DocumentReranker:
-    """Embedding-first cross-encoder reranker backed by BGE reranker v2 m3."""
+    """Document reranker backed by the independent vLLM rerank service."""
 
     def __init__(
         self,
         model_name: str = DEFAULT_BGE_RERANKER_MODEL,
         recency_boost: bool = False,
-        batch_size: int = 16,
-        max_length: int = 1024,
-        device: str | None = None,
-        local_files_only: bool = True,
         model_weight: float = 0.86,
         base_weight: float = 0.14,
         fallback: DocumentReranker | None = None,
     ) -> None:
         self.model_name = model_name
         self.recency_boost = recency_boost
-        self.batch_size = batch_size
-        self.max_length = max_length
-        self.device = device
-        self.local_files_only = local_files_only
         self.model_weight = model_weight
         self.base_weight = base_weight
         self.fallback = fallback or RuleBasedDocumentReranker(recency_boost=recency_boost)
-        self._model: Any | None = None
-        self._load_error: str | None = None
+        self._service_error: str | None = None
 
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
@@ -287,14 +232,10 @@ class BgeM3DocumentReranker:
         # 先执行规则排序，既提供模型不可用时的完整回退，也保留后续融合所需的基础分。
         fallback_ranked = self.fallback.rerank(query, candidates, len(candidates))
         try:
-            model = helper_load_cross_encoder(self)
-            pairs = [(query, helper_candidate_rerank_text(candidate, query)) for candidate in fallback_ranked]
-            # P2 高并发: 走 GPUQueue 让 predict 与跨 producer 共享 GPU 调用,
-            # 避免多线程交叉访问 CrossEncoder (非线程安全, 触发 CUDA 上下文冲突)。
-            # 这里 batch 已经攒好 (pairs 列表), submit_predict_pairs 一次提交;
-            # 跨请求合并见 submit_predict_one。
-            raw_scores = _gpu_predict_via_queue(pairs, self)
-        except Exception:
+            documents = [helper_candidate_rerank_text(candidate, query) for candidate in fallback_ranked]
+            raw_scores = rerank_texts(query, documents, model_name=self.model_name)
+        except Exception as exc:
+            self._service_error = str(exc)
             return self.helper_mark_fallback(fallback_ranked[:topk])
 
         raw_values = [float(score) for score in raw_scores]
@@ -309,7 +250,7 @@ class BgeM3DocumentReranker:
             combined = (self.model_weight * model_score) + (self.base_weight * base_score)
             ranked["score"] = combined * quality_multiplier
             reason = dict(ranked.get("match_reason", {}))
-            reason["reranker"] = "bge_m3_cross_encoder"
+            reason["reranker"] = "vllm_cross_encoder"
             reason["reranker_model"] = self.model_name
             reason["reranker_raw_score"] = raw_score
             reason["reranker_normalized_score"] = model_score
@@ -336,39 +277,30 @@ class BgeM3DocumentReranker:
             reason = dict(updated.get("match_reason", {}))
             reason["reranker"] = "rule_based_fallback"
             reason["requested_reranker_model"] = self.model_name
-            if self._load_error:
-                reason["reranker_error"] = self._load_error[:500]
+            if self._service_error:
+                reason["reranker_error"] = self._service_error[:500]
             updated["match_reason"] = reason
             output.append(updated)
         return output
 
 
 class BgeM3ChunkReranker:
-    """Embedding-first cross-encoder reranker for chunk-level retrieve."""
+    """Chunk reranker backed by the independent vLLM rerank service."""
 
     def __init__(
         self,
         model_name: str = DEFAULT_BGE_RERANKER_MODEL,
-        batch_size: int = 16,
-        max_length: int = 1024,
-        device: str | None = None,
-        local_files_only: bool = True,
         model_weight: float = 0.84,
         base_weight: float = 0.10,
         rule_weight: float = 0.06,
         fallback: ChunkReranker | None = None,
     ) -> None:
         self.model_name = model_name
-        self.batch_size = batch_size
-        self.max_length = max_length
-        self.device = device
-        self.local_files_only = local_files_only
         self.model_weight = model_weight
         self.base_weight = base_weight
         self.rule_weight = rule_weight
         self.fallback = fallback or RuleBasedChunkReranker()
-        self._model: Any | None = None
-        self._load_error: str | None = None
+        self._service_error: str | None = None
 
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
@@ -378,11 +310,10 @@ class BgeM3ChunkReranker:
         # 分块重排也先保留规则结果；模型加载或推理失败时可返回可解释的降级排序。
         fallback_ranked = self.fallback.rerank(query, candidates, len(candidates))
         try:
-            model = helper_load_cross_encoder(self)
-            pairs = [(query, helper_chunk_rerank_text(candidate)) for candidate in fallback_ranked]
-            # P2 高并发: 同 BgeM3Document 走 GPUQueue, 避免多线程交叉访问 CrossEncoder。
-            raw_scores = _gpu_predict_via_queue(pairs, self)
-        except Exception:
+            documents = [helper_chunk_rerank_text(candidate) for candidate in fallback_ranked]
+            raw_scores = rerank_texts(query, documents, model_name=self.model_name)
+        except Exception as exc:
+            self._service_error = str(exc)
             return self.helper_mark_fallback(fallback_ranked[:topk])
 
         raw_values = [float(score) for score in raw_scores]
@@ -404,7 +335,7 @@ class BgeM3ChunkReranker:
                 + self.rule_weight * rule_score
             )
             reason = dict(ranked.get("match_reason", {}))
-            reason["reranker"] = "bge_m3_chunk_cross_encoder"
+            reason["reranker"] = "vllm_chunk_cross_encoder"
             reason["reranker_model"] = self.model_name
             reason["reranker_raw_score"] = raw_score
             reason["reranker_normalized_score"] = model_score
@@ -429,116 +360,35 @@ class BgeM3ChunkReranker:
             reason = dict(updated.get("match_reason", {}))
             reason["reranker"] = "rule_based_chunk_fallback"
             reason["requested_reranker_model"] = self.model_name
-            if self._load_error:
-                reason["reranker_error"] = self._load_error[:500]
+            if self._service_error:
+                reason["reranker_error"] = self._service_error[:500]
             updated["match_reason"] = reason
             output.append(updated)
         return output
 
 
-def _register_gpu_queue_runner(model_name: str = DEFAULT_BGE_RERANKER_MODEL) -> None:
-    """在 GPUQueue 注册 (model_name, "predict") runner。
-
-    把多个 rerank 请求的 pairs 列表合并到一次 CrossEncoder.predict,
-    避免多线程交叉访问模型。
-    注意: CrossEncoder 实例在 runner 第一次被调用时 lazy 创建一次,
-    之后所有 producer 共享同一个实例 (放在模块级闭包变量里)。
-    """
-    try:
-        from src.mcp.gpu_queue import get_gpu_queue
-        gq = get_gpu_queue()
-        if gq.is_registered(model_name, "predict"):
-            return
-
-        model_holder: dict[str, Any] = {}
-
-        def ensure_model() -> Any:
-            # lazy + 进程级单例 CrossEncoder; 模块级闭包变量做 cache, 避免重复加载。
-            if model_holder.get("model") is not None:
-                return model_holder["model"]
-            try:
-                from sentence_transformers import CrossEncoder  # type: ignore
-            except ImportError:
-                raise RuntimeError("sentence-transformers 未安装, reranker GPU queue 不可用")
-            model_kwargs: dict[str, Any] = {}
-            dtype = os.getenv("BGE_RERANKER_DTYPE", "").strip()
-            if dtype:
-                model_kwargs["torch_dtype"] = dtype
-            attn = os.getenv("BGE_RERANKER_ATTN", "").strip()
-            if attn:
-                model_kwargs["attn_implementation"] = attn
-            local_only = os.getenv("BGE_RERANKER_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
-            max_length = int(os.getenv("BGE_RERANKER_MAX_LENGTH", "1024"))
-            model_holder["model"] = CrossEncoder(
-                model_name,
-                local_files_only=local_only,
-                max_length=max_length,
-                trust_remote_code=True,
-                model_kwargs=model_kwargs or None,
-            )
-            return model_holder["model"]
-
-        def runner(payloads: list[list[tuple[str, str]]]) -> list[list[float]]:
-            """payloads: 每个 producer 是 pairs 列表 (list[tuple[str, str]])。
-
-            返回 list[list[float]]: 每个 producer 对应一个 score 列表,
-            GPUQueue 框架要求与 payloads 等长。
-            """
-            model = ensure_model()
-            batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "8"))
-            out: list[list[float]] = []
-            for pairs in payloads:
-                raw = model.predict(pairs, batch_size=batch_size, show_progress_bar=False)
-                out.append([float(s) for s in raw])
-            return out
-
-        gq.register(model_name, "predict", runner)
-    except Exception:
-        pass
-
-
-try:
-    _register_gpu_queue_runner()
-except Exception:
-    pass
-
-
 def default_document_reranker(recency_boost: bool = False) -> DocumentReranker:
-    mode = os.getenv("DOCUMENT_RERANKER", "bge_m3").strip().lower()
+    mode = os.getenv("DOCUMENT_RERANKER", "vllm").strip().lower()
     if mode in {"none", "noop", "off"}:
         return helper_cached_noop_document_reranker()
     if mode in {"rule", "rules", "rule_based"}:
         return helper_cached_rule_document_reranker(recency_boost)
-    local_only = os.getenv("BGE_RERANKER_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
-    batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "8"))
-    max_length = int(os.getenv("BGE_RERANKER_MAX_LENGTH", "1024"))
     return helper_cached_bge_document_reranker(
         os.getenv("BGE_RERANKER_MODEL", DEFAULT_BGE_RERANKER_MODEL),
         recency_boost,
-        batch_size,
-        max_length,
-        os.getenv("BGE_RERANKER_DEVICE") or "",
-        local_only,
         helper_env_float("BGE_DOCUMENT_RERANKER_MODEL_WEIGHT", 0.86),
         helper_env_float("BGE_DOCUMENT_RERANKER_BASE_WEIGHT", 0.14),
     )
 
 
 def default_chunk_reranker() -> ChunkReranker:
-    mode = os.getenv("CHUNK_RERANKER", os.getenv("RERANKER", "bge_m3")).strip().lower()
+    mode = os.getenv("CHUNK_RERANKER", os.getenv("RERANKER", "vllm")).strip().lower()
     if mode in {"none", "noop", "off"}:
         return helper_cached_noop_chunk_reranker()
     if mode in {"rule", "rules", "rule_based"}:
         return helper_cached_rule_chunk_reranker()
-    local_only = os.getenv("BGE_RERANKER_LOCAL_ONLY", "1").strip().lower() not in {"0", "false", "no"}
-    batch_size = int(os.getenv("BGE_RERANKER_BATCH_SIZE", "8"))
-    max_length = int(os.getenv("BGE_RERANKER_MAX_LENGTH", "1024"))
     return helper_cached_bge_chunk_reranker(
         os.getenv("BGE_RERANKER_MODEL", DEFAULT_BGE_RERANKER_MODEL),
-        batch_size,
-        max_length,
-        os.getenv("BGE_RERANKER_DEVICE") or "",
-        local_only,
         helper_env_float("BGE_CHUNK_RERANKER_MODEL_WEIGHT", 0.84),
         helper_env_float("BGE_CHUNK_RERANKER_BASE_WEIGHT", 0.10),
         helper_env_float("BGE_CHUNK_RERANKER_RULE_WEIGHT", 0.06),
@@ -559,20 +409,12 @@ def helper_cached_rule_document_reranker(recency_boost: bool) -> RuleBasedDocume
 def helper_cached_bge_document_reranker(
     model_name: str,
     recency_boost: bool,
-    batch_size: int,
-    max_length: int,
-    device: str,
-    local_files_only: bool,
     model_weight: float,
     base_weight: float,
 ) -> BgeM3DocumentReranker:
     return BgeM3DocumentReranker(
         model_name=model_name,
         recency_boost=recency_boost,
-        batch_size=batch_size,
-        max_length=max_length,
-        device=device or None,
-        local_files_only=local_files_only,
         model_weight=model_weight,
         base_weight=base_weight,
     )
@@ -591,20 +433,12 @@ def helper_cached_rule_chunk_reranker() -> RuleBasedChunkReranker:
 @lru_cache(maxsize=8)
 def helper_cached_bge_chunk_reranker(
     model_name: str,
-    batch_size: int,
-    max_length: int,
-    device: str,
-    local_files_only: bool,
     model_weight: float,
     base_weight: float,
     rule_weight: float,
 ) -> BgeM3ChunkReranker:
     return BgeM3ChunkReranker(
         model_name=model_name,
-        batch_size=batch_size,
-        max_length=max_length,
-        device=device or None,
-        local_files_only=local_files_only,
         model_weight=model_weight,
         base_weight=base_weight,
         rule_weight=rule_weight,

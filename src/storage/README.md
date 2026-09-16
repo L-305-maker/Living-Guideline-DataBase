@@ -6,7 +6,7 @@
 | --- | --- |
 | `postgres_store.py` | 建表、全量入库、统计、PostgreSQL 全文检索和向量索引创建 |
 | `vectorize.py` | 读取卡片、视图、分块，使用 Qwen3-Embedding-8B（1024 维）编码并写入 pgvector 表 |
-| `query_embedding.py` | 缓存查询模型并生成 pgvector 参数文本 |
+| `query_embedding.py` | 调用 vLLM embedding 服务并生成 pgvector 参数文本 |
 | `pg_hybrid_retrieval.py` | 融合 PostgreSQL 词法通道、pgvector 通道和重排结果 |
 
 ## 数据关系
@@ -32,7 +32,8 @@ python -B -m src.storage.postgres_store stats
 数据库连接优先读取命令行 `--dsn`，随后读取 `POSTGRES_DSN`、`DATABASE_URL` 或标准 `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER`、`PGPASSWORD` 环境变量。
 
 - `PG_VECTOR_MODEL`：查询与就绪检查使用的模型，必须与向量化模型一致。
-- `PG_VECTOR_LOCAL_ONLY`：查询模型是否只读本地缓存。
+- `VLLM_EMBEDDING_BASE_URL`：vLLM 根地址，默认 `http://127.0.0.1:8001`。
+- `VLLM_EMBEDDING_MODEL`：vLLM 的 served model name，默认沿用 `PG_VECTOR_MODEL`。
 - `PG_VECTOR_RETRIEVAL_REQUIRED=1`：要求卡片、视图和分块向量全部齐全，失败时禁止退化。
 
 ## 向量完整性

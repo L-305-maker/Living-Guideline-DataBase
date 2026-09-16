@@ -1,113 +1,80 @@
 from __future__ import annotations
 
-import os
-import sys
-import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from src.retrieval.reranker import helper_load_cross_encoder
+from src.models import vllm_client
+from src.retrieval.reranker import BgeM3ChunkReranker
 from src.storage import query_embedding
 
 
-class FakeEncodeModel:
-    def __init__(self) -> None:
-        self.called_kwargs: dict = {}
-
-    def encode(self, texts: list[str], **kwargs: object) -> list[list[float]]:
-        self.called_kwargs = dict(kwargs)
-        return [[0.0] * 1024 for _ in texts]
-
-
-class FakeOwner:
-    def __init__(self) -> None:
-        self.model_name = "Qwen/Qwen3-Reranker-4B"
-        self.device = None
-        self.local_files_only = True
-        self.max_length = 2048
-        self._model = None
-        self._load_error = None
-
-
 class QwenModelSwitchTest(unittest.TestCase):
-    def test_encode_with_model_truncates_qwen_to_database_dimension(self) -> None:
-        model = FakeEncodeModel()
-        query_embedding.encode_with_model(model, ["x"], model_name="Qwen/Qwen3-Embedding-8B")
+    def test_embedding_client_requests_fixed_dimension_and_normalizes(self) -> None:
+        payloads: list[dict] = []
 
-        self.assertEqual(query_embedding.EMBEDDING_DIM, model.called_kwargs["truncate_dim"])
-        self.assertTrue(model.called_kwargs["normalize_embeddings"])
+        def fake_post(_base_url, _path, payload, *, api_key_env):
+            payloads.append(payload)
+            self.assertEqual("VLLM_EMBEDDING_API_KEY", api_key_env)
+            vector = [3.0, 4.0] + [0.0] * 1022
+            return {"data": [{"index": 0, "embedding": vector}]}
 
-    def test_encode_with_model_skips_truncation_for_non_mrl(self) -> None:
-        model = FakeEncodeModel()
-        query_embedding.encode_with_model(model, ["x"], model_name="BAAI/bge-m3")
+        with patch.object(vllm_client, "helper_post_json", side_effect=fake_post):
+            vectors = vllm_client.embed_texts(
+                ["测试"], model_name="Qwen/Qwen3-Embedding-8B", dimensions=1024
+            )
 
-        self.assertNotIn("truncate_dim", model.called_kwargs)
-        self.assertTrue(model.called_kwargs["normalize_embeddings"])
+        self.assertEqual(1024, payloads[0]["dimensions"])
+        self.assertAlmostEqual(0.6, vectors[0][0])
+        self.assertAlmostEqual(0.8, vectors[0][1])
 
-    def test_legacy_dimension_override_cannot_diverge_from_database_schema(self) -> None:
-        model = FakeEncodeModel()
-        with patch.dict(os.environ, {"PG_VECTOR_MATRYOSHKA_DIM": "512"}):
-            query_embedding.encode_with_model(model, ["x"], model_name="Qwen/Qwen3-Embedding-8B")
+    def test_query_vector_literal_routes_through_vllm(self) -> None:
+        vector = [1.0] + [0.0] * 1023
+        with patch("src.storage.query_embedding.embed_texts", return_value=[vector]) as embed:
+            literal = query_embedding.query_vector_literal(
+                "测试", model_name="Qwen/Qwen3-Embedding-8B"
+            )
 
-        self.assertEqual(query_embedding.EMBEDDING_DIM, model.called_kwargs["truncate_dim"])
+        self.assertTrue(literal.startswith("[1.00000000,"))
+        embed.assert_called_once_with(
+            ["测试"], model_name="Qwen/Qwen3-Embedding-8B", dimensions=1024
+        )
 
-    def test_query_vector_literal_routes_through_encode_with_model(self) -> None:
-        model = FakeEncodeModel()
+    def test_rerank_client_restores_original_document_order(self) -> None:
+        response = {
+            "results": [
+                {"index": 1, "relevance_score": 0.9},
+                {"index": 0, "relevance_score": 0.2},
+            ]
+        }
+        with patch.object(vllm_client, "helper_post_json", return_value=response) as post:
+            scores = vllm_client.rerank_texts(
+                "query", ["first", "second"], model_name="Qwen/Qwen3-Reranker-4B"
+            )
+
+        self.assertEqual([0.2, 0.9], scores)
+        self.assertEqual(2, post.call_args.args[2]["top_n"])
+
+    def test_embedding_client_rejects_wrong_dimension(self) -> None:
+        response = {"data": [{"index": 0, "embedding": [1.0, 0.0]}]}
         with (
-            patch("src.storage.query_embedding.load_model", return_value=model),
-            patch.dict(os.environ, {}, clear=False),
+            patch.object(vllm_client, "helper_post_json", return_value=response),
+            self.assertRaisesRegex(RuntimeError, "dimension mismatch"),
         ):
-            literal = query_embedding.query_vector_literal("测试", model_name="Qwen/Qwen3-Embedding-8B")
+            vllm_client.embed_texts(
+                ["query"], model_name="Qwen/Qwen3-Embedding-8B", dimensions=1024
+            )
 
-        self.assertTrue(literal.startswith("["))
-        self.assertEqual(query_embedding.EMBEDDING_DIM, model.called_kwargs["truncate_dim"])
+    def test_chunk_reranker_uses_vllm_scores(self) -> None:
+        candidates = [
+            {"chunk_id": "a", "content": "first", "score": 0.2, "match_reason": {"base_rrf_score": 0.2}},
+            {"chunk_id": "b", "content": "second", "score": 0.1, "match_reason": {"base_rrf_score": 0.1}},
+        ]
+        with patch("src.retrieval.reranker.rerank_texts", return_value=[0.1, 0.9]) as rerank:
+            ranked = BgeM3ChunkReranker().rerank("query", candidates, topk=2)
 
-    def test_cross_encoder_receives_model_kwargs_from_env(self) -> None:
-        owner = FakeOwner()
-        fake_cross_encoder = MagicMock(return_value=object())
-        fake_st = types.ModuleType("sentence_transformers")
-        fake_st.CrossEncoder = fake_cross_encoder
-        with (
-            patch.dict(os.environ, {"BGE_RERANKER_DTYPE": "bfloat16", "BGE_RERANKER_ATTN": "flash_attention_2"}),
-            patch.dict(sys.modules, {"sentence_transformers": fake_st}),
-        ):
-            loaded = helper_load_cross_encoder(owner)
-
-        self.assertIsNotNone(loaded)
-        _, kwargs = fake_cross_encoder.call_args
-        self.assertEqual("bfloat16", kwargs["model_kwargs"]["torch_dtype"])
-        self.assertEqual("flash_attention_2", kwargs["model_kwargs"]["attn_implementation"])
-
-    def test_cross_encoder_without_model_kwargs_env(self) -> None:
-        owner = FakeOwner()
-        fake_cross_encoder = MagicMock(return_value=object())
-        fake_st = types.ModuleType("sentence_transformers")
-        fake_st.CrossEncoder = fake_cross_encoder
-        with (
-            patch.dict(os.environ, {"BGE_RERANKER_DTYPE": "", "BGE_RERANKER_ATTN": ""}),
-            patch.dict(sys.modules, {"sentence_transformers": fake_st}),
-        ):
-            helper_load_cross_encoder(owner)
-
-        _, kwargs = fake_cross_encoder.call_args
-        self.assertIsNone(kwargs["model_kwargs"])
-
-
-    def test_load_model_passes_dtype_attn_and_padding_kwargs(self) -> None:
-        fake_st = types.ModuleType("sentence_transformers")
-        fake_encoder = MagicMock()
-        fake_st.SentenceTransformer = fake_encoder
-        query_embedding.load_model.cache_clear()
-        with (
-            patch.dict(os.environ, {"PG_VECTOR_MODEL_DTYPE": "bfloat16", "PG_VECTOR_MODEL_ATTN": "flash_attention_2"}),
-            patch.dict(sys.modules, {"sentence_transformers": fake_st}),
-        ):
-            query_embedding.load_model("Qwen/Qwen3-Embedding-8B")
-
-        _, kwargs = fake_encoder.call_args
-        self.assertEqual("bfloat16", kwargs["model_kwargs"]["torch_dtype"])
-        self.assertEqual("flash_attention_2", kwargs["model_kwargs"]["attn_implementation"])
-        self.assertEqual("left", kwargs["tokenizer_kwargs"]["padding_side"])
+        self.assertEqual("b", ranked[0]["chunk_id"])
+        self.assertEqual("vllm_chunk_cross_encoder", ranked[0]["match_reason"]["reranker"])
+        self.assertEqual(2, len(rerank.call_args.args[1]))
 
 if __name__ == "__main__":
     unittest.main()

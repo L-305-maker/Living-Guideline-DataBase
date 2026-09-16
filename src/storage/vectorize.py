@@ -21,8 +21,7 @@ from src.storage.postgres_store import get_pool
 from src.storage.query_embedding import (
     DEFAULT_MODEL,
     EMBEDDING_DIM,
-    encode_with_model as _encode_with_model,
-    load_model as helper_load_model,
+    encode_texts as _encode_texts,
     vector_literal as _vector_literal,
 )
 
@@ -105,13 +104,12 @@ def helper_vectorize_rows(
     model_name: str,
     batch_size: int,
     target: VectorTarget,
-    model: Any | None = None,
 ) -> dict[str, Any]:
     """把已读入内存的行批量编码并 UPSERT 到指定 embedding 表。
 
     流程：
-    1. 模型按需懒加载（仅首次调用或显式传入 None 时加载），打印 device 便于调试。
-    2. 按 batch_size 切片送入 model.encode；批量推理比逐条调用节省大量 CPU/GPU 调度开销。
+    1. 按 batch_size 将文本发送给常驻的 vLLM embedding 服务。
+    2. vLLM 负责跨请求调度，应用侧只控制单次请求批量大小。
     3. 编码结果必须与数据库 vector 列的固定维度一致。
     4. 使用 executemany + ON CONFLICT (id_column, model) DO UPDATE：
        - 同一 (id, model) 已存在时刷新 dim/embedding/created_at；
@@ -120,10 +118,6 @@ def helper_vectorize_rows(
     5. 每批 commit 一次，避免长事务膨胀 WAL 并允许中途崩溃后断点续跑。
     """
     print(f"[vectorize] selected {len(rows)} {target.source_table}", flush=True)
-    if model is None:
-        print(f"[vectorize] loading model {model_name}...", flush=True)
-        model = helper_load_model(model_name)
-        print(f"[vectorize] model loaded on {getattr(model, 'device', 'unknown')}", flush=True)
     inserted = 0
     with get_pool(dsn).connection(timeout=10) as conn:
         with conn.cursor() as cur:
@@ -131,8 +125,8 @@ def helper_vectorize_rows(
                 batch = rows[start : start + batch_size]
                 texts = [row[1] for row in batch]
                 print(f"[vectorize] encoding {target.source_table} {start + 1}-{start + len(batch)}...", flush=True)
-                embeddings = _encode_with_model(model, texts, model_name=model_name)
-                dim = int(embeddings.shape[1])
+                embeddings = _encode_texts(texts, model_name=model_name)
+                dim = len(embeddings[0]) if embeddings else 0
                 if dim != EMBEDDING_DIM:
                     raise ValueError(
                         f"Embedding dimension mismatch: expected {EMBEDDING_DIM}, got {dim}"
@@ -172,8 +166,7 @@ def helper_vectorize_pages(
     """分页驱动 helper_vectorize_rows，覆盖大表向量化场景。
 
     关键设计：
-    - 模型只在第一页加载一次（model is None 判断），之后整轮复用同一 SentenceTransformer
-      实例，避免每页重复加载权重（加载一次需要几秒到几十秒）。
+    - vLLM 模型在独立服务中常驻，分页过程只发送 HTTP 批量请求。
     - missing_only=True 时：分页使用固定 offset（缺失集合稳定）；
       missing_only=False 时：每页推进 fetch_offset，否则会无限循环处理同一批。
     - 提前退出条件：当一页返回行数 < fetch_limit（已读完）或已达 limit 上限。
@@ -186,7 +179,6 @@ def helper_vectorize_pages(
 
     total = 0
     fetch_offset = offset
-    model = None
     while limit is None or total < limit:
         fetch_limit = page_size if limit is None else min(page_size, limit - total)
         # missing_only 模式：每页都从同一 offset 开始查剩余缺失项；
@@ -197,11 +189,7 @@ def helper_vectorize_pages(
         )
         if not rows:
             break
-        if model is None:
-            print(f"[vectorize] loading model {model_name}...", flush=True)
-            model = helper_load_model(model_name)
-            print(f"[vectorize] model loaded on {getattr(model, 'device', 'unknown')}", flush=True)
-        result = helper_vectorize_rows(rows, dsn, model_name, batch_size, target, model)
+        result = helper_vectorize_rows(rows, dsn, model_name, batch_size, target)
         total += int(result["upserted"])
         if not missing_only:
             fetch_offset += len(rows)

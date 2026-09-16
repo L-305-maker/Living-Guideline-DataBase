@@ -90,13 +90,12 @@ class PgDocumentMultiviewStorageTest(unittest.TestCase):
             pg_hybrid_retrieval._VECTOR_READY_CACHE.clear()
 
     def test_vectorizer_rejects_dimension_that_cannot_fit_schema(self) -> None:
-        embeddings = mock.Mock()
-        embeddings.shape = (1, 512)
+        embeddings = [[0.0] * 512]
         pool = mock.MagicMock()
 
         with (
             mock.patch.object(vectorize, "get_pool", return_value=pool),
-            mock.patch.object(vectorize, "_encode_with_model", return_value=embeddings),
+            mock.patch.object(vectorize, "_encode_texts", return_value=embeddings),
         ):
             with self.assertRaisesRegex(ValueError, "expected 1024, got 512"):
                 vectorize.helper_vectorize_rows(
@@ -105,7 +104,6 @@ class PgDocumentMultiviewStorageTest(unittest.TestCase):
                     "model",
                     1,
                     vectorize.CHUNKS,
-                    model=object(),
                 )
 
     def test_text_search_keeps_filter_parameter_order_and_named_results(self) -> None:
