@@ -53,9 +53,8 @@ def smoke_test(query: str = "diabetes hypertension guideline", topk: int = 3) ->
         "retrieve_count": len(chunks),
         "retrieve_first": {
             key: chunks[0].get(key)
-            for key in ("chunk_id", "doc_id", "heading", "prev_chunk_id", "next_chunk_id", "char_start", "char_end")
+            for key in ("chunk_id", "doc_id", "heading", "char_start", "char_end")
         },
-        "retrieve_has_source_context": bool(chunks[0].get("source_quote_context")),
     }
 
 

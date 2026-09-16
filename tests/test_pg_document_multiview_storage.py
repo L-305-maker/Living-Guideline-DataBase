@@ -74,6 +74,21 @@ class PgDocumentMultiviewStorageTest(unittest.TestCase):
         self.assertEqual(2, pool.connection.call_count)
         self.assertEqual(12, cursor.execute.call_count)
 
+    def test_vector_ready_check_cache_expires_after_ttl(self) -> None:
+        pg_hybrid_retrieval._VECTOR_READY_CACHE.clear()
+        try:
+            with (
+                mock.patch.object(pg_hybrid_retrieval, "helper_assert_pg_vectors_ready") as check,
+                mock.patch.object(pg_hybrid_retrieval.time, "monotonic", side_effect=[0.0, 30.0, 61.0]),
+            ):
+                pg_hybrid_retrieval.helper_assert_pg_vectors_ready_cached(None, "model")
+                pg_hybrid_retrieval.helper_assert_pg_vectors_ready_cached(None, "model")
+                pg_hybrid_retrieval.helper_assert_pg_vectors_ready_cached(None, "model")
+
+            self.assertEqual(2, check.call_count)
+        finally:
+            pg_hybrid_retrieval._VECTOR_READY_CACHE.clear()
+
     def test_vectorizer_rejects_dimension_that_cannot_fit_schema(self) -> None:
         embeddings = mock.Mock()
         embeddings.shape = (1, 512)
@@ -456,6 +471,61 @@ class PgDocumentMultiviewStorageTest(unittest.TestCase):
         sql, rows = connection.cursor_value.batches[0]
         self.assertIn("ON CONFLICT DO NOTHING", sql)
         self.assertEqual(["in-db"], [row[0] for row in rows])
+
+    def test_search_rerank_candidate_count_is_capped_at_fifty(self) -> None:
+        class CapturingReranker:
+            candidate_count = 0
+
+            def rerank(self, query, candidates, topk):
+                self.candidate_count = len(candidates)
+                return candidates[:topk]
+
+        def documents(prefix: str) -> list[dict[str, str]]:
+            return [{"doc_id": f"{prefix}-{index}"} for index in range(60)]
+
+        reranker = CapturingReranker()
+        with (
+            mock.patch.object(pg_hybrid_retrieval, "search_document_cards_pg", lambda *args, **kwargs: documents("card")),
+            mock.patch.object(pg_hybrid_retrieval, "search_document_views_pg", lambda *args, **kwargs: documents("view")),
+            mock.patch.object(pg_hybrid_retrieval, "vector_search_document_cards_pg", lambda *args, **kwargs: documents("dense-card")),
+            mock.patch.object(pg_hybrid_retrieval, "vector_search_document_views_pg", lambda *args, **kwargs: documents("dense-view")),
+            mock.patch.object(pg_hybrid_retrieval, "query_vector_literal", return_value="[0.1]") as encode,
+        ):
+            pg_hybrid_retrieval.search_documents_hybrid_pg("query", topk=20, pool_size=1, reranker=reranker)
+
+        self.assertEqual(50, reranker.candidate_count)
+        encode.assert_called_once_with("query", pg_hybrid_retrieval.DEFAULT_MODEL)
+
+    def test_retrieve_rerank_candidate_count_is_four_times_topk(self) -> None:
+        class CapturingReranker:
+            candidate_count = 0
+
+            def rerank(self, query, candidates, topk):
+                self.candidate_count = len(candidates)
+                return candidates[:topk]
+
+        def chunks(prefix: str) -> list[dict[str, str]]:
+            return [
+                {"chunk_id": f"{prefix}-{index}", "doc_id": f"document-{index}"}
+                for index in range(60)
+            ]
+
+        reranker = CapturingReranker()
+        enrichment_sizes = []
+
+        def enrich(dsn, items):
+            enrichment_sizes.append(len(items))
+            return items
+
+        with (
+            mock.patch.object(pg_hybrid_retrieval, "retrieve_chunks_pg", lambda *args, **kwargs: chunks("bm25")),
+            mock.patch.object(pg_hybrid_retrieval, "vector_retrieve_chunks_pg", lambda *args, **kwargs: chunks("vector")),
+            mock.patch.object(pg_hybrid_retrieval, "helper_enrich_chunk_context_pg", enrich),
+        ):
+            pg_hybrid_retrieval.retrieve_chunks_hybrid_pg("query", topk=10, pool_size=1, reranker=reranker)
+
+        self.assertEqual(40, reranker.candidate_count)
+        self.assertEqual([10], enrichment_sizes)
 
 if __name__ == "__main__":
     unittest.main()

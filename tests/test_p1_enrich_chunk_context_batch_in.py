@@ -75,6 +75,8 @@ class EnrichChunkContextRuntime(unittest.TestCase):
         # 3) char 字段正确
         self.assertEqual(out[0]["char_start"], 100)
         self.assertEqual(out[2]["char_end"],   400)
+        for field in ("prev_chunk_id", "next_chunk_id", "source_quote_context"):
+            self.assertNotIn(field, out[0])
         # 4) char_span_kind = "section" 当 char_start/char_end 任一非 None
         self.assertEqual(out[0]["char_span_kind"], "section")
         # 5) SQL 实际执行 1 次, 且 unnest 数组长度 == 2 (去重生效)

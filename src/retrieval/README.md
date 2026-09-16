@@ -16,7 +16,7 @@
 
 - 召回通道可以分别产出候选，最终用 RRF 或加权 RRF 合并。
 - `match_reason` 记录命中字段、boost、base score、reranker 和质量惩罚，便于审计。
-- chunk 返回应保留 `doc_id`、`chunk_id`、标题路径、字符范围、相邻块和 `source_quote_context`。
+- chunk 返回应保留 `doc_id`、`chunk_id`、标题路径和字符范围。
 - 查询侧模型名必须与 pgvector 表中的 `model` 一致，避免不同模型向量混用。
 
 ## Reranker 配置

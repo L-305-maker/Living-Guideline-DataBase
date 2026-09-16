@@ -35,6 +35,7 @@ def _run_hybrid(monkey_patches: dict[str, object]) -> object:
     with ExitStack() as stack:
         for target, name, value in monkey_patches:
             stack.enter_context(patch.object(target, name, value))
+        stack.enter_context(patch.object(ph, "query_vector_literal", return_value="[0.1]"))
         return ph.search_documents_hybrid_pg(
             query="q",
             topk=2,
@@ -174,7 +175,7 @@ class HybridRecallRuntime(unittest.TestCase):
             timing["views"] = time.perf_counter() - t0
             return [{"doc_id": "B"}]
 
-        # dense 也都慢, 这样如果 dense 误进 ThreadPoolExecutor 也能看出来
+        # 两条 dense SQL 也应并发执行。
         dense_timing = {}
         def slow_vcards(*a, **k):
             t0 = time.perf_counter()
@@ -206,9 +207,8 @@ class HybridRecallRuntime(unittest.TestCase):
                 overlap, sleep_s * 0.4,
                 f"text 通道未真并发: cards={timing['cards']:.3f}s views={timing['views']:.3f}s",
             )
-        # 整体墙钟: text 并发 (~0.3s) + dense 串行 (~0.6s) ≈ 0.9s
-        # 兜底: < 串行极限 1.3s, > 并发下限 0.5s (text 并发生效)
-        self.assertLess(wall, 1.3, f"总墙钟过长, 并发未生效: {wall:.3f}s")
+        # 整体墙钟: text 与编码并发 (~0.3s) + dense SQL 并发 (~0.3s) ≈ 0.6s。
+        self.assertLess(wall, 0.95, f"总墙钟过长, 并发未生效: {wall:.3f}s")
 
 
 if __name__ == "__main__":

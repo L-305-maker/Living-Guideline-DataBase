@@ -86,23 +86,6 @@ def clip_text(text: str, limit: int) -> str:
     return compact[:limit].rstrip() + "..."
 
 
-def source_quote_context(
-    prev_content: str, content: str, next_content: str
-) -> str:
-    """为命中块拼接有限长度的前后文，避免返回整篇文档。
-
-    输出格式：[previous] ...\\n[current] ...\\n[next] ...
-    每段都经过 clip_text 限制长度（prev 取末尾 500 / current 1400 / next 开头 500）。
-    """
-    parts = []
-    if prev_content:
-        parts.append("[previous] " + clip_text(prev_content[-500:], 500))
-    parts.append("[current] " + clip_text(content, 1400))
-    if next_content:
-        parts.append("[next] " + clip_text(next_content[:500], 500))
-    return "\n".join(parts)
-
-
 # 查询词提取正则：与 text.SEARCH_TOKEN_RE 类似但保留连续的 CJK 字符（便于中文短语）。
 QUERY_TOKEN_RE = re.compile(
     r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?|[\u4e00-\u9fff]+"

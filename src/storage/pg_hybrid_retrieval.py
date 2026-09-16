@@ -20,15 +20,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import Callable
+from threading import Lock
 from typing import Any
 from psycopg.rows import dict_row
 
 from src.retrieval.reranker import ChunkReranker, DocumentReranker, default_chunk_reranker, default_document_reranker
-from src.retrieval.common import (
-    fill_consensus_fallback as helper_fill_consensus_fallback,
-    source_quote_context as helper_source_quote_context,
-)
+from src.retrieval.common import fill_consensus_fallback as helper_fill_consensus_fallback
 from src.retrieval.rrf import rrf_fusion
 from src.mcp.retrieval_timing import current_timing, timed, timed_call
 from src.storage.query_embedding import DEFAULT_MODEL, query_vector_literal
@@ -47,6 +46,16 @@ from src.storage.postgres_store import (
 
 
 LOGGER = logging.getLogger(__name__)
+RERANK_CANDIDATE_MULTIPLIER = 4
+RERANK_CANDIDATE_LIMIT = 50
+VECTOR_READY_CACHE_TTL_SECONDS = 60.0
+_VECTOR_READY_CACHE: dict[tuple[str | None, str], float] = {}
+_VECTOR_READY_CACHE_LOCK = Lock()
+
+
+def helper_rerank_candidates(items: list[dict[str, Any]], topk: int) -> list[dict[str, Any]]:
+    """保留最多 topk 的 4 倍候选，且单次 rerank 不超过 50 条。"""
+    return items[:min(topk * RERANK_CANDIDATE_MULTIPLIER, RERANK_CANDIDATE_LIMIT)]
 
 
 def pg_vector_retrieval_required() -> bool:
@@ -79,6 +88,18 @@ def helper_assert_pg_vectors_ready(dsn: str | None, model_name: str) -> None:
                     )
 
 
+def helper_assert_pg_vectors_ready_cached(dsn: str | None, model_name: str) -> None:
+    """在短 TTL 内复用向量就绪检查，避免每个请求重复执行六次 COUNT。"""
+    key = (dsn, model_name)
+    now = time.monotonic()
+    with _VECTOR_READY_CACHE_LOCK:
+        if _VECTOR_READY_CACHE.get(key, 0.0) > now:
+            return
+    helper_assert_pg_vectors_ready(dsn, model_name)
+    with _VECTOR_READY_CACHE_LOCK:
+        _VECTOR_READY_CACHE[key] = now + VECTOR_READY_CACHE_TTL_SECONDS
+
+
 def vector_search_document_cards_pg(
     query: str,
     dsn: str | None = None,
@@ -89,14 +110,16 @@ def vector_search_document_cards_pg(
     topk: int = 50,
     model_name: str = DEFAULT_MODEL,
     document_kind: str | None = None,
+    vector: str | None = None,
 ) -> list[dict[str, Any]]:
     # 向量通道：document_card_embeddings 上的余弦相似度检索。
     # - 余弦距离 <=> 越小越相似；1 - distance 转为相似度，可与其它通道统一按降序解释；
     # - 必须 WHERE e.model = %s 保证只查当前模型（兼容历史模型记录）；
     # - time_sql 把 publication_date 改成 dc.publication_date，消除 cards JOIN documents 后的列歧义。
     
-    with timed("embedding.document_cards"):
-        vector = query_vector_literal(query, model_name)
+    if vector is None:
+        with timed("embedding.document_cards"):
+            vector = query_vector_literal(query, model_name)
     params: list[Any] = [vector, model_name]
     where = [
         "e.model = %s",
@@ -139,14 +162,16 @@ def vector_search_document_views_pg(
     topk: int = 50,
     model_name: str = DEFAULT_MODEL,
     document_kind: str | None = None,
+    vector: str | None = None,
 ) -> list[dict[str, Any]]:
     # 向量通道：document_view_embeddings 上的余弦相似度检索。
     # 与 cards 通道差异：
     # - 多取候选（max(topk*3, topk)），同一文档的多个视图都被召回后 Python 端按 doc_id 去重；
     #   不预先在 SQL 里 DISTINCT 是为了保留优先级和分数用于融合。
 
-    with timed("embedding.document_views"):
-        vector = query_vector_literal(query, model_name)
+    if vector is None:
+        with timed("embedding.document_views"):
+            vector = query_vector_literal(query, model_name)
     params: list[Any] = [vector, model_name]
     where = [
         "e.model = %s",
@@ -267,7 +292,6 @@ def helper_enrich_chunk_context_pg(dsn: str | None, items: list[dict[str, Any]])
     # 行为：
     # - 通过 doc_id + section_path 查找对应 section 行（按 section_index 取第一条）；
     # - 找不到时回退使用 section_path 最后一项作为 heading 占位；
-    # - 同时填 source_quote_context（用于 MCP 显示引用上下文）；
     # - char_span_kind 标记 section/document 跨度，便于前端区分引用粒度。
     # 性能说明（高并发 N+1 → 单次 IN）：
     # - 老实现每 chunk 一次 SQL（topk=30 → 30 次往返），高并发下直接放大延迟；
@@ -330,12 +354,9 @@ def helper_enrich_chunk_context_pg(dsn: str | None, items: list[dict[str, Any]])
         section_path_items = helper_section_path_items(item.get("section_path"))
         updated = dict(item)
         updated["heading"] = heading or ((section_path_items or [None])[-1])
-        updated["prev_chunk_id"] = None
-        updated["next_chunk_id"] = None
         updated["char_start"] = section_char_start
         updated["char_end"] = section_char_end
         updated["char_span_kind"] = "section" if section_char_start is not None or section_char_end is not None else None
-        updated["source_quote_context"] = helper_source_quote_context("", item.get("content", ""), "")
         enriched.append(updated)
     return enriched
 
@@ -419,6 +440,17 @@ def helper_optional_vector_channel(
         return []
 
 
+def helper_optional_query_vector(query: str, model_name: str, required: bool) -> str | None:
+    """生成一次共享查询向量；非强制模式下保留纯文本降级语义。"""
+    try:
+        return query_vector_literal(query, model_name)
+    except Exception:
+        if required:
+            raise
+        LOGGER.warning("查询向量不可用，已降级为文本检索", exc_info=True)
+        return None
+
+
 def search_documents_hybrid_pg(
     query: str, dsn: str | None = None, source_institution: str | None = None,
     clinical_department: str | None = None, time_range: str | dict[str, str] | None = None,
@@ -430,22 +462,19 @@ def search_documents_hybrid_pg(
     # 1. 若 PG_VECTOR_RETRIEVAL_REQUIRED=1，先校验 3 张 embedding 表与源表行数一致；
     # 2. 四路召回（card_text / view_text / card_dense / view_dense）各取 pool_size 条；
     # 3. 仅保留非空通道做 RRF（空通道不影响融合分数）；
-    # 4. 临床科室配额（helper_route_documents_pg）筛选出至多 50 个候选；
-    # 5. 默认 DocumentReranker 重排至 topk（封顶 20）。
+    # 4. 临床科室配额（helper_route_documents_pg）筛选候选；
+    # 5. 仅将 topk 的 4 倍（至多 50 条）送入 reranker。
+    # 6. 默认 DocumentReranker 重排至 topk（封顶 20）。
     
     require_vector = pg_vector_retrieval_required()
     if require_vector:
-        timed_call("vector_ready_check", helper_assert_pg_vectors_ready, dsn, model_name)
+        timed_call("vector_ready_check", helper_assert_pg_vectors_ready_cached, dsn, model_name)
     if pool_size < 1:
         raise ValueError("pool_size must be positive")
-    recall_n = max(pool_size, topk)
+    rerank_n = min(topk * RERANK_CANDIDATE_MULTIPLIER, RERANK_CANDIDATE_LIMIT)
+    recall_n = max(pool_size, rerank_n)
 
-    # P1.2 高并发改造: text 2 路 (cards/views) 并发, dense 2 路仍串行。
-    # 动机:
-    # - text 通道是纯 PG 网络往返 (TSVector + 多个索引), 没有共享资源,
-    #   ThreadPoolExecutor 并发可省一半墙钟;
-    # - dense 通道要进 SentenceTransformer.encode, 模型非线程安全,
-    #   需要独立 GPU queue 才能并发 (留到 P2, 本期 dense 串行保留)。
+    # 文本两路与单次查询向量编码并发；两个向量 SQL 复用该向量后并发执行。
     # 故障语义: text 任一路抛错即整体抛错 (与原行为一致),
     # dense 沿用 helper_optional_vector_channel 决定抛错还是降级为空列表。
     _logger_level = os.getenv("PG_RECALL_LOG", "0").strip().lower() in {"1", "true", "yes", "y"}
@@ -454,7 +483,7 @@ def search_documents_hybrid_pg(
     timing = current_timing()
     card_text: list[dict[str, Any]] = []
     view_text: list[dict[str, Any]] = []
-    with _cf.ThreadPoolExecutor(max_workers=text_workers, thread_name_prefix="mcp-text-recall") as _ex:
+    with _cf.ThreadPoolExecutor(max_workers=text_workers + 1, thread_name_prefix="mcp-document-recall") as _ex:
         _futures = {
             _ex.submit(
                 timed_call, "bm25.document_cards", search_document_cards_pg,
@@ -467,6 +496,10 @@ def search_documents_hybrid_pg(
                 recall_n, timing=timing, document_kind=document_kind,
             ): "view_text",
         }
+        _vector_future = _ex.submit(
+            timed_call, "embedding.documents", helper_optional_query_vector,
+            query, model_name, require_vector, timing=timing,
+        )
         for fut in _cf.as_completed(_futures):
             name = _futures[fut]
             try:
@@ -478,21 +511,31 @@ def search_documents_hybrid_pg(
                 if _logger_level:
                     LOGGER.warning("召回通道 %s 失败: %s", name, _exc, exc_info=True)
                 raise
+        query_vector = _vector_future.result()
 
-    card_dense = helper_optional_vector_channel(
-        "document_cards",
-        require_vector,
-        vector_search_document_cards_pg,
-        query, dsn, source_institution, clinical_department, time_range, publication_date,
-        recall_n, model_name, document_kind=document_kind,
-    )
-    view_dense = helper_optional_vector_channel(
-        "document_views",
-        require_vector,
-        vector_search_document_views_pg,
-        query, dsn, source_institution, clinical_department, time_range, publication_date,
-        recall_n, model_name, document_kind=document_kind,
-    )
+    card_dense: list[dict[str, Any]] = []
+    view_dense: list[dict[str, Any]] = []
+    if query_vector is not None:
+        with _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="mcp-document-dense") as _ex:
+            _futures = {
+                _ex.submit(
+                    timed_call, "dense.document_cards", helper_optional_vector_channel,
+                    "document_cards", require_vector, vector_search_document_cards_pg,
+                    query, dsn, source_institution, clinical_department, time_range, publication_date,
+                    recall_n, model_name, document_kind=document_kind, vector=query_vector, timing=timing,
+                ): "card_dense",
+                _ex.submit(
+                    timed_call, "dense.document_views", helper_optional_vector_channel,
+                    "document_views", require_vector, vector_search_document_views_pg,
+                    query, dsn, source_institution, clinical_department, time_range, publication_date,
+                    recall_n, model_name, document_kind=document_kind, vector=query_vector, timing=timing,
+                ): "view_dense",
+            }
+            for fut in _cf.as_completed(_futures):
+                if _futures[fut] == "card_dense":
+                    card_dense = fut.result()
+                else:
+                    view_dense = fut.result()
     # RRF 只接收非空通道；空通道不应占用名次权重或改变融合分母。
     channels = [ranked for ranked in (card_text, view_text, card_dense, view_dense) if ranked]
     if not channels:
@@ -512,6 +555,7 @@ def search_documents_hybrid_pg(
         item["retrieval_scores"] = {name: ranks.get(doc_id) for name, ranks in rank_maps.items()}
         candidates.append(item)
     candidates = timed_call("route", helper_route_documents_pg, candidates, clinical_department)
+    candidates = helper_rerank_candidates(candidates, topk)
     candidates = [{**helper_department_fields(item), "document_kind": document_kind} for item in candidates]
     reranker = reranker or default_document_reranker()
     return timed_call("rerank", reranker.rerank, query, candidates, min(topk, 20))
@@ -520,24 +564,26 @@ def search_documents_hybrid_pg(
 def retrieve_chunks_hybrid_pg(
     query: str, dsn: str | None = None, source_institution: str | None = None,
     clinical_department: str | None = None, time_range: str | dict[str, str] | None = None,
-    publication_date: str | None = None, topk: int = 30, pool_size: int = 100,
+    publication_date: str | None = None, topk: int = 30, pool_size: int = 50,
     model_name: str = DEFAULT_MODEL, reranker: ChunkReranker | None = None, document_kind: str = "guideline",
 ) -> list[dict[str, Any]]:
-    # 分块级混合检索：BM25 + Dense 双通道 → RRF → 路由 → 上下文增强 → Reranker → topk。
+    # 分块级混合检索：BM25 + Dense 双通道 → RRF → 路由 → Reranker → 上下文增强 → topk。
     # 流程：
     # 1. 强制向量就绪校验（可选）；
     # 2. 两路召回（text_ranked / vector_ranked）各取 pool_size；
     # 3. RRF 融合（按 chunk_id 而非 doc_id）；
     # 4. helper_route_chunks_pg 按 91/9 配额重组；
-    # 5. helper_enrich_chunk_context_pg 补充 section heading 与 char_span；
+    # 5. 仅将 topk 的 4 倍（至多 50 条）送入 reranker。
     # 6. 默认 ChunkReranker 重排至 topk（封顶 30）。
+    # 7. 仅为最终结果补充 section heading 与 char_span。
     
     require_vector = pg_vector_retrieval_required()
     if require_vector:
-        timed_call("vector_ready_check", helper_assert_pg_vectors_ready, dsn, model_name)
+        timed_call("vector_ready_check", helper_assert_pg_vectors_ready_cached, dsn, model_name)
     if pool_size < 1:
         raise ValueError("pool_size must be positive")
-    recall_n = max(pool_size, topk)
+    rerank_n = min(topk * RERANK_CANDIDATE_MULTIPLIER, RERANK_CANDIDATE_LIMIT)
+    recall_n = max(pool_size, rerank_n)
     text_ranked = timed_call(
         "bm25.chunks", retrieve_chunks_pg, query, dsn, source_institution,
         clinical_department, time_range, publication_date, recall_n, document_kind=document_kind,
@@ -564,40 +610,11 @@ def retrieve_chunks_hybrid_pg(
         item["retrieval_scores"] = {"bm25_rank": bm25_ranks.get(chunk_id), "vector_rank": vector_ranks.get(chunk_id)}
         candidates.append(item)
     candidates = timed_call("route", helper_route_chunks_pg, candidates, dsn, clinical_department)
+    candidates = helper_rerank_candidates(candidates, topk)
     candidates = [{**helper_department_fields(item), "document_kind": document_kind} for item in candidates]
-    candidates = timed_call("context_enrich", helper_enrich_chunk_context_pg, dsn, candidates)
     reranker = reranker or default_chunk_reranker()
-    return timed_call("rerank", reranker.rerank, query, candidates, min(topk, 30))
-
-
-def helper_attach_document_views_pg(
-    items: list[dict[str, Any]], dsn: str | None = None,
-) -> list[dict[str, Any]]:
-    # 批量回填每个文档的 view_type → text 映射，供前端展示摘要/目录等。
-    # - dict.fromkeys 保序去重：保持 item 中 doc_id 首次出现顺序；
-    # - views_by_doc[view_type] 取首次出现的视图文本（同一 type 多个 view 时第一条优先）。
-    
-    if not items:
-        return []
-    doc_ids = list(dict.fromkeys(item["doc_id"] for item in items))
-    views_by_doc: dict[str, dict[str, str]] = {doc_id: {} for doc_id in doc_ids}
-    with get_pool(dsn).connection(timeout=10) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT doc_id, view_type, text
-                FROM document_views
-                WHERE doc_id = ANY(%s)
-                ORDER BY doc_id, priority DESC, view_type
-                """,
-                (doc_ids,),
-            )
-            for doc_id, view_type, text in cur.fetchall():
-                views_by_doc[doc_id].setdefault(view_type, text or "")
-    return [
-        {**item, "document_views": views_by_doc.get(item["doc_id"], {})}
-        for item in items
-    ]
+    reranked = timed_call("rerank", reranker.rerank, query, candidates, min(topk, 30))
+    return timed_call("context_enrich", helper_enrich_chunk_context_pg, dsn, reranked)
 
 
 def search_documents_with_consensus_fallback_pg(
@@ -622,7 +639,7 @@ def search_documents_with_consensus_fallback_pg(
             topk=deficit, reranker=reranker, document_kind="consensus",
         ),
     )
-    return timed_call("response_enrich", helper_attach_document_views_pg, output, dsn)
+    return output
 
 
 def retrieve_chunks_with_consensus_fallback_pg(

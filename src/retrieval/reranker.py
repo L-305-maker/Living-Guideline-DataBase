@@ -153,8 +153,7 @@ class RuleBasedChunkReranker:
             content = str(item.get("content") or "")
             section_text = " > ".join(str(part) for part in item.get("section_path") or [])
             title = str(item.get("title") or "")
-            source_context = str(item.get("source_quote_context") or "")
-            searchable_text = "\n".join([title, section_text, content, source_context])
+            searchable_text = "\n".join([title, section_text, content])
             boosts: dict[str, float] = {}
             matched_fields = set(item.get("match_reason", {}).get("matched_fields", []))
 
@@ -171,10 +170,6 @@ class RuleBasedChunkReranker:
             if helper_contains_term(title, terms):
                 boosts["title_term"] = 0.08
                 matched_fields.add("title")
-            if source_context and helper_contains_term(source_context, terms):
-                boosts["neighbor_context_term"] = 0.04
-                matched_fields.add("source_quote_context")
-
             chunk_type = str(item.get("chunk_type") or "")
             type_boost = helper_chunk_type_boost(chunk_type)
             if type_boost:
@@ -668,9 +663,6 @@ def helper_chunk_rerank_text(candidate: dict[str, Any]) -> str:
         f"Chunk type: {candidate.get('chunk_type', '')}",
         "Content: " + helper_clip_text(str(candidate.get("content", "")), 1500),
     ]
-    context = str(candidate.get("source_quote_context") or "")
-    if context:
-        parts.append("Neighbor context: " + helper_clip_text(context, 700))
     return "\n\n".join(part for part in parts if part.strip())
 
 
